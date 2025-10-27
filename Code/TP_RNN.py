@@ -3,20 +3,26 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from torch import nn
+import os
 
 
 
 # Import raw data
+#Defining function to check if directory exists, if not it generates it
+def check_and_make_dir(dir):
+    if not os.path.isdir(dir):os.mkdir(dir)
 #Base directory 
-base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/Data/'
+base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing temperature values
-raw_T_data = np.loadtxt(base_dir+'bt-4500k/training_data_T.csv', delimiter=',')
+raw_T_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
 #File containing pressure values
-raw_P_data = np.loadtxt(base_dir+'bt-4500k/training_data_P.csv', delimiter=',')
+raw_P_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 #Path to store model
 model_save_path = base_dir+'Model_Storage/RNN/'
+check_and_make_dir(model_save_path)
 #Path to store plots
 plot_save_path = base_dir+'Plots/RNN/'
+check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
 #First 5 are the input values (H2 pressure in bar, CO2 pressure in bar, LoD in hours, Obliquity in deg, H2+Co2 pressure) but we remove the last one since it's not adding info.
