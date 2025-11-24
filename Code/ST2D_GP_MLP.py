@@ -70,13 +70,13 @@ rng.manual_seed(partition_seed)
 show_plot = False
 
 #Number of nearest neighbors to choose
-N_neigbors = 500
+N_neigbors = 5
 
 #Optimizer learning rate
-learning_rate = 1e-6
+learning_rate = 1e-5
 
 #Batch size 
-batch_size = 64
+batch_size = 200
 
 #Number of epochs 
 n_epochs = 10
@@ -117,19 +117,17 @@ def Sai_CGP(obs_features, obs_labels, query_features):
     Conditional Gaussian Process
     Inputs: 
         obs_features : ndarray (D, N)
-            D-dimensional features of the N observation data points.
+            D-dimensional features of the N ensemble data points.
         obs_labels : ndarray (K, N)
-            K-dimensional labels of the N observation data points.
+            K-dimensional labels of the N ensemble data points.
         query_features : ndarray (D, 1)
             D-dimensional features of the query data point.
     Outputs:
-        query_labels : ndarray (K, 1)
-            K-dimensional labels of the query data point.
-
+        query_labels : ndarray (K, N)
+            K-dimensional labels of the ensemble updated from the query point.
+        query_cov_labels : ndarray (K, K)
+            K-by-K covariance of the ensemble labels.
     """
-    # Defining relevant means
-    mean_obs_labels = np.mean(obs_labels, axis=1, keepdims=True)
-    mean_obs_features = np.mean(obs_features, axis=1, keepdims=True)
     
     # Defining relevant covariance matrices
     ## Between feature and label of observation data
@@ -143,11 +141,11 @@ def Sai_CGP(obs_features, obs_labels, query_features):
     ## Adding regularizer to avoid singularities
     Cxx += 1e-8 * np.eye(Cxx.shape[0]) 
 
-    query_mean_labels = mean_obs_labels + (Cyx @ scipy.linalg.inv(Cxx) @ (query_features - mean_obs_features))
+    query_labels = obs_labels + (Cyx @ scipy.linalg.inv(Cxx) @ (query_features - obs_features))
 
     query_cov_labels = Cyy - Cyx @ scipy.linalg.inv(Cxx) @ Cxy
 
-    return query_mean_labels, query_cov_labels
+    return query_labels, query_cov_labels
 
 
 
@@ -329,7 +327,7 @@ for query_idx, (query_input, query_output) in enumerate(zip(train_inputs, train_
     
     #Find the query labels from nearest neigbours
     mean_test_output, cov_test_output = Sai_CGP(prox_train_inputs.T, prox_train_outputs.T, query_input.reshape((1, 4)).T)
-    model_test_output = mean_test_output[:,0] 
+    model_test_output = np.mean(mean_test_output,axis=1)
     model_test_output_err = np.sqrt(np.diag(cov_test_output))
     train_NN_inputs[query_idx, :] = model_test_output
 
@@ -338,7 +336,7 @@ for query_idx, (query_input, query_output) in enumerate(zip(train_inputs, train_
 
         #Convert shape
         plot_test_output = query_output.reshape((46, 72))
-        plot_model_test_output = mean_test_output.reshape((46, 72))
+        plot_model_test_output = model_test_output.reshape((46, 72))
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True, layout='constrained')        
         # Compute global vmin/vmax across all datasets
