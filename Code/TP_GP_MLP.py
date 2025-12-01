@@ -84,6 +84,9 @@ nn_depth = 5
 #Optimizer learning rate
 learning_rate = 1e-5
 
+#Weight decay
+weight_decay = 1e-3
+
 #Batch size 
 batch_size = 200
 
@@ -391,7 +394,8 @@ class RegressionModule(pl.LightningModule):
 lightning_module = RegressionModule(
     model=model,
     optimizer=SGD,
-    learning_rate=learning_rate
+    learning_rate=learning_rate,
+    weight_decay=weight_decay
 )
 
 # Setup logger
