@@ -336,10 +336,11 @@ data_module = CustomDataModule(
 ###################################
 # PyTorch Lightning Module
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate):
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
         self.loss_fn = nn.MSELoss()
         self.optimizer_class = optimizer
         
@@ -378,7 +379,7 @@ class RegressionModule(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        return self.optimizer_class(self.model.parameters(), lr=self.learning_rate)
+        return self.optimizer_class(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
 
 
 
