@@ -99,10 +99,6 @@ batch_size = 200
 #Number of epochs 
 n_epochs = 1000
 
-#Define storage for losses
-train_losses = []
-eval_losses = []
-
 #Mode for optimization
 run_mode = 'use'
 

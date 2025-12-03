@@ -70,23 +70,37 @@ rng.manual_seed(partition_seed)
 show_plot = False
 
 #Number of nearest neighbors to choose
-N_neigbors = 5
+N_neigbors = 10
+
+#Distance metric to use
+distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
+
+#Neural network width and depth
+nn_width = 102
+nn_depth = 5
 
 #Optimizer learning rate
 learning_rate = 1e-5
+
+#Regularization coefficient
+regularization_coeff = 1e-2
+
+#Weight decay 
+weight_decay = 0.0
 
 #Batch size 
 batch_size = 200
 
 #Number of epochs 
-n_epochs = 10
-
-#Define storage for losses
-train_losses = []
-eval_losses = []
+n_epochs = 1000
 
 #Mode for optimization
 run_mode = 'use'
+
+#Convert raw inputs for H2 and CO2 pressures to log10 scale so don't have to deal with it later
+if 'logged' in distance_metric:
+    raw_inputs[:, 0] = np.log10(raw_inputs[:, 0]) #H2
+    raw_inputs[:, 1] = np.log10(raw_inputs[:, 1]) #CO2
 
 
 
@@ -154,100 +168,50 @@ def Sai_CGP(obs_features, obs_labels, query_features):
 
 
 ###################
-#### Build MLP ####
+#### Build CNN ####
 ###################
-class EncoderDecoder(nn.Module):
-    """Encoder-Decoder architecture for 46x72 image prediction"""
-    def __init__(self, in_channels=1, out_channels=1):
-        super(EncoderDecoder, self).__init__()
+class SimpleCNN(nn.Module):
+    def __init__(self, input_channels, output_channels):
+        super(SimpleCNN, self).__init__()
         
-        # Encoder
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+        # Direct CNN - no dimensionality reduction
+        self.cnn = nn.Sequential(
+            # Input: input_channels x 48 x 69
+            nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU()
-        )
-        self.pool1 = nn.MaxPool2d(2, 2)  # 46x72 -> 23x36
-        
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU()
-        )
-        self.pool2 = nn.MaxPool2d(2, 2)  # 23x36 -> 11x18
-        
-        self.bottleneck = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU()
-        )
-        
-        # Decoder with explicit size handling
-        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)  # 11x18 -> 22x36
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),  # 128 = 64 (from up1) + 64 (skip)
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU()
-        )
-        
-        self.up2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)  # 22x36 -> 44x72
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),  # 64 = 32 (from up2) + 32 (skip)
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU()
-        )
-        
-        # Final adjustment to get exact 46x72
-        self.final_up = nn.ConvTranspose2d(32, 32, kernel_size=3, padding=1)
-        self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1)
-        
-    def forward(self, x):
-        # Encoder with skip connections
-        e1 = self.enc1(x)
-        p1 = self.pool1(e1)
-        
-        e2 = self.enc2(p1)
-        p2 = self.pool2(e2)
-        
-        bottleneck = self.bottleneck(p2)
-        
-        # Decoder with skip connections
-        d1 = self.up1(bottleneck)
-        e2_cropped = e2[:, :, :d1.size(2), :d1.size(3)]
-        d1 = torch.cat([d1, e2_cropped], dim=1)  # Crop e2 if needed
-        d1 = self.dec1(d1)
-        
-        d2 = self.up2(d1)
-        e1_cropped = e1[:, :, :d2.size(2), :d2.size(3)]
-        d2 = torch.cat([d2, e1_cropped], dim=1)  # Crop e1 if needed
-        d2 = self.dec2(d2)
-        
-        # Pad to exact size if needed
-        if d2.size(2) < 46 or d2.size(3) < 72:
-            pad_h = 46 - d2.size(2)
-            pad_w = 72 - d2.size(3)
-            d2 = nn.functional.pad(d2, (0, pad_w, 0, pad_h), mode='replicate')
+            nn.ReLU(inplace=True),
+            # Output: 32 x 48 x 69
             
-        # Final adjustment to 46x72
-        d2 = self.final_up(d2)
-        output = self.final_conv(d2)
-        
-        return output
+            # nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            # nn.BatchNorm2d(64),
+            # nn.ReLU(inplace=True),
+            # # Output: 64 x 48 x 69
+            
+            # nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            # nn.BatchNorm2d(64),
+            # nn.ReLU(inplace=True),
+            # # Output: 64 x 48 x 69
+            
+            # nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            # nn.BatchNorm2d(32),
+            # nn.ReLU(inplace=True),
+            # # Output: 32 x 48 x 69
+            
+            nn.Conv2d(32, output_channels, kernel_size=1, stride=1, padding=0),
+            nn.Sigmoid()  # Output values between 0 and 1
+            # Output: output_channels x 48 x 69
+        )
+    
+    def forward(self, x):
+        """
+        Forward pass through the CNN.
+        Args:
+            x: Input tensor of shape (batch_size, input_channels, 46, 72)
+        Returns:
+            Output images of shape (batch_size, output_channels, 46, 72)
+        """
+        x = self.cnn(x)
+        return x
     
 class CustomDataModule(pl.LightningDataModule):
     def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs, 
@@ -303,7 +267,7 @@ class CustomDataModule(pl.LightningDataModule):
         dataset = TensorDataset(self.test_inputs, self.test_outputs)
         return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
 
-model = EncoderDecoder().to(device)
+model = SimpleCNN(1,1).to(device)
 summary(model)
 
 
@@ -318,7 +282,13 @@ train_NN_inputs = np.zeros(train_outputs.shape, dtype=float)
 for query_idx, (query_input, query_output) in enumerate(zip(train_inputs, train_outputs)):
 
     #Calculate proximity of query point to observations
-    distances = np.sqrt( (query_input[0] - train_inputs[:,0])**2 + (query_input[1] - train_inputs[:,1])**2 + (query_input[2] - train_inputs[:,2])**2 + (query_input[3] - train_inputs[:,3])**2 )
+    # Euclidian distance
+    if 'euclidean' in distance_metric:
+        distances = np.sqrt( (query_input[0] - train_inputs[:,0])**2 + (query_input[1] - train_inputs[:,1])**2 + (query_input[2] - train_inputs[:,2])**2 + (query_input[3] - train_inputs[:,3])**2 )
+    # Mahalanobis distance
+    elif 'mahalanobis' in distance_metric:
+        distances = np.sqrt( (query_input - np.mean(train_inputs, axis=0)).T @ scipy.linalg.inv((train_inputs @ train_inputs.T) / (train_inputs.shape[0] - 1)) @ (query_input - np.mean(train_inputs, axis=0)) )
+    else:raise('Invalid distance metric')
 
     #Choose the N closest points
     N_closest_idx = np.argsort(distances)[:N_neigbors]
@@ -401,16 +371,47 @@ data_module = CustomDataModule(
 ###################################
 # PyTorch Lightning Module
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate):
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff=0.0):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
+        self.reg_coeff = reg_coeff
+        self.weight_decay = weight_decay
         self.loss_fn = nn.MSELoss()
         self.optimizer_class = optimizer
+    
+    def compute_gradient_penalty(self, X):
+        """
+        Compute the gradient of model output with respect to input.
+        Returns the L2 norm of the gradients as a regularization term.
+        """
+        if self.reg_coeff == 0:
+            return torch.tensor(0., device=self.device)
         
-        # Store losses
-        self.train_losses = []
-        self.eval_losses = []
+        # Clone and enable gradient computation for inputs
+        X_grad = X.clone().detach().requires_grad_(True)
+
+        # Temporarily enable gradients (needed for validation/test steps)
+        with torch.enable_grad():
+            
+            # Compute output (need to recompute to track gradients w.r.t. X)
+            output = self.model(X_grad)
+            
+            # Compute gradients of output with respect to input
+            grad_outputs = torch.ones_like(output)
+            gradients = torch.autograd.grad(
+                outputs=output,
+                inputs=X_grad,
+                grad_outputs=grad_outputs,
+                create_graph=True,  # Keep computation graph for backprop
+                retain_graph=True,
+                only_inputs=True
+            )[0]
+            
+            # Compute L2 norm of gradients (squared)
+            gradient_penalty = torch.mean(gradients ** 2)
+        
+        return self.reg_coeff * gradient_penalty
     
     def forward(self, x):
         return self.model(x)
@@ -420,6 +421,10 @@ class RegressionModule(pl.LightningModule):
         pred = self(X)
         loss = self.loss_fn(pred, y)
         
+        # Add gradient regularization
+        grad_penalty = self.compute_gradient_penalty(X)
+        loss += grad_penalty
+
         # Log metrics
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
@@ -428,7 +433,7 @@ class RegressionModule(pl.LightningModule):
         X, y = batch
         pred = self(X)
         loss = self.loss_fn(pred, y)
-        
+
         # Log metrics
         self.log('valid_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
@@ -437,13 +442,13 @@ class RegressionModule(pl.LightningModule):
         X, y = batch
         pred = self(X)
         loss = self.loss_fn(pred, y)
-        
+
         # Log metrics
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
     
     def configure_optimizers(self):
-        return self.optimizer_class(self.model.parameters(), lr=self.learning_rate)
+        return self.optimizer_class(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
 
 
 
@@ -459,7 +464,9 @@ class RegressionModule(pl.LightningModule):
 lightning_module = RegressionModule(
     model=model,
     optimizer=SGD,
-    learning_rate=learning_rate
+    learning_rate=learning_rate,
+    reg_coeff=regularization_coeff,
+    weight_decay=weight_decay
 )
 
 # Setup logger
@@ -477,17 +484,19 @@ if run_mode == 'use':
     trainer.fit(lightning_module, datamodule=data_module)
     
     # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{learning_rate}LR_{batch_size}BS.ckpt')
+    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt')
     
     print("Done!")
     
 else:
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{learning_rate}LR_{batch_size}BS.ckpt',
+        model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt',
         model=model,
         optimizer=SGD,
-        learning_rate=learning_rate
+    learning_rate=learning_rate,
+    reg_coeff=regularization_coeff,
+    weight_decay=weight_decay
     )
     print("Model loaded!")
 
@@ -496,7 +505,6 @@ else:
 trainer.test(lightning_module, datamodule=data_module)
 
 # --- Accessing Training History After Training ---
-
 # Find the version directory (e.g., version_0, version_1, etc.)
 log_dir = model_save_path+'logs/NeuralNetwork'
 versions = [d for d in os.listdir(log_dir) if d.startswith('version_')]
@@ -505,12 +513,10 @@ csv_path = os.path.join(log_dir, latest_version, 'metrics.csv')
 
 # Read the metrics
 metrics_df = pd.read_csv(csv_path)
-print(metrics_df.head())
 
 # Extract losses per epoch
 train_losses = metrics_df[metrics_df['train_loss_epoch'].notna()]['train_loss_epoch'].tolist()
 eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
-
 
 
 
@@ -522,9 +528,31 @@ eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist(
 ##########################
 # Loss curves
 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios':[3, 1]}, figsize=(10, 6))
-ax1.plot(np.arange(n_epochs), train_losses, label="Train")
-ax1.plot(np.arange(n_epochs), eval_losses, label="Validation")
-ax2.plot(np.arange(n_epochs), np.array(train_losses) - np.array(eval_losses), label="Train")
+
+# Calculate number of batches per epoch
+n_batches = len(train_losses) // n_epochs
+
+# Create x-axis in terms of epochs (0 to n_epochs)
+x_all = np.linspace(0, n_epochs, len(train_losses))
+x_epoch = np.arange(n_epochs+1)
+
+# Plot transparent background showing all batch losses
+ax1.plot(x_all, train_losses, alpha=0.3, color='C0', linewidth=0.5)
+ax1.plot(x_all, eval_losses, alpha=0.3, color='C1', linewidth=0.5)
+
+# Plot solid lines showing epoch-level losses (every n_batches steps)
+train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]  # Last batch of each epoch
+eval_epoch = [eval_losses[0]] + eval_losses[n_batches-1::n_batches]
+ax1.plot(x_epoch, train_epoch, label="Train", color='C0', linewidth=2, marker='o')
+ax1.plot(x_epoch, eval_epoch, label="Validation", color='C1', linewidth=2, marker='o')
+
+# Same for difference plot
+diff_all = np.array(train_losses) - np.array(eval_losses)
+diff_epoch = np.array(train_epoch) - np.array(eval_epoch)
+
+ax2.plot(x_all, diff_all, alpha=0.3, color='C2', linewidth=0.5)
+ax2.plot(x_epoch, diff_epoch, color='C2', linewidth=2, marker='o')
+
 ax1.set_yscale('log')
 ax2.set_yscale('log')
 ax2.set_xlabel("Epoch")
@@ -532,6 +560,7 @@ ax1.set_ylabel("MSE Loss")
 ax2.set_ylabel("Loss Diff.")
 ax1.legend()
 ax1.grid()
+ax2.grid()
 plt.subplots_adjust(hspace=0)
 plt.savefig(plot_save_path+'/loss.pdf')
 
