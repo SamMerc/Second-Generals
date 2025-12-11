@@ -28,7 +28,7 @@ import seaborn as sns
 def check_and_make_dir(dir):
     if not os.path.isdir(dir):os.mkdir(dir)
 #Base directory 
-base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
+base_dir = '/home/merci228/WORK/2G_ML/'
 #File containing surface temperature map
 raw_ST_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 #Path to store model
@@ -179,20 +179,20 @@ class SimpleCNN(nn.Module):
             nn.ReLU(inplace=True),
             # Output: 32 x 48 x 69
             
-            # nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            # nn.BatchNorm2d(64),
-            # nn.ReLU(inplace=True),
-            # # Output: 64 x 48 x 69
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            # Output: 64 x 48 x 69
             
-            # nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            # nn.BatchNorm2d(64),
-            # nn.ReLU(inplace=True),
-            # # Output: 64 x 48 x 69
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            # Output: 64 x 48 x 69
             
-            # nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
-            # nn.BatchNorm2d(32),
-            # nn.ReLU(inplace=True),
-            # # Output: 32 x 48 x 69
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            # Output: 32 x 48 x 69
             
             nn.Conv2d(32, output_channels, kernel_size=1, stride=1, padding=0),
             nn.Sigmoid()  # Output values between 0 and 1

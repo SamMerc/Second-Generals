@@ -4,8 +4,6 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
-import celerite2
-from celerite2 import terms
 import torch
 from torch.optim import SGD
 from pytorch_lightning.loggers import CSVLogger
@@ -30,7 +28,7 @@ import pandas as pd
 def check_and_make_dir(dir):
     if not os.path.isdir(dir):os.mkdir(dir)
 #Base directory 
-base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
+base_dir = '/home/merci228/WORK/2G_ML/'
 #File containing temperature values
 raw_T_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
 #File containing pressure values
