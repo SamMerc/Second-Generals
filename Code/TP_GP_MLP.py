@@ -4,6 +4,8 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+import celerite2
+from celerite2 import terms
 import torch
 from torch.optim import SGD
 from pytorch_lightning.loggers import CSVLogger
@@ -14,6 +16,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 import scipy
 from torchinfo import summary
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import pandas as pd
 
 
@@ -33,10 +36,10 @@ raw_T_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=
 #File containing pressure values
 raw_P_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/GP/'
+model_save_path = base_dir+'Model_Storage/GP_stand_norm/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/GP/'
+plot_save_path = base_dir+'Plots/GP_stand_norm/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -61,7 +64,7 @@ sub_data_partitions = [0.7, 0.1, 0.2]
 
 #Defining the device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-num_threads = 1
+num_threads = 96
 torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
 torch.set_default_device(device)
@@ -85,10 +88,10 @@ nn_width = 102
 nn_depth = 5
 
 #Optimizer learning rate
-learning_rate = 1e-5
+learning_rate = 1e-3
 
 #Regularization coefficient
-regularization_coeff = 1e-2
+regularization_coeff = 0.0
 
 #Weight decay 
 weight_decay = 0.0
@@ -97,7 +100,7 @@ weight_decay = 0.0
 batch_size = 200
 
 #Number of epochs 
-n_epochs = 1000
+n_epochs = 100000
 
 #Mode for optimization
 run_mode = 'use'
@@ -201,6 +204,38 @@ class NeuralNetwork(nn.Module):
 class CustomDataModule(pl.LightningDataModule):
     def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs, test_inputs, test_outputs, batch_size, rng):
         super().__init__()
+
+        # Standardizing the output
+        ## Create scaler
+        out_scaler = StandardScaler()
+        
+        ## Fit scaler on training dataset (convert to numpy)
+        out_scaler.fit(train_outputs.numpy())
+        
+        ## Transform all datasets and convert back to tensors
+        train_outputs = torch.tensor(out_scaler.transform(train_outputs.numpy()), dtype=torch.float32)
+        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.numpy()), dtype=torch.float32)
+        test_outputs = torch.tensor(out_scaler.transform(test_outputs.numpy()), dtype=torch.float32)
+        
+        # Store the scaler if you need to inverse transform later
+        self.out_scaler = out_scaler
+        
+        # Normalizing the input
+        ## Create scaler
+        in_scaler = MinMaxScaler()
+        
+        ## Fit scaler on training dataset (convert to numpy)
+        in_scaler.fit(train_inputs.numpy())
+        
+        ## Transform all datasets and convert back to tensors
+        train_inputs = torch.tensor(in_scaler.transform(train_inputs.numpy()), dtype=torch.float32)
+        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.numpy()), dtype=torch.float32)
+        test_inputs = torch.tensor(in_scaler.transform(test_inputs.numpy()), dtype=torch.float32)
+        
+        # Store the scaler if you need to inverse transform later
+        self.in_scaler = in_scaler
+
+
         self.train_inputs = train_inputs
         self.train_outputs = train_outputs
         self.valid_inputs = valid_inputs
@@ -474,7 +509,7 @@ else:
 
 
 #Testing model on test dataset
-trainer.test(lightning_module, datamodule=data_module)
+if run_mode == 'use':trainer.test(lightning_module, datamodule=data_module)
 
 # --- Accessing Training History After Training ---
 # Find the version directory (e.g., version_0, version_1, etc.)
@@ -538,7 +573,11 @@ plt.subplots_adjust(hspace=0)
 plt.savefig(plot_save_path+'/loss.pdf')
 
 #Comparing GP predicted T-P profiles vs NN predicted T-P profiles vs true T-P profiles with residuals
-substep = 1000
+substep = 100
+
+# Get the scalers from data module
+out_scaler = data_module.out_scaler
+in_scaler = data_module.in_scaler
 
 #Converting tensors to numpy arrays if this isn't already done
 if (type(NN_test_outputs_T) != np.ndarray):
@@ -553,9 +592,16 @@ NN_res_P = np.zeros(NN_test_outputs_P.shape, dtype=float)
 for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, NN_test_output_T, NN_test_output_P) in enumerate(zip(NN_test_og_inputs, NN_test_inputs_T, NN_test_inputs_P, NN_test_outputs_T, NN_test_outputs_P)):
 
     #Retrieve prediction
-    NN_pred_output = model(torch.cat([GP_test_output_T,GP_test_output_P])).detach().numpy()
-    NN_pred_output_T = NN_pred_output[:O]
-    NN_pred_output_P = NN_pred_output[O:]
+    input_data = torch.cat([GP_test_output_T, GP_test_output_P]).reshape(1, -1).numpy()
+    scaled_input = in_scaler.transform(input_data)
+    NN_pred_output = model(torch.tensor(scaled_input, dtype=torch.float32)).detach().numpy()
+        
+    # Inverse transform to get original scale
+    NN_pred_output_original = out_scaler.inverse_transform(NN_pred_output.reshape(1, -1)).flatten()
+
+    #Shift back into T and P components
+    NN_pred_output_T = NN_pred_output_original[:O]
+    NN_pred_output_P = NN_pred_output_original[O:]
 
     #Convert to numpy
     NN_test_input = NN_test_input.numpy()
@@ -603,5 +649,39 @@ for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, NN_test_out
         axs['res_pressure'].sharex(axs['results'])
 
         plt.suptitle(rf'H$_2$ : {NN_test_input[0]} bar, CO$_2$ : {NN_test_input[1]} bar, LoD : {NN_test_input[2]:.0f} days, Obliquity : {NN_test_input[3]} deg')
-        plt.savefig(plot_save_path+f'/pred_vs_actual_n.{NN_test_idx}.pdf')
-    
+        plt.savefig(plot_save_path+f'/pred_vs_actual_n.{NN_test_idx}.pdf')  
+
+
+#Plot residuals
+fig, ((ax1, ax3),(ax2,ax4)) = plt.subplots(2, 2, sharex=True, figsize=[12, 8])
+ax1.plot(GP_res_T.T, alpha=0.1, color='green')
+ax2.plot(GP_res_P.T, alpha=0.1, color='green')
+ax3.plot(NN_res_T.T, alpha=0.1, color='blue')
+ax4.plot(NN_res_P.T, alpha=0.1, color='blue')
+for ax in [ax1, ax2, ax3, ax4]:
+    ax.axhline(0, color='black', linestyle='dashed')
+    ax.grid()
+ax2.set_xlabel('Index')
+ax4.set_xlabel('Index')
+ax1.set_ylabel('Temperature')
+ax2.set_ylabel('log$_{10}$ Pressure (bar)')
+ax3.set_ylabel('Temperature')
+ax4.set_ylabel('log$_{10}$ Pressure (bar)')
+plt.subplots_adjust(hspace=0.1, bottom=0.25)
+
+# Add statistics text at the bottom
+stats_text = (
+    f"--- GP Residuals ---\n"
+    f"Temperature Residuals : Median = {np.median(GP_res_T):.2f} K, Std = {np.std(GP_res_T):.2f} K\n"
+    f"Pressure Residuals : Median = {np.median(GP_res_P):.2f} $log_{{10}}$ bar, Std = {np.std(GP_res_P):.2f} $log_{{10}}$ bar\n"
+    f"\n"
+    f"--- NN Residuals ---\n"
+    f"Temperature Residuals : Median = {np.median(NN_res_T):.2f} K, Std = {np.std(NN_res_T):.2f} K\n"
+    f"Pressure Residuals : Median = {np.median(NN_res_P):.3f} $log_{{10}}$ bar, Std = {np.std(NN_res_P):.2f} $log_{{10}}$ bar"
+)
+
+fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
+         verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+plt.savefig(plot_save_path+f'/res_GP_NN.pdf', bbox_inches='tight')
+plt.show()

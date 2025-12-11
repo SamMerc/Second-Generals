@@ -9,12 +9,13 @@ from torch.optim import SGD
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning import Trainer
 import pytorch_lightning as pl
-import os
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 import scipy
 from torchinfo import summary
 import pandas as pd
+import os
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import seaborn as sns
 
 
@@ -31,10 +32,10 @@ base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing surface temperature map
 raw_ST_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/GP_ST/'
+model_save_path = base_dir+'Model_Storage/GP_ST_stand_norm/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/GP_ST/'
+plot_save_path = base_dir+'Plots/GP_ST_stand_norm/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -56,7 +57,7 @@ sub_data_partitions = [0.7, 0.1, 0.2]
 
 #Defining the device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-num_threads = 1
+num_threads = 96
 torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
 torch.set_default_device(device)
@@ -75,15 +76,11 @@ N_neigbors = 10
 #Distance metric to use
 distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
 
-#Neural network width and depth
-nn_width = 102
-nn_depth = 5
-
 #Optimizer learning rate
-learning_rate = 1e-5
+learning_rate = 1e-3
 
 #Regularization coefficient
-regularization_coeff = 1e-2
+regularization_coeff = 0.0
 
 #Weight decay 
 weight_decay = 0.0
@@ -92,7 +89,7 @@ weight_decay = 0.0
 batch_size = 200
 
 #Number of epochs 
-n_epochs = 1000
+n_epochs = 2000
 
 #Mode for optimization
 run_mode = 'use'
@@ -216,9 +213,10 @@ class SimpleCNN(nn.Module):
 class CustomDataModule(pl.LightningDataModule):
     def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs, 
                  test_inputs, test_outputs, batch_size, rng, reshape_for_cnn=False, 
-                 img_channels=1, img_height=None, img_width=None,
-                 output_channels=None, output_height=None, output_width=None):
+                 img_channels=1, img_height=None, img_width=None):
         super().__init__()
+
+        #Store original shapes for reshaping 
         self.batch_size = batch_size
         self.rng = rng
         self.reshape_for_cnn = reshape_for_cnn
@@ -226,6 +224,41 @@ class CustomDataModule(pl.LightningDataModule):
         self.img_height = img_height
         self.img_width = img_width
         
+        # Standardizing the output
+        ## Create scaler
+        out_scaler = StandardScaler()
+        
+        ## Fit scaler on training dataset (convert to numpy)
+        out_scaler.fit(train_outputs.numpy())
+        
+        ## Transform all datasets and convert back to tensors
+        train_outputs = torch.tensor(out_scaler.transform(train_outputs.numpy()), dtype=torch.float32)
+        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.numpy()), dtype=torch.float32)
+        test_outputs = torch.tensor(out_scaler.transform(test_outputs.numpy()), dtype=torch.float32)
+        
+        # Store the scaler if you need to inverse transform later
+        self.out_scaler = out_scaler
+        
+        # Normalizing the input
+        ## Create scaler
+        in_scaler = MinMaxScaler()
+        
+        ## Fit scaler on training dataset (convert to numpy)
+        in_scaler.fit(train_inputs.numpy())
+        
+        ## Transform all datasets and convert back to tensors
+        train_inputs = torch.tensor(in_scaler.transform(train_inputs.numpy()), dtype=torch.float32)
+        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.numpy()), dtype=torch.float32)
+        test_inputs = torch.tensor(in_scaler.transform(test_inputs.numpy()), dtype=torch.float32)
+        
+        # Store the scaler if you need to inverse transform later
+        self.in_scaler = in_scaler
+        
+        #Store the inputs
+        self.train_inputs = train_inputs
+        self.valid_inputs = valid_inputs
+        self.test_inputs = test_inputs
+
         # Reshape data if needed for CNN
         if reshape_for_cnn:
             # Reshape inputs
@@ -502,7 +535,7 @@ else:
 
 
 #Testing model on test dataset
-trainer.test(lightning_module, datamodule=data_module)
+if run_mode == 'use':trainer.test(lightning_module, datamodule=data_module)
 
 # --- Accessing Training History After Training ---
 # Find the version directory (e.g., version_0, version_1, etc.)
@@ -565,7 +598,11 @@ plt.subplots_adjust(hspace=0)
 plt.savefig(plot_save_path+'/loss.pdf')
 
 #Comparing GP predicted ST maps vs NN predicted ST maps vs true ST maps with residuals
-substep = 1000
+substep = 100
+
+# Get the scalers from data module
+out_scaler = data_module.out_scaler
+in_scaler = data_module.in_scaler
 
 #Converting tensors to numpy arrays if this isn't already done
 if (type(NN_test_outputs) != np.ndarray):
@@ -576,8 +613,21 @@ NN_res = np.zeros(NN_test_outputs.shape, dtype=float)
 
 for NN_test_idx, (NN_test_input, GP_test_output, NN_test_output) in enumerate(zip(NN_test_og_inputs, NN_test_inputs, NN_test_outputs)):
 
-    #Retrieve prediction
-    NN_pred_output = model(GP_test_output.reshape(1, 1, 46, 72)).detach().numpy().reshape(3312)
+    # Flatten to 2D for the scaler: (1 sample, 3312 features)
+    GP_test_output_np = GP_test_output.numpy().reshape(1, -1)
+
+    # Scale the input
+    scaled_input = in_scaler.transform(GP_test_output_np)
+
+    # If your model expects 4D input, reshape back
+    # Otherwise, keep it as 2D if that's what the model expects
+    model_input = torch.tensor(scaled_input, dtype=torch.float32).reshape(1, 1, 46, 72)
+
+    # Get prediction
+    NN_pred_output_scaled = model(model_input).detach().numpy().reshape(3312)
+
+    # Inverse transform to get original scale
+    NN_pred_output = out_scaler.inverse_transform(NN_pred_output_scaled.reshape(1, -1)).flatten()
 
     #Convert to numpy
     NN_test_input = NN_test_input.numpy()
@@ -597,9 +647,11 @@ for NN_test_idx, (NN_test_input, GP_test_output, NN_test_output) in enumerate(zi
         plot_res_NN = NN_res[NN_test_idx, :].reshape((46, 72))
         
         fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(5, 1, figsize=(8, 8), sharex=True, layout='constrained')        
+        
         # Compute global vmin/vmax across all datasets
         vmin = np.min(NN_test_output)
         vmax = np.max(NN_test_output)
+        
         # Plot heatmaps
         ax1.set_title('Data')
         hm1 = sns.heatmap(plot_test_output, ax=ax1)#, cbar=False, vmin=vmin, vmax=vmax)
