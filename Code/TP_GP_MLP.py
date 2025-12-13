@@ -163,9 +163,9 @@ def Sai_CGP(obs_features, obs_labels, query_features):
     ## Adding regularizer to avoid singularities
     Cxx += 1e-8 * np.eye(Cxx.shape[0]) 
 
-    query_labels = obs_labels + (Cyx @ scipy.linalg.inv(Cxx) @ (query_features - obs_features))
+    query_labels = obs_labels + (Cyx @ scipy.linalg.pinv(Cxx) @ (query_features - obs_features))
 
-    query_cov_labels = Cyy - Cyx @ scipy.linalg.inv(Cxx) @ Cxy
+    query_cov_labels = Cyy - Cyx @ scipy.linalg.pinv(Cxx) @ Cxy
 
     return query_labels, query_cov_labels
 
