@@ -69,8 +69,18 @@ torch.set_default_device(device)
 
 #Defining the noise seed for the random partitioning of the training data
 partition_seed = 4
-rng = torch.Generator(device=device)
-rng.manual_seed(partition_seed)
+partition_rng = torch.Generator(device=device)
+partition_rng.manual_seed(partition_seed)
+
+#Defining the noise seed for the generating of batches from the partitioned data
+batch_seed = 5
+batch_rng = torch.Generator(device=device)
+batch_rng.manual_seed(batch_seed)
+
+#Defining the noise seed for the neural network initialization
+NN_seed = 6
+NN_rng = torch.Generator(device=device)
+NN_rng.manual_seed(NN_seed)
 
 # Variable to show plots or not 
 show_plot = False
@@ -118,7 +128,7 @@ if 'logged' in distance_metric:
 #### Partition data into training and testing sets ####
 #######################################################
 ## Retrieving indices of data partitions
-train_idx, test_idx = torch.utils.data.random_split(range(N), data_partition, generator=rng)
+train_idx, test_idx = torch.utils.data.random_split(range(N), data_partition, generator=partition_rng)
 ## Generate the data partitions
 ### Training
 train_inputs = raw_inputs[train_idx]
@@ -179,8 +189,11 @@ def Sai_CGP(obs_features, obs_labels, query_features):
 #### Build MLP ####
 ###################
 class NeuralNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, depth):
+    def __init__(self, input_dim, hidden_dim, output_dim, depth, generator=None):
         super().__init__()
+        # Set seed if generator provided
+        if generator is not None:
+            torch.manual_seed(generator.initial_seed())
         layers = []
         # Input layer
         layers.append(nn.Linear(input_dim, hidden_dim))
@@ -255,7 +268,7 @@ class CustomDataModule(pl.LightningDataModule):
         dataset = TensorDataset(self.test_inputs, self.test_outputs)
         return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
 
-model = NeuralNetwork(2*O, nn_width, 2*O, nn_depth).to(device)
+model = NeuralNetwork(2*O, nn_width, 2*O, nn_depth, generator=NN_rng).to(device)
 summary(model)
 
 
@@ -310,7 +323,7 @@ for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tr
 # Split training dataset into training, validation, and testing, and format it correctly
 
 ## Retrieving indices of data partitions
-train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(train_inputs.shape[0]), sub_data_partitions, generator=rng)
+train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(train_inputs.shape[0]), sub_data_partitions, generator=partition_rng)
 
 ## Generate the data partitions
 ### Training
@@ -363,7 +376,7 @@ data_module = CustomDataModule(
     NN_train_inputs, NN_train_outputs,
     NN_valid_inputs, NN_valid_outputs,
     NN_test_inputs, NN_test_outputs,
-    batch_size, rng
+    batch_size, batch_rng
 )
 
 
@@ -476,6 +489,9 @@ lightning_module = RegressionModule(
 
 # Setup logger
 logger = CSVLogger(model_save_path+'logs', name='NeuralNetwork')
+
+# Set all seeds for complete reproducibility
+pl.seed_everything(NN_seed, workers=True)
 
 # Create Trainer and train
 trainer = Trainer(

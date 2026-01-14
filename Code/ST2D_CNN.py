@@ -59,8 +59,18 @@ torch.set_default_device(device)
 
 #Defining the noise seed for the random partitioning of the training data
 partition_seed = 4
-rng = torch.Generator(device=device)
-rng.manual_seed(partition_seed)
+partition_rng = torch.Generator(device=device)
+partition_rng.manual_seed(partition_seed)
+
+#Defining the noise seed for the generating of batches from the partitioned data
+batch_seed = 5
+batch_rng = torch.Generator(device=device)
+batch_rng.manual_seed(batch_seed)
+
+#Defining the noise seed for the neural network initialization
+NN_seed = 6
+NN_rng = torch.Generator(device=device)
+NN_rng.manual_seed(NN_seed)
 
 # Variable to show plots or not 
 show_plot = False
@@ -179,7 +189,7 @@ class CustomDataModule(pl.LightningDataModule):
 #Splitting the data 
 
 ## Retrieving indices of data partitions
-train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(N), data_partitions, generator=rng)
+train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(N), data_partitions, generator=partition_rng)
 
 ## Generate the data partitions
 ### Training
@@ -197,7 +207,7 @@ data_module = CustomDataModule(
     train_inputs, train_outputs,
     valid_inputs, valid_outputs,
     test_inputs, test_outputs,
-    batch_size, rng, reshape_for_cnn=True,
+    batch_size, batch_rng, reshape_for_cnn=True,
     img_channels=1, img_height=46, img_width=72
 )
 
@@ -206,9 +216,12 @@ data_module = CustomDataModule(
 #### Build CNN ####
 ###################
 class CNN(nn.Module):
-    def __init__(self, input_dim, output_channels):
+    def __init__(self, input_dim, output_channels, generator=None):
         super(CNN, self).__init__()
         
+        # Set seed if generator provided
+        if generator is not None:
+            torch.manual_seed(generator.initial_seed())
 
         # Project input parameters to a higher dimension
         self.fc = nn.Sequential(
@@ -266,7 +279,7 @@ class CNN(nn.Module):
         
         return x
 
-model = CNN(D,1).to(device)
+model = CNN(D,1,generator=NN_rng).to(device)
 summary(model)
 
 
@@ -378,6 +391,9 @@ lightning_module = RegressionModule(
 
 # Setup logger
 logger = CSVLogger(model_save_path+'logs', name='NeuralNetwork')
+
+# Set all seeds for complete reproducibility
+pl.seed_everything(NN_seed, workers=True)
 
 # Create Trainer and train
 trainer = Trainer(
