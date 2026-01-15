@@ -5,7 +5,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-from torch.optim import SGD
+from torch.optim import SGD, Adam
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning import Trainer
 import pytorch_lightning as pl
@@ -510,7 +510,7 @@ class RegressionModule(pl.LightningModule):
 # Create Lightning Module
 lightning_module = RegressionModule(
     model=model,
-    optimizer=SGD,
+    optimizer=Adam,
     learning_rate=learning_rate,
     reg_coeff=regularization_coeff,
     weight_decay=weight_decay
@@ -535,16 +535,16 @@ if run_mode == 'use':
     trainer.fit(lightning_module, datamodule=data_module)
     
     # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt')
+    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt')
     
     print("Done!")
     
 else:
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt',
+        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt',
         model=model,
-        optimizer=SGD,
+        optimizer=Adam,
     learning_rate=learning_rate,
     reg_coeff=regularization_coeff,
     weight_decay=weight_decay

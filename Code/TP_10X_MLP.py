@@ -5,7 +5,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-from torch.optim import SGD
+from torch.optim import SGD, Adam
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning import Trainer
 import pytorch_lightning as pl
@@ -36,7 +36,7 @@ raw_P_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=
 model_save_path = base_dir+'Model_Storage/NN_10X/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/NN/'
+plot_save_path = base_dir+'Plots/NN_10X/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -44,11 +44,6 @@ check_and_make_dir(plot_save_path)
 raw_inputs = raw_T_data[:, :4]
 raw_outputs_T = raw_T_data[:, 5:]
 raw_outputs_P = raw_P_data[:, 5:]
-
-#Storing useful quantitites
-N = raw_inputs.shape[0] #Number of data points
-D = raw_inputs.shape[1] #Number of features
-O = 2*raw_outputs_T.shape[1] #Number of outputs
 
 #Convert raw outputs to log10 scale so we don't have to deal with it later
 raw_outputs_P = np.log10(raw_outputs_P/1000)
@@ -370,7 +365,7 @@ summary(model)
 # Create Lightning Module
 lightning_module = RegressionModule(
     model=model,
-    optimizer=SGD,
+    optimizer=Adam,
     learning_rate=learning_rate,
     reg_coeff=regularization_coeff,
     weight_decay=weight_decay
@@ -394,16 +389,16 @@ if run_mode == 'use':
     trainer.fit(lightning_module, datamodule=data_module)
     
     # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt')
+    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt')
     
     print("Done!")
     
 else:
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt',
+        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt',
         model=model,
-        optimizer=SGD,
+        optimizer=Adam,
     learning_rate=learning_rate,
     reg_coeff=regularization_coeff,
     weight_decay=weight_decay
