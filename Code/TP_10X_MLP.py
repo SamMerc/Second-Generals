@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torchinfo import summary
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-
+import sys, itertools
 
 
 
@@ -347,81 +347,86 @@ class RegressionModule(pl.LightningModule):
 ######################
 #### Run training ####
 ######################
+# # Distribute tasks - for HPC usage
+task_arrays = [NN_seeds]
+param_combos = list(itertools.product(*task_arrays))
+param_combos = [list(c) for c in param_combos]
 
-#Loop over NN seeds, essentially looping over the NNs
-for iNN, NN_seed in enumerate(NN_seeds):
-    #Generate key
-    NN_rng = torch.Generator(device=device)
-    NN_rng.manual_seed(NN_seed)
+my_task_id = int(sys.argv[1])
+NN_seed = param_combos[my_task_id - 1]
 
-    #Update paths
-    model_save_path += f'NeuralNetwork_{iNN}/'
-    plot_save_path += f'NeuralNetwork_{iNN}/'
+#Generate key
+NN_rng = torch.Generator(device=device)
+NN_rng.manual_seed(NN_seed)
 
-    #Generate model
-    model = NeuralNetwork(D, nn_width, 2*O, nn_depth, generator=NN_rng).to(device)
-    summary(model)
+#Update paths
+model_save_path += f'NeuralNetwork_{my_task_id}/'
+plot_save_path += f'NeuralNetwork_{my_task_id}/'
 
-    # Create Lightning Module
-    lightning_module = RegressionModule(
+#Generate model
+model = NeuralNetwork(D, nn_width, 2*O, nn_depth, generator=NN_rng).to(device)
+summary(model)
+
+# Create Lightning Module
+lightning_module = RegressionModule(
+    model=model,
+    optimizer=SGD,
+    learning_rate=learning_rate,
+    reg_coeff=regularization_coeff,
+    weight_decay=weight_decay
+)
+
+# Setup logger
+logger = CSVLogger(model_save_path+'logs', name='NeuralNetwork')
+
+# Set all seeds for complete reproducibility
+pl.seed_everything(NN_seed, workers=True)
+
+# Create Trainer and train
+trainer = Trainer(
+    max_epochs=n_epochs,
+    logger=logger,
+    deterministic=True  # For reproducibility
+)
+
+if run_mode == 'use':
+    
+    trainer.fit(lightning_module, datamodule=data_module)
+    
+    # Save model (PyTorch Lightning style)
+    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt')
+    
+    print("Done!")
+    
+else:
+    # Load model
+    lightning_module = RegressionModule.load_from_checkpoint(
+        model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt',
         model=model,
         optimizer=SGD,
-        learning_rate=learning_rate,
-        reg_coeff=regularization_coeff,
-        weight_decay=weight_decay
+    learning_rate=learning_rate,
+    reg_coeff=regularization_coeff,
+    weight_decay=weight_decay
     )
-
-    # Setup logger
-    logger = CSVLogger(model_save_path+'logs', name='NeuralNetwork')
-
-    # Set all seeds for complete reproducibility
-    pl.seed_everything(NN_seed, workers=True)
-
-    # Create Trainer and train
-    trainer = Trainer(
-        max_epochs=n_epochs,
-        logger=logger,
-        deterministic=True  # For reproducibility
-    )
-
-    if run_mode == 'use':
-        
-        trainer.fit(lightning_module, datamodule=data_module)
-        
-        # Save model (PyTorch Lightning style)
-        trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt')
-        
-        print("Done!")
-        
-    else:
-        # Load model
-        lightning_module = RegressionModule.load_from_checkpoint(
-            model_save_path + f'{n_epochs}epochs_{regularization_coeff}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt',
-            model=model,
-            optimizer=SGD,
-        learning_rate=learning_rate,
-        reg_coeff=regularization_coeff,
-        weight_decay=weight_decay
-        )
-        print("Model loaded!")
+    print("Model loaded!")
 
 
-    #Testing model on test dataset
-    trainer.test(lightning_module, datamodule=data_module)
+#Testing model on test dataset
+trainer.test(lightning_module, datamodule=data_module)
 
-    # --- Accessing Training History After Training ---
-    # Find the version directory (e.g., version_0, version_1, etc.)
-    log_dir = model_save_path+'logs/NeuralNetwork'
-    versions = [d for d in os.listdir(log_dir) if d.startswith('version_')]
-    latest_version = sorted(versions)[-1]  # Get the latest version
-    csv_path = os.path.join(log_dir, latest_version, 'metrics.csv')
+# --- Accessing Training History After Training ---
+# Find the version directory (e.g., version_0, version_1, etc.)
+log_dir = model_save_path+'logs/NeuralNetwork'
+versions = [d for d in os.listdir(log_dir) if d.startswith('version_')]
+latest_version = sorted(versions)[-1]  # Get the latest version
+csv_path = os.path.join(log_dir, latest_version, 'metrics.csv')
 
-    # Read the metrics
-    metrics_df = pd.read_csv(csv_path)
+# Read the metrics
+metrics_df = pd.read_csv(csv_path)
 
-    # Extract losses per epoch
-    train_losses = metrics_df[metrics_df['train_loss_epoch'].notna()]['train_loss_epoch'].tolist()
-    eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
+# Extract losses per epoch
+train_losses = metrics_df[metrics_df['train_loss_epoch'].notna()]['train_loss_epoch'].tolist()
+eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
 
 
 
@@ -429,142 +434,142 @@ for iNN, NN_seed in enumerate(NN_seeds):
 
 
 
-    ##########################
-    #### Diagnostic plots ####
-    ##########################
-    # Loss curves
-    fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios':[3, 1]}, figsize=(10, 6))
+##########################
+#### Diagnostic plots ####
+##########################
+# Loss curves
+fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios':[3, 1]}, figsize=(10, 6))
 
-    # Calculate number of batches per epoch
-    n_batches = len(train_losses) // n_epochs
+# Calculate number of batches per epoch
+n_batches = len(train_losses) // n_epochs
 
-    # Create x-axis in terms of epochs (0 to n_epochs)
-    x_all = np.linspace(0, n_epochs, len(train_losses))
-    x_epoch = np.arange(n_epochs+1)
+# Create x-axis in terms of epochs (0 to n_epochs)
+x_all = np.linspace(0, n_epochs, len(train_losses))
+x_epoch = np.arange(n_epochs+1)
 
-    # Plot transparent background showing all batch losses
-    ax1.plot(x_all, train_losses, alpha=0.3, color='C0', linewidth=0.5)
-    ax1.plot(x_all, eval_losses, alpha=0.3, color='C1', linewidth=0.5)
+# Plot transparent background showing all batch losses
+ax1.plot(x_all, train_losses, alpha=0.3, color='C0', linewidth=0.5)
+ax1.plot(x_all, eval_losses, alpha=0.3, color='C1', linewidth=0.5)
 
-    # Plot solid lines showing epoch-level losses (every n_batches steps)
-    train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]  # Last batch of each epoch
-    eval_epoch = [eval_losses[0]] + eval_losses[n_batches-1::n_batches]
-    ax1.plot(x_epoch, train_epoch, label="Train", color='C0', linewidth=2, marker='o')
-    ax1.plot(x_epoch, eval_epoch, label="Validation", color='C1', linewidth=2, marker='o')
+# Plot solid lines showing epoch-level losses (every n_batches steps)
+train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]  # Last batch of each epoch
+eval_epoch = [eval_losses[0]] + eval_losses[n_batches-1::n_batches]
+ax1.plot(x_epoch, train_epoch, label="Train", color='C0', linewidth=2, marker='o')
+ax1.plot(x_epoch, eval_epoch, label="Validation", color='C1', linewidth=2, marker='o')
 
-    # Same for difference plot
-    diff_all = np.array(train_losses) - np.array(eval_losses)
-    diff_epoch = np.array(train_epoch) - np.array(eval_epoch)
+# Same for difference plot
+diff_all = np.array(train_losses) - np.array(eval_losses)
+diff_epoch = np.array(train_epoch) - np.array(eval_epoch)
 
-    ax2.plot(x_all, diff_all, alpha=0.3, color='C2', linewidth=0.5)
-    ax2.plot(x_epoch, diff_epoch, color='C2', linewidth=2, marker='o')
+ax2.plot(x_all, diff_all, alpha=0.3, color='C2', linewidth=0.5)
+ax2.plot(x_epoch, diff_epoch, color='C2', linewidth=2, marker='o')
 
-    ax1.set_yscale('log')
-    ax2.set_yscale('log')
-    ax2.set_xlabel("Epoch")
-    ax1.set_ylabel("MSE Loss")
-    ax2.set_ylabel("Loss Diff.")
-    ax1.legend()
-    ax1.grid()
-    ax2.grid()
-    plt.subplots_adjust(hspace=0)
-    plt.savefig(plot_save_path+'/loss.pdf')
+ax1.set_yscale('log')
+ax2.set_yscale('log')
+ax2.set_xlabel("Epoch")
+ax1.set_ylabel("MSE Loss")
+ax2.set_ylabel("Loss Diff.")
+ax1.legend()
+ax1.grid()
+ax2.grid()
+plt.subplots_adjust(hspace=0)
+plt.savefig(plot_save_path+'/loss.pdf')
 
-    #Comparing predicted T-P profiles vs true T-P profiles with residuals
-    substep = 100
+#Comparing predicted T-P profiles vs true T-P profiles with residuals
+substep = 100
 
-    # Get the scalers from data module
-    out_scaler = data_module.out_scaler
-    in_scaler = data_module.in_scaler
+# Get the scalers from data module
+out_scaler = data_module.out_scaler
+in_scaler = data_module.in_scaler
 
-    #Converting tensors to numpy arrays if this isn't already done
-    if (type(test_outputs_T) != np.ndarray):
-        test_outputs_T = test_outputs_T.numpy()
-        test_outputs_P = test_outputs_P.numpy()
+#Converting tensors to numpy arrays if this isn't already done
+if (type(test_outputs_T) != np.ndarray):
+    test_outputs_T = test_outputs_T.numpy()
+    test_outputs_P = test_outputs_P.numpy()
 
-    res_T = np.zeros(test_outputs_P.shape, dtype=float)
-    res_P = np.zeros(test_outputs_P.shape, dtype=float)
+res_T = np.zeros(test_outputs_P.shape, dtype=float)
+res_P = np.zeros(test_outputs_P.shape, dtype=float)
 
-    for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_inputs, test_outputs_T, test_outputs_P)):
+for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_inputs, test_outputs_T, test_outputs_P)):
 
-        #Convert to numpy and reshape
-        test_input = test_input.numpy()
+    #Convert to numpy and reshape
+    test_input = test_input.numpy()
 
-        #Retrieve prediction
-        pred_output = model(torch.tensor(in_scaler.transform(test_input.reshape(1, -1)))).detach().numpy()
-        
-        # Inverse transform to get original scale
-        pred_output_original = out_scaler.inverse_transform(pred_output.reshape(1, -1)).flatten()
-        
-        # Split back into T and P components
-        pred_output_T = pred_output_original[:O]
-        pred_output_P = pred_output_original[O:]
+    #Retrieve prediction
+    pred_output = model(torch.tensor(in_scaler.transform(test_input.reshape(1, -1)))).detach().numpy()
+    
+    # Inverse transform to get original scale
+    pred_output_original = out_scaler.inverse_transform(pred_output.reshape(1, -1)).flatten()
+    
+    # Split back into T and P components
+    pred_output_T = pred_output_original[:O]
+    pred_output_P = pred_output_original[O:]
 
-        #Storing residuals 
-        res_T[test_idx, :] = pred_output_T - test_output_T
-        res_P[test_idx, :] = pred_output_P - test_output_P
-        #Plotting
-        if (test_idx % substep == 0):
-            fig, axs = plt.subplot_mosaic([['res_pressure', '.'],
-                                        ['results', 'res_temperature']],
-                                figsize=(8, 6),
-                                width_ratios=(3, 1), height_ratios=(1, 3),
-                                layout='constrained')        
-            axs['results'].plot(test_output_T, test_output_P, '.', linestyle='-', color='blue', linewidth=2)
-            axs['results'].plot(pred_output_T, pred_output_P, color='green', linewidth=2)
-            axs['results'].invert_yaxis()
-            axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
-            axs['results'].set_xlabel('Temperature (K)')
-            axs['results'].legend()
-            axs['results'].grid()
+    #Storing residuals 
+    res_T[test_idx, :] = pred_output_T - test_output_T
+    res_P[test_idx, :] = pred_output_P - test_output_P
+    #Plotting
+    if (test_idx % substep == 0):
+        fig, axs = plt.subplot_mosaic([['res_pressure', '.'],
+                                    ['results', 'res_temperature']],
+                            figsize=(8, 6),
+                            width_ratios=(3, 1), height_ratios=(1, 3),
+                            layout='constrained')        
+        axs['results'].plot(test_output_T, test_output_P, '.', linestyle='-', color='blue', linewidth=2)
+        axs['results'].plot(pred_output_T, pred_output_P, color='green', linewidth=2)
+        axs['results'].invert_yaxis()
+        axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
+        axs['results'].set_xlabel('Temperature (K)')
+        axs['results'].legend()
+        axs['results'].grid()
 
-            axs['res_temperature'].plot(res_T[test_idx, :], test_output_P, '.', linestyle='-', color='green', linewidth=2)
-            axs['res_temperature'].set_xlabel('Residuals (K)')
-            axs['res_temperature'].invert_yaxis()
-            axs['res_temperature'].grid()
-            axs['res_temperature'].axvline(0, color='black', linestyle='dashed', zorder=2)
-            axs['res_temperature'].yaxis.tick_right()
-            axs['res_temperature'].yaxis.set_label_position("right")
-            axs['res_temperature'].sharey(axs['results'])
+        axs['res_temperature'].plot(res_T[test_idx, :], test_output_P, '.', linestyle='-', color='green', linewidth=2)
+        axs['res_temperature'].set_xlabel('Residuals (K)')
+        axs['res_temperature'].invert_yaxis()
+        axs['res_temperature'].grid()
+        axs['res_temperature'].axvline(0, color='black', linestyle='dashed', zorder=2)
+        axs['res_temperature'].yaxis.tick_right()
+        axs['res_temperature'].yaxis.set_label_position("right")
+        axs['res_temperature'].sharey(axs['results'])
 
-            axs['res_pressure'].plot(test_output_T, res_P[test_idx, :], '.', linestyle='-', color='green', linewidth=2)
-            axs['res_pressure'].set_ylabel('Residuals (bar)')
-            axs['res_pressure'].invert_yaxis()
-            axs['res_pressure'].grid()
-            axs['res_pressure'].axhline(0, color='black', linestyle='dashed', zorder=2)
-            axs['res_pressure'].xaxis.tick_top()
-            axs['res_pressure'].xaxis.set_label_position("top")
-            axs['res_pressure'].sharex(axs['results'])
+        axs['res_pressure'].plot(test_output_T, res_P[test_idx, :], '.', linestyle='-', color='green', linewidth=2)
+        axs['res_pressure'].set_ylabel('Residuals (bar)')
+        axs['res_pressure'].invert_yaxis()
+        axs['res_pressure'].grid()
+        axs['res_pressure'].axhline(0, color='black', linestyle='dashed', zorder=2)
+        axs['res_pressure'].xaxis.tick_top()
+        axs['res_pressure'].xaxis.set_label_position("top")
+        axs['res_pressure'].sharex(axs['results'])
 
-            plt.suptitle(rf'H$_2$ : {test_input[0]} bar, CO$_2$ : {test_input[1]} bar, LoD : {test_input[2]:.0f} days, Obliquity : {test_input[3]} deg')
-            plt.savefig(plot_save_path+f'/pred_vs_actual_n.{test_idx}.pdf')
-        
-        
-    print('\n','--- NN Residuals ---')
-    print(f'Temperature Residuals : Median = {np.median(res_T):.2f} K, Std = {np.std(res_T):.2f} K')
-    print(rf'Pressure Residuals : Median = {np.median(res_P):.3f} $log_{10}$ bar, Std = {np.std(res_P):.2f} $log_{10}$ bar')
+        plt.suptitle(rf'H$_2$ : {test_input[0]} bar, CO$_2$ : {test_input[1]} bar, LoD : {test_input[2]:.0f} days, Obliquity : {test_input[3]} deg')
+        plt.savefig(plot_save_path+f'/pred_vs_actual_n.{test_idx}.pdf')
+    
+    
+print('\n','--- NN Residuals ---')
+print(f'Temperature Residuals : Median = {np.median(res_T):.2f} K, Std = {np.std(res_T):.2f} K')
+print(rf'Pressure Residuals : Median = {np.median(res_P):.3f} $log_{10}$ bar, Std = {np.std(res_P):.2f} $log_{10}$ bar')
 
-    #Plot residuals
-    fig, (ax1, ax2) = plt.subplots(1, 2, sharex=True, figsize=[12, 8])
-    ax1.plot(res_T.T, alpha=0.1, color='green')
-    ax2.plot(res_P.T, alpha=0.1, color='green')
-    for ax in [ax1, ax2]:
-        ax.axhline(0, color='black', linestyle='dashed')
-        ax.set_xlabel('Index')
-        ax.grid()
-    ax1.set_ylabel('Temperature')
-    ax2.set_ylabel('log$_{10}$ Pressure (bar)')
-    plt.subplots_adjust(hspace=0.1, bottom=0.25)
+#Plot residuals
+fig, (ax1, ax2) = plt.subplots(1, 2, sharex=True, figsize=[12, 8])
+ax1.plot(res_T.T, alpha=0.1, color='green')
+ax2.plot(res_P.T, alpha=0.1, color='green')
+for ax in [ax1, ax2]:
+    ax.axhline(0, color='black', linestyle='dashed')
+    ax.set_xlabel('Index')
+    ax.grid()
+ax1.set_ylabel('Temperature')
+ax2.set_ylabel('log$_{10}$ Pressure (bar)')
+plt.subplots_adjust(hspace=0.1, bottom=0.25)
 
-    # Add statistics text at the bottom
-    stats_text = (
-        f"--- NN Residuals ---\n"
-        f"Temperature Residuals : Median = {np.median(res_T):.2f} K, Std = {np.std(res_T):.2f} K\n"
-        f"Pressure Residuals : Median = {np.median(res_P):.3f} $log_{{10}}$ bar, Std = {np.std(res_P):.2f} $log_{{10}}$ bar"
-    )
+# Add statistics text at the bottom
+stats_text = (
+    f"--- NN Residuals ---\n"
+    f"Temperature Residuals : Median = {np.median(res_T):.2f} K, Std = {np.std(res_T):.2f} K\n"
+    f"Pressure Residuals : Median = {np.median(res_P):.3f} $log_{{10}}$ bar, Std = {np.std(res_P):.2f} $log_{{10}}$ bar"
+)
 
-    fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
-            verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
+        verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-    plt.savefig(plot_save_path+f'/res_NN.pdf', bbox_inches='tight')
-    plt.show()
+plt.savefig(plot_save_path+f'/res_NN.pdf', bbox_inches='tight')
+plt.show()
