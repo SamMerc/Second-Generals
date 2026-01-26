@@ -88,7 +88,8 @@ nn_depth = 5
 learning_rate = 1e-5
 
 #Regularization coefficient
-regularization_coeff = 0.0
+regularization_coeff_l1 = 0.0
+regularization_coeff_l2 = 0.0
 
 #Weight decay 
 weight_decay = 0.0
@@ -254,11 +255,12 @@ class NeuralNetwork(nn.Module):
 ###################################
 # PyTorch Lightning Module
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff=0.0):
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff_l1=0.0, reg_coeff_l2=0.0):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
-        self.reg_coeff = reg_coeff
+        self.reg_coeff_l1 = reg_coeff_l1
+        self.reg_coeff_l2 = reg_coeff_l2
         self.weight_decay = weight_decay
         self.loss_fn = nn.MSELoss()
         self.optimizer_class = optimizer
@@ -268,7 +270,7 @@ class RegressionModule(pl.LightningModule):
         Compute the gradient of model output with respect to input.
         Returns the L2 norm of the gradients as a regularization term.
         """
-        if self.reg_coeff == 0:
+        if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
             return torch.tensor(0., device=self.device)
         
         # Clone and enable gradient computation for inputs
@@ -292,10 +294,13 @@ class RegressionModule(pl.LightningModule):
             )[0]
             
             # Compute L2 norm of gradients (squared)
-            gradient_penalty = torch.mean(gradients ** 2)
+            gradient_penalty_squared = torch.mean(gradients ** 2)            
+            
+            # Compute L1 norm of gradients
+            gradient_penalty = torch.mean(gradients.abs())
         
-        return self.reg_coeff * gradient_penalty
-    
+        return self.reg_coeff_l1 * gradient_penalty, self.reg_coeff_l2 * gradient_penalty_squared
+
     def forward(self, x):
         return self.model(x)
     
@@ -305,8 +310,8 @@ class RegressionModule(pl.LightningModule):
         loss = self.loss_fn(pred, y)
         
         # Add gradient regularization
-        grad_penalty = self.compute_gradient_penalty(X)
-        loss += grad_penalty
+        grad_penalty_l1, grad_penalty_l2 = self.compute_gradient_penalty(X)
+        loss += grad_penalty_l1 + grad_penalty_l2
 
         # Log metrics
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -367,7 +372,8 @@ lightning_module = RegressionModule(
     model=model,
     optimizer=Adam,
     learning_rate=learning_rate,
-    reg_coeff=regularization_coeff,
+    reg_coeff_l1=regularization_coeff_l1,
+    reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay
 )
 
@@ -389,18 +395,19 @@ if run_mode == 'use':
     trainer.fit(lightning_module, datamodule=data_module)
     
     # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt')
+    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{learning_rate}LR_{batch_size}BS.ckpt')
     
     print("Done!")
     
 else:
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt',
+        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{learning_rate}LR_{batch_size}BS.ckpt',
         model=model,
         optimizer=Adam,
     learning_rate=learning_rate,
-    reg_coeff=regularization_coeff,
+    reg_coeff_l1=regularization_coeff_l1,
+    reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay
     )
     print("Model loaded!")

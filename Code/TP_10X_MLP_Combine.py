@@ -94,8 +94,10 @@ old_learning_rate = 1e-5
 new_learning_rate = 1e-5
 
 #Regularization coefficient
-old_regularization_coeff = 0.0
-new_regularization_coeff = 0.0
+old_regularization_coeff_l1 = 0.0
+old_regularization_coeff_l2 = 0.0
+new_regularization_coeff_l1 = 0.0
+new_regularization_coeff_l2 = 0.0
 
 #Weight decay 
 old_weight_decay = 0.0
@@ -400,12 +402,14 @@ class EnsembleLightningModule(pl.LightningModule):
     """
     PyTorch Lightning module for training the ensemble combiner.
     """
-    def __init__(self, ensemble_wrapper, optimizer, combiner_model, weight_decay=0.0, learning_rate=1e-4):
+    def __init__(self, ensemble_wrapper, optimizer, combiner_model, weight_decay=0.0, learning_rate=1e-4, reg_coeff_l1=0.0, reg_coeff_l2=0.0):
         super().__init__()
         self.ensemble_wrapper = ensemble_wrapper
         self.combiner = combiner_model
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.reg_coeff_l1 = reg_coeff_l1
+        self.reg_coeff_l2 = reg_coeff_l2
         self.loss_fn = nn.MSELoss()
         self.optimizer_class = optimizer
         
@@ -413,6 +417,54 @@ class EnsembleLightningModule(pl.LightningModule):
         for model in self.ensemble_wrapper.models:
             for param in model.parameters():
                 param.requires_grad = False
+    
+    def compute_gradient_penalty(self, ensemble_preds, original_inputs=None):
+        """
+        Compute the gradient of combiner output with respect to its inputs.
+        Returns the L1 and L2 norm of the gradients as regularization terms.
+        """
+        if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
+            return torch.tensor(0., device=self.device), torch.tensor(0., device=self.device)
+        
+        # Clone and enable gradient computation for inputs
+        ensemble_preds_grad = ensemble_preds.clone().detach().requires_grad_(True)
+        original_inputs_grad = None
+        if original_inputs is not None:
+            original_inputs_grad = original_inputs.clone().detach().requires_grad_(True)
+        
+        # Temporarily enable gradients (needed for validation/test steps)
+        with torch.enable_grad():
+            # Compute output (need to recompute to track gradients w.r.t. inputs)
+            output = self.combiner(ensemble_preds_grad, original_inputs_grad)
+            
+            # Compute gradients of output with respect to inputs
+            grad_outputs = torch.ones_like(output)
+            
+            # Get gradients w.r.t. ensemble_preds
+            inputs_to_grad = [ensemble_preds_grad]
+            if original_inputs_grad is not None:
+                inputs_to_grad.append(original_inputs_grad)
+            
+            gradients = torch.autograd.grad(
+                outputs=output,
+                inputs=inputs_to_grad,
+                grad_outputs=grad_outputs,
+                create_graph=True,  # Keep computation graph for backprop
+                retain_graph=True,
+                only_inputs=True
+            )
+            
+            # Combine gradients from both inputs
+            if len(gradients) == 2:
+                all_gradients = torch.cat([gradients[0].flatten(1), gradients[1].flatten(1)], dim=1)
+            else:
+                all_gradients = gradients[0]
+            
+            # Compute L1 and L2 norm of gradients
+            gradient_penalty_l1 = torch.mean(all_gradients.abs())
+            gradient_penalty_l2 = torch.mean(all_gradients ** 2)
+        
+        return self.reg_coeff_l1 * gradient_penalty_l1, self.reg_coeff_l2 * gradient_penalty_l2
     
     def forward(self, ensemble_preds, original_inputs=None):
         # Combine predictions with the meta-learner
@@ -428,6 +480,11 @@ class EnsembleLightningModule(pl.LightningModule):
             original_inputs = None
         pred = self(ensemble_preds, original_inputs)
         loss = self.loss_fn(pred, y)
+        
+        # Add gradient regularization
+        grad_penalty_l1, grad_penalty_l2 = self.compute_gradient_penalty(ensemble_preds, original_inputs)
+        loss += grad_penalty_l1 + grad_penalty_l2
+
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
     
@@ -554,7 +611,7 @@ orig_data_module = OriginalDataModule(
 # Collect paths to all trained models
 model_paths = []
 for i in range(1, n_models + 1):
-    model_path = model_saved_path + f'NeuralNetwork_{i}/{old_n_epochs}epochs_{old_weight_decay}WD_{old_regularization_coeff}RC_{old_learning_rate}LR_{old_batch_size}BS.ckpt'
+    model_path = model_saved_path + f'NeuralNetwork_{i}/{old_n_epochs}epochs_{old_weight_decay}WD_{old_regularization_coeff_l1+old_regularization_coeff_l2}RC_{old_learning_rate}LR_{old_batch_size}BS.ckpt'
     if os.path.exists(model_path):
         model_paths.append(model_path)
     else:
@@ -628,14 +685,14 @@ if run_mode == 'use':
     trainer.fit(ensemble_lightning, datamodule=new_data_module)
     
     # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{new_n_epochs}epochs_{new_weight_decay}WD_{new_regularization_coeff}RC_{new_learning_rate}LR_{new_batch_size}BS.ckpt')
+    trainer.save_checkpoint(model_save_path + f'{new_n_epochs}epochs_{new_weight_decay}WD_{new_regularization_coeff_l1+new_regularization_coeff_l2}RC_{new_learning_rate}LR_{new_batch_size}BS.ckpt')
     
     print("Done!")
     
 else:
     # Load model
     lightning_module = EnsembleLightningModule.load_from_checkpoint(
-        model_save_path + f'{new_n_epochs}epochs_{new_weight_decay}WD_{new_regularization_coeff}RC_{new_learning_rate}LR_{new_batch_size}BS.ckpt',
+        model_save_path + f'{new_n_epochs}epochs_{new_weight_decay}WD_{new_regularization_coeff_l1+new_regularization_coeff_l2}RC_{new_learning_rate}LR_{new_batch_size}BS.ckpt',
         ensemble_wrapper=ensemble_wrapper,
         combiner_model=combiner,
         learning_rate=new_learning_rate,
