@@ -222,22 +222,22 @@ class EnsembleDataModule(pl.LightningDataModule):
         # Store the scaler if you need to inverse transform later
         self.in_scaler = in_scaler
 
-        if self.train_original_inputs is not None:
+        if train_original_inputs is not None:
 
             # Normalizing the original input
             ## Create scaler
-            orig_in_scaler = MinMaxScaler()
+            past_in_scaler = MinMaxScaler()
             
             ## Fit scaler on training dataset (convert to numpy)
-            orig_in_scaler.fit(train_original_inputs.numpy())
+            past_in_scaler.fit(train_original_inputs.numpy())
             
             ## Transform all datasets and convert back to tensors
-            train_original_inputs = torch.tensor(orig_in_scaler.transform(train_original_inputs.numpy()), dtype=torch.float32)
-            valid_original_inputs = torch.tensor(orig_in_scaler.transform(valid_original_inputs.numpy()), dtype=torch.float32)
-            test_original_inputs = torch.tensor(orig_in_scaler.transform(test_original_inputs.numpy()), dtype=torch.float32)
+            train_original_inputs = torch.tensor(past_in_scaler.transform(train_original_inputs.numpy()), dtype=torch.float32)
+            valid_original_inputs = torch.tensor(past_in_scaler.transform(valid_original_inputs.numpy()), dtype=torch.float32)
+            test_original_inputs = torch.tensor(past_in_scaler.transform(test_original_inputs.numpy()), dtype=torch.float32)
             
             # Store the scaler if you need to inverse transform later
-            self.orig_in_scaler = orig_in_scaler
+            self.past_in_scaler = past_in_scaler
 
         self.train_ensemble_preds = train_ensemble_preds
         self.train_targets = train_targets
@@ -475,8 +475,9 @@ def prepare_ensemble_data(ensemble_wrapper, original_data_module, device='cpu'):
     Returns:
         Dictionary containing ensemble predictions and targets for train/val/test
     """
-    ensemble_wrapper.ensemble_wrapper.eval()
-    
+    for model in ensemble_wrapper.models:
+        model.eval()   
+         
     data = {}
     
     # Process each split
@@ -505,6 +506,8 @@ def prepare_ensemble_data(ensemble_wrapper, original_data_module, device='cpu'):
         data[f'{split_name}_inputs'] = torch.cat(all_inputs, dim=0)
         data[f'{split_name}_ensemble_preds'] = torch.cat(all_ensemble_preds, dim=0)
         data[f'{split_name}_targets'] = torch.cat(all_targets, dim=0)
+    
+    return data
 
 #Splitting the original data 
 ## Retrieving indices of data partitions
@@ -703,53 +706,84 @@ plt.savefig(plot_save_path+'/loss.pdf')
 #Comparing predicted T-P profiles vs true T-P profiles with residuals
 substep = 100
 
-# Get the scalers from data module
-out_scaler = new_data_module.out_scaler
-in_scaler = new_data_module.in_scaler
+# Get the scalers from original and new data module
+orig_out_scaler = orig_data_module.out_scaler
+orig_in_scaler = orig_data_module.in_scaler
+
+new_out_scaler = new_data_module.out_scaler
+new_in_scaler = new_data_module.in_scaler
+if with_orig_inputs:past_in_scaler = new_data_module.past_in_scaler
 
 #Converting tensors to numpy arrays if this isn't already done
 if (type(test_outputs_T) != np.ndarray):
     test_outputs_T = test_outputs_T.numpy()
     test_outputs_P = test_outputs_P.numpy()
 
-res_T = np.zeros(test_outputs_P.shape, dtype=float)
-res_P = np.zeros(test_outputs_P.shape, dtype=float)
+#Set up residual array
+res_Ts = np.zeros((n_models+1, test_outputs_T.shape[0], test_outputs_T.shape[1]), dtype=float)
+res_Ps = np.zeros((n_models+1, test_outputs_P.shape[0], test_outputs_P.shape[1]), dtype=float)
 
 for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_inputs, test_outputs_T, test_outputs_P)):
 
     #Convert to numpy and reshape
     test_input = test_input.numpy()
 
-    #Retrieve predictions for each model
-    for model in ensemble_wrapper.models:
-        pred_output = model(torch.tensor(in_scaler.transform(test_input.reshape(1, -1)))).detach().numpy()
-    
-    # Inverse transform to get original scale
-    pred_output_original = out_scaler.inverse_transform(pred_output.reshape(1, -1)).flatten()
-    
-    # Split back into T and P components
-    pred_output_T = pred_output_original[:O]
-    pred_output_P = pred_output_original[O:]
+    pred_outputs_T = np.zeros((n_models+1,O), dtype=float)
+    pred_outputs_P = np.zeros((n_models+1,O), dtype=float)
 
+    #Retrieve predictions for each model
+    for imodel, model in enumerate(ensemble_wrapper.models):
+        pred_output = model(torch.tensor(orig_in_scaler.transform(test_input.reshape(1, -1)))).detach().numpy()
+    
+        # Inverse transform to get original scale
+        pred_output_original =orig_out_scaler.inverse_transform(pred_output.reshape(1, -1)).flatten()
+        
+        # Split back into T and P components
+        pred_outputs_T[imodel,:] = pred_output_original[:O]
+        pred_outputs_P[imodel,:] = pred_output_original[O:]
+
+    #Retrieve prediction from combiner
+    if with_orig_inputs:
+        pred_output = combiner(
+                            torch.tensor(new_in_scaler.transform(np.concatenate([pred_outputs_T[imodel,:], pred_outputs_P[imodel,:]]).reshape(1, -1))), 
+                            torch.tensor(past_in_scaler.transform(test_input.reshape(1, -1)))
+                            ).detach().numpy()
+    else:
+        pred_output = combiner(torch.tensor(new_in_scaler.transform(torch.cat((pred_outputs_T, pred_outputs_P)).reshape(1, -1)))).detach().numpy()
+                           
+    # Inverse transform to get original scale
+    pred_output_original =new_out_scaler.inverse_transform(pred_output.reshape(1, -1)).flatten()
+
+    # Split back into T and P components
+    pred_outputs_T[-1,:] = pred_output_original[:O]
+    pred_outputs_P[-1,:] = pred_output_original[O:]
+    
     #Storing residuals 
-    res_T[test_idx, :] = pred_output_T - test_output_T
-    res_P[test_idx, :] = pred_output_P - test_output_P
+    res_Ts[:, test_idx, :] = pred_outputs_T - test_output_T
+    res_Ps[:, test_idx, :] = pred_outputs_P - test_output_P
+
     #Plotting
     if (test_idx % substep == 0):
         fig, axs = plt.subplot_mosaic([['res_pressure', '.'],
                                     ['results', 'res_temperature']],
                             figsize=(8, 6),
                             width_ratios=(3, 1), height_ratios=(1, 3),
-                            layout='constrained')        
-        axs['results'].plot(test_output_T, test_output_P, '.', linestyle='-', color='blue', linewidth=2)
-        axs['results'].plot(pred_output_T, pred_output_P, color='green', linewidth=2)
+                            layout='constrained') 
+
+        for imodel in range(n_models+1):       
+            axs['results'].plot(test_output_T, test_output_P, '.', linestyle='-', color='blue', linewidth=2)
+            axs['results'].plot(pred_outputs_T[imodel, :], pred_outputs_P[imodel, :], color='green', linewidth=2)
+
+            axs['res_temperature'].plot(res_Ts[imodel, test_idx, :], test_output_P, '.', linestyle='-', color='green', linewidth=2)
+
+            axs['res_pressure'].plot(test_output_T, res_Ps[imodel, test_idx, :], '.', linestyle='-', color='green', linewidth=2)
+
         axs['results'].invert_yaxis()
         axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
         axs['results'].set_xlabel('Temperature (K)')
         axs['results'].legend()
         axs['results'].grid()
 
-        axs['res_temperature'].plot(res_T[test_idx, :], test_output_P, '.', linestyle='-', color='green', linewidth=2)
         axs['res_temperature'].set_xlabel('Residuals (K)')
         axs['res_temperature'].invert_yaxis()
         axs['res_temperature'].grid()
@@ -758,7 +792,6 @@ for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_i
         axs['res_temperature'].yaxis.set_label_position("right")
         axs['res_temperature'].sharey(axs['results'])
 
-        axs['res_pressure'].plot(test_output_T, res_P[test_idx, :], '.', linestyle='-', color='green', linewidth=2)
         axs['res_pressure'].set_ylabel('Residuals (bar)')
         axs['res_pressure'].invert_yaxis()
         axs['res_pressure'].grid()
@@ -766,36 +799,51 @@ for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_i
         axs['res_pressure'].xaxis.tick_top()
         axs['res_pressure'].xaxis.set_label_position("top")
         axs['res_pressure'].sharex(axs['results'])
-
+    
         plt.suptitle(rf'H$_2$ : {test_input[0]} bar, CO$_2$ : {test_input[1]} bar, LoD : {test_input[2]:.0f} days, Obliquity : {test_input[3]} deg')
         plt.savefig(plot_save_path+f'/pred_vs_actual_n.{test_idx}.pdf')
     
     
-print('\n','--- NN Residuals ---')
-print(f'Temperature Residuals : Median = {np.median(res_T):.2f} K, Std = {np.std(res_T):.2f} K')
-print(rf'Pressure Residuals : Median = {np.median(res_P):.3f} $log_{10}$ bar, Std = {np.std(res_P):.2f} $log_{10}$ bar')
-
-#Plot residuals
-fig, (ax1, ax2) = plt.subplots(1, 2, sharex=True, figsize=[12, 8])
-ax1.plot(res_T.T, alpha=0.1, color='green')
-ax2.plot(res_P.T, alpha=0.1, color='green')
-for ax in [ax1, ax2]:
-    ax.axhline(0, color='black', linestyle='dashed')
-    ax.set_xlabel('Index')
-    ax.grid()
-ax1.set_ylabel('Temperature')
-ax2.set_ylabel('log$_{10}$ Pressure (bar)')
-plt.subplots_adjust(hspace=0.1, bottom=0.25)
-
-# Add statistics text at the bottom
+fig, axes = plt.subplots(11, 2, sharex=True, figsize=[50, 8])
+# Initialize statistics text 
 stats_text = (
     f"--- NN Residuals ---\n"
-    f"Temperature Residuals : Median = {np.median(res_T):.2f} K, Std = {np.std(res_T):.2f} K\n"
-    f"Pressure Residuals : Median = {np.median(res_P):.3f} $log_{{10}}$ bar, Std = {np.std(res_P):.2f} $log_{{10}}$ bar"
 )
+print('\n','--- NN Residuals ---')
 
+#Define colours 
+colours = plt.get_cmap('viridis')(np.linspace(0., 1, n_models+1))
+
+for imodel in range(n_models+1):
+    print('\n',f'    --- Model {imodel+1} ---')
+    print(f'    Temperature Residuals : Median = {np.median(res_Ts[imodel, :, :]):.2f} K, Std = {np.std(res_Ts[imodel, :, :]):.2f} K')
+    print(rf'   Pressure Residuals : Median = {np.median(res_Ps[imodel, :, :]):.3f} $log_{10}$ bar, Std = {np.std(res_Ps[imodel, :, :]):.2f} $log_{10}$ bar')
+
+    label = f'Model {imodel+1}' if imodel < n_models else 'Combiner'
+
+    #Plot residuals
+    axes[imodel, 0].set_title(label)
+    axes[imodel, 0].plot(res_Ts[imodel, :, :].T, alpha=0.1, color=colours[imodel])
+    axes[imodel, 1].plot(res_Ts[imodel, :, :].T, alpha=0.1, color=colours[imodel])
+    for ax in [axes[imodel, 0], axes[imodel, 1]]:
+        ax.axhline(0, color='black', linestyle='dashed')
+        ax.set_xlabel('Index')
+        ax.grid()
+    axes[imodel, 0].set_ylabel('Temperature')
+    axes[imodel, 1].set_ylabel('log$_{10}$ Pressure (bar)')
+
+    stats_text += (
+        f'    --- Model {imodel+1} ---'
+        f"Temperature Residuals : Median = {np.median(res_Ts[imodel, :, :]):.2f} K, Std = {np.std(res_Ts[imodel, :, :]):.2f} K\n"
+        f"Pressure Residuals : Median = {np.median(res_Ps[imodel, :, :]):.3f} $log_{{10}}$ bar, Std = {np.std(res_Ps[imodel, :, :]):.2f} $log_{{10}}$ bar"
+    )
+
+plt.subplots_adjust(hspace=0.1, bottom=0.25)
+
+#Add statistics text at the bottom
 fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
         verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
+plt.legend()
 plt.savefig(plot_save_path+f'/res_NN.pdf', bbox_inches='tight')
 plt.show()
