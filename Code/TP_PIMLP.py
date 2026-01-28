@@ -146,7 +146,7 @@ def TP_model(params, pressures):
     func_layer_2 = lambda P : T2 + (np.log(P/P2) / alpha2) ** (1/beta2)
     temperatures[P_layer_2] = func_layer_2(pressures[P_layer_2])
 
-    # Layer 3: P2 < P < P3
+    # Layer 3: P > P3
     P_layer_3 = (pressures >= P3)
     func_layer_3 = lambda P : T3
     temperatures[P_layer_3] = func_layer_3(pressures[P_layer_3])
@@ -154,19 +154,64 @@ def TP_model(params, pressures):
     return temperatures, ((P0, T0), (P1, func_layer_1(P1)), (P2, T2), (P3, T3))
 
 
-# Plot a sample atmosphere profile
-pressures = np.logspace(-4, 2, 10000)
-params = (200, 1e-5, 1e-3, 1e-1, 10, 0.2, 0.2)
-temperature_profile, model_vals = TP_model(params, pressures)
+###############################################
+#### Example fit on one of the TP profiles ####
+###############################################
+
+from lmfit import minimize, Parameters
+
+data_T = raw_outputs_T[6]
+data_P = 10**raw_outputs_P[6]
+params = Parameters()
+params.add('T0', 
+           value=data_T.min() + 10,
+           min=data_T.min() - 50,
+           max=data_T.max() + 50)
+
+P0_init = data_P.min() * 2
+params.add('P0', 
+           value=P0_init,
+           min=data_P.min() * 0.5,
+           max=data_P.min() * 100)
+
+P1_init = data_P.min() * 100
+params.add('P1', 
+           value=P1_init,
+           min=P0_init * 10,        
+           max=data_P.max() * 0.1)
+
+P2_init = data_P.max() * 0.1
+params.add('P2', 
+           value=P2_init,
+           min=P1_init * 10,        
+           max=data_P.max() * 0.5)
+
+params.add('P3', 
+           value=data_P.max() * 2,   
+           min=P2_init * 2,          
+           max=data_P.max() * 100)
+
+params.add('alpha1', value=0.2, min=0.01, max=2.0)
+params.add('alpha2', value=0.2, min=0.01, max=2.0)
+
+def residual(params, pressures, data_T):
+    param_values = (params['T0'], params['P0'], params['P1'], params['P2'], params['P3'], params['alpha1'], params['alpha2'])
+    model_T, _ = TP_model(param_values, pressures)
+    return model_T - data_T
+
+result = minimize(residual, params, args=(10**raw_outputs_P[6], raw_outputs_T[6]))
+print(result.params)
+bestfit = (result.params['T0'].value, result.params['P0'].value, result.params['P1'].value, result.params['P2'].value, result.params['P3'].value, result.params['alpha1'].value, result.params['alpha2'].value)
+
+model_pressures = np.logspace(raw_outputs_P[6][0], raw_outputs_P[6][-1], 10000)
+temperature_profile, points = TP_model(bestfit, model_pressures)
 
 plt.figure(figsize=(6, 8))
-plt.plot(temperature_profile, pressures, label='TP Profile')
-for P,T in model_vals:
-    plt.scatter(T, P, color='red')
-plt.yscale('log')
+plt.plot(raw_outputs_T[6], raw_outputs_P[6], label='Truth')
+plt.plot(temperature_profile, np.log10(model_pressures), label='Model')
 plt.gca().invert_yaxis()
 plt.xlabel('Temperature (K)')
-plt.ylabel('Pressure (bar)')
+plt.ylabel(r'log$_{10}$ Pressure (bar)')
 plt.title('Sample Temperature-Pressure Profile')
 plt.legend()
 plt.grid()
