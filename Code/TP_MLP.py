@@ -79,9 +79,6 @@ NN_seed = 6
 NN_rng = torch.Generator(device=device)
 NN_rng.manual_seed(NN_seed)
 
-# Variable to show plots or not 
-show_plot = False
-
 #Neural network width and depth
 nn_width = 102
 nn_depth = 5

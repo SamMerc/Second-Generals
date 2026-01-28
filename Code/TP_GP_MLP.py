@@ -28,16 +28,16 @@ import pandas as pd
 def check_and_make_dir(dir):
     if not os.path.isdir(dir):os.mkdir(dir)
 #Base directory 
-base_dir = '/home/merci228/WORK/2G_ML/'
+base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing temperature values
 raw_T_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
 #File containing pressure values
 raw_P_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/GP_stand_norm/'
+model_save_path = base_dir+'Model_Storage/GP_stand_norm_smooth/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/GP_stand_norm/'
+plot_save_path = base_dir+'Plots/GP_stand_norm_smooth/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -103,7 +103,7 @@ regularization_coeff_l1 = 0.0
 regularization_coeff_l2 = 0.0
 
 #Smoothness constraint coefficient
-smoothness_coeff = 0.0
+smoothness_coeff = 0.001
 
 #Weight decay 
 weight_decay = 0.0
@@ -112,7 +112,7 @@ weight_decay = 0.0
 batch_size = 200
 
 #Number of epochs 
-n_epochs = 100000
+n_epochs = 10000
 
 #Mode for optimization
 run_mode = 'use'

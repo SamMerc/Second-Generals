@@ -77,9 +77,6 @@ batch_rng.manual_seed(batch_seed)
 #Defining the noise seeds for the 10 neural network initializations
 NN_seeds = [6,7,8,9,10,11,12,13,14,15]
 
-# Variable to show plots or not 
-show_plot = False
-
 #Neural network width and depth
 nn_width = 102
 nn_depth = 5
