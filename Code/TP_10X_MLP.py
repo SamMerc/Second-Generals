@@ -265,41 +265,23 @@ class RegressionModule(pl.LightningModule):
         self.loss_fn = nn.MSELoss()
         self.optimizer_class = optimizer
     
-    def compute_gradient_penalty(self, X):
+    def compute_weight_regularization(self):
         """
-        Compute the gradient of model output with respect to input.
-        Returns the L2 norm of the gradients as a regularization term.
+        Compute L1 and L2 regularization on model weights (parameters).
         """
         if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
-            return torch.tensor(0., device=self.device)
+            return torch.tensor(0., device=self.device), torch.tensor(0., device=self.device)
         
-        # Clone and enable gradient computation for inputs
-        X_grad = X.clone().detach().requires_grad_(True)
-
-        # Temporarily enable gradients (needed for validation/test steps)
-        with torch.enable_grad():
-            
-            # Compute output (need to recompute to track gradients w.r.t. X)
-            output = self.model(X_grad)
-            
-            # Compute gradients of output with respect to input
-            grad_outputs = torch.ones_like(output)
-            gradients = torch.autograd.grad(
-                outputs=output,
-                inputs=X_grad,
-                grad_outputs=grad_outputs,
-                create_graph=True,  # Keep computation graph for backprop
-                retain_graph=True,
-                only_inputs=True
-            )[0]
-            
-            # Compute L2 norm of gradients (squared)
-            gradient_penalty_squared = torch.mean(gradients ** 2)            
-            
-            # Compute L1 norm of gradients
-            gradient_penalty = torch.mean(gradients.abs())
+        l1_penalty = torch.tensor(0., device=self.device)
+        l2_penalty = torch.tensor(0., device=self.device)
         
-        return self.reg_coeff_l1 * gradient_penalty, self.reg_coeff_l2 * gradient_penalty_squared
+        for param in self.model.parameters():
+            if self.reg_coeff_l1 > 0:
+                l1_penalty += torch.sum(torch.abs(param))
+            if self.reg_coeff_l2 > 0:
+                l2_penalty += torch.sum(param ** 2)
+        
+        return self.reg_coeff_l1 * l1_penalty, self.reg_coeff_l2 * l2_penalty
 
     def forward(self, x):
         return self.model(x)
@@ -308,9 +290,9 @@ class RegressionModule(pl.LightningModule):
         X, y = batch
         pred = self(X)
         loss = self.loss_fn(pred, y)
-        
-        # Add gradient regularization
-        grad_penalty_l1, grad_penalty_l2 = self.compute_gradient_penalty(X)
+
+        # Add weight regularization
+        grad_penalty_l1, grad_penalty_l2 = self.compute_weight_regularization()
         loss += grad_penalty_l1 + grad_penalty_l2
 
         # Log metrics

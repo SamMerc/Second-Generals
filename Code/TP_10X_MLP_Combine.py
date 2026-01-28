@@ -418,53 +418,23 @@ class EnsembleLightningModule(pl.LightningModule):
             for param in model.parameters():
                 param.requires_grad = False
     
-    def compute_gradient_penalty(self, ensemble_preds, original_inputs=None):
+    def compute_weight_regularization(self):
         """
-        Compute the gradient of combiner output with respect to its inputs.
-        Returns the L1 and L2 norm of the gradients as regularization terms.
+        Compute L1 and L2 regularization on combiner model weights (parameters).
         """
         if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
             return torch.tensor(0., device=self.device), torch.tensor(0., device=self.device)
         
-        # Clone and enable gradient computation for inputs
-        ensemble_preds_grad = ensemble_preds.clone().detach().requires_grad_(True)
-        original_inputs_grad = None
-        if original_inputs is not None:
-            original_inputs_grad = original_inputs.clone().detach().requires_grad_(True)
+        l1_penalty = torch.tensor(0., device=self.device)
+        l2_penalty = torch.tensor(0., device=self.device)
         
-        # Temporarily enable gradients (needed for validation/test steps)
-        with torch.enable_grad():
-            # Compute output (need to recompute to track gradients w.r.t. inputs)
-            output = self.combiner(ensemble_preds_grad, original_inputs_grad)
-            
-            # Compute gradients of output with respect to inputs
-            grad_outputs = torch.ones_like(output)
-            
-            # Get gradients w.r.t. ensemble_preds
-            inputs_to_grad = [ensemble_preds_grad]
-            if original_inputs_grad is not None:
-                inputs_to_grad.append(original_inputs_grad)
-            
-            gradients = torch.autograd.grad(
-                outputs=output,
-                inputs=inputs_to_grad,
-                grad_outputs=grad_outputs,
-                create_graph=True,  # Keep computation graph for backprop
-                retain_graph=True,
-                only_inputs=True
-            )
-            
-            # Combine gradients from both inputs
-            if len(gradients) == 2:
-                all_gradients = torch.cat([gradients[0].flatten(1), gradients[1].flatten(1)], dim=1)
-            else:
-                all_gradients = gradients[0]
-            
-            # Compute L1 and L2 norm of gradients
-            gradient_penalty_l1 = torch.mean(all_gradients.abs())
-            gradient_penalty_l2 = torch.mean(all_gradients ** 2)
+        for param in self.combiner.parameters():
+            if self.reg_coeff_l1 > 0:
+                l1_penalty += torch.sum(torch.abs(param))
+            if self.reg_coeff_l2 > 0:
+                l2_penalty += torch.sum(param ** 2)
         
-        return self.reg_coeff_l1 * gradient_penalty_l1, self.reg_coeff_l2 * gradient_penalty_l2
+        return self.reg_coeff_l1 * l1_penalty, self.reg_coeff_l2 * l2_penalty
     
     def forward(self, ensemble_preds, original_inputs=None):
         # Combine predictions with the meta-learner
@@ -480,10 +450,10 @@ class EnsembleLightningModule(pl.LightningModule):
             original_inputs = None
         pred = self(ensemble_preds, original_inputs)
         loss = self.loss_fn(pred, y)
-        
-        # Add gradient regularization
-        grad_penalty_l1, grad_penalty_l2 = self.compute_gradient_penalty(ensemble_preds, original_inputs)
-        loss += grad_penalty_l1 + grad_penalty_l2
+
+        # Add weight regularization
+        weight_penalty_l1, weight_penalty_l2 = self.compute_weight_regularization()
+        loss += weight_penalty_l1 + weight_penalty_l2
 
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
