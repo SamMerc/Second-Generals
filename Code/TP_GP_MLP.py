@@ -65,21 +65,20 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 num_threads = 96
 torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
-torch.set_default_device(device)
 
 #Defining the noise seed for the random partitioning of the training data
 partition_seed = 4
-partition_rng = torch.Generator(device=device)
+partition_rng = torch.Generator()
 partition_rng.manual_seed(partition_seed)
 
 #Defining the noise seed for the generating of batches from the partitioned data
 batch_seed = 5
-batch_rng = torch.Generator(device=device)
+batch_rng = torch.Generator()
 batch_rng.manual_seed(batch_seed)
 
 #Defining the noise seed for the neural network initialization
 NN_seed = 6
-NN_rng = torch.Generator(device=device)
+NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
 # Variable to show plots or not 
@@ -225,12 +224,12 @@ class CustomDataModule(pl.LightningDataModule):
         out_scaler = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        out_scaler.fit(train_outputs.numpy())
+        out_scaler.fit(train_outputs.cpu().numpy())
         
         ## Transform all datasets and convert back to tensors
-        train_outputs = torch.tensor(out_scaler.transform(train_outputs.numpy()), dtype=torch.float32)
-        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.numpy()), dtype=torch.float32)
-        test_outputs = torch.tensor(out_scaler.transform(test_outputs.numpy()), dtype=torch.float32)
+        train_outputs = torch.tensor(out_scaler.transform(train_outputs.cpu().numpy()), dtype=torch.float32)
+        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.cpu().numpy()), dtype=torch.float32)
+        test_outputs = torch.tensor(out_scaler.transform(test_outputs.cpu().numpy()), dtype=torch.float32)
         
         # Store the scaler if you need to inverse transform later
         self.out_scaler = out_scaler
@@ -240,12 +239,12 @@ class CustomDataModule(pl.LightningDataModule):
         in_scaler = MinMaxScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        in_scaler.fit(train_inputs.numpy())
+        in_scaler.fit(train_inputs.cpu().numpy())
         
         ## Transform all datasets and convert back to tensors
-        train_inputs = torch.tensor(in_scaler.transform(train_inputs.numpy()), dtype=torch.float32)
-        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.numpy()), dtype=torch.float32)
-        test_inputs = torch.tensor(in_scaler.transform(test_inputs.numpy()), dtype=torch.float32)
+        train_inputs = torch.tensor(in_scaler.transform(train_inputs.cpu().numpy()), dtype=torch.float32)
+        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.cpu().numpy()), dtype=torch.float32)
+        test_inputs = torch.tensor(in_scaler.transform(test_inputs.cpu().numpy()), dtype=torch.float32)
         
         # Store the scaler if you need to inverse transform later
         self.in_scaler = in_scaler
@@ -272,7 +271,7 @@ class CustomDataModule(pl.LightningDataModule):
         dataset = TensorDataset(self.test_inputs, self.test_outputs)
         return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
 
-model = NeuralNetwork(2*O, nn_width, 2*O, nn_depth, generator=NN_rng).to(device)
+model = NeuralNetwork(2*O, nn_width, 2*O, nn_depth, generator=NN_rng)
 summary(model)
 
 
@@ -628,10 +627,14 @@ substep = 100
 out_scaler = data_module.out_scaler
 in_scaler = data_module.in_scaler
 
+# Move model to CPU for inference to avoid GPU memory issues
+model.cpu()
+model.eval()
+
 #Converting tensors to numpy arrays if this isn't already done
 if (type(NN_test_outputs_T) != np.ndarray):
-    NN_test_outputs_T = NN_test_outputs_T.numpy()
-    NN_test_outputs_P = NN_test_outputs_P.numpy()
+    NN_test_outputs_T = NN_test_outputs_T.cpu().numpy()
+    NN_test_outputs_P = NN_test_outputs_P.cpu().numpy()
 
 GP_res_T = np.zeros(NN_test_outputs_P.shape, dtype=float)
 GP_res_P = np.zeros(NN_test_outputs_P.shape, dtype=float)
@@ -653,7 +656,7 @@ for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, NN_test_out
     NN_pred_output_P = NN_pred_output_original[O:]
 
     #Convert to numpy
-    NN_test_input = NN_test_input.numpy()
+    NN_test_input = NN_test_input.cpu().numpy()
 
     #Storing residuals 
     GP_res_T[NN_test_idx, :] = GP_test_output_T.numpy() - NN_test_output_T

@@ -65,21 +65,20 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 num_threads = 1
 torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
-torch.set_default_device(device)
 
 #Defining the noise seed for the random partitioning of the training data
 partition_seed = 4
-partition_rng = torch.Generator(device=device)
+partition_rng = torch.Generator()
 partition_rng.manual_seed(partition_seed)
 
 #Defining the noise seed for the generating of batches from the partitioned data
 batch_seed = 5
-batch_rng = torch.Generator(device=device)
+batch_rng = torch.Generator()
 batch_rng.manual_seed(batch_seed)
 
 #Defining the noise seed for the neural network initialization
 NN_seed = 16
-NN_rng = torch.Generator(device=device)
+NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
 # Whether to give combiner access to original inputs
@@ -128,12 +127,12 @@ class OriginalDataModule(pl.LightningDataModule):
         out_scaler = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        out_scaler.fit(train_outputs.numpy())
+        out_scaler.fit(train_outputs.cpu().numpy())
         
         ## Transform all datasets and convert back to tensors
-        train_outputs = torch.tensor(out_scaler.transform(train_outputs.numpy()), dtype=torch.float32)
-        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.numpy()), dtype=torch.float32)
-        test_outputs = torch.tensor(out_scaler.transform(test_outputs.numpy()), dtype=torch.float32)
+        train_outputs = torch.tensor(out_scaler.transform(train_outputs.cpu().numpy()), dtype=torch.float32)
+        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.cpu().numpy()), dtype=torch.float32)
+        test_outputs = torch.tensor(out_scaler.transform(test_outputs.cpu().numpy()), dtype=torch.float32)
         
         # Store the scaler if you need to inverse transform later
         self.out_scaler = out_scaler
@@ -143,12 +142,12 @@ class OriginalDataModule(pl.LightningDataModule):
         in_scaler = MinMaxScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        in_scaler.fit(train_inputs.numpy())
+        in_scaler.fit(train_inputs.cpu().numpy())
         
         ## Transform all datasets and convert back to tensors
-        train_inputs = torch.tensor(in_scaler.transform(train_inputs.numpy()), dtype=torch.float32)
-        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.numpy()), dtype=torch.float32)
-        test_inputs = torch.tensor(in_scaler.transform(test_inputs.numpy()), dtype=torch.float32)
+        train_inputs = torch.tensor(in_scaler.transform(train_inputs.cpu().numpy()), dtype=torch.float32)
+        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.cpu().numpy()), dtype=torch.float32)
+        test_inputs = torch.tensor(in_scaler.transform(test_inputs.cpu().numpy()), dtype=torch.float32)
         
         # Store the scaler if you need to inverse transform later
         self.in_scaler = in_scaler
@@ -199,12 +198,12 @@ class EnsembleDataModule(pl.LightningDataModule):
         out_scaler = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        out_scaler.fit(train_targets.numpy())
+        out_scaler.fit(train_targets.cpu().numpy())
         
         ## Transform all datasets and convert back to tensors
-        train_targets = torch.tensor(out_scaler.transform(train_targets.numpy()), dtype=torch.float32)
-        valid_targets = torch.tensor(out_scaler.transform(valid_targets.numpy()), dtype=torch.float32)
-        test_targets = torch.tensor(out_scaler.transform(test_targets.numpy()), dtype=torch.float32)
+        train_targets = torch.tensor(out_scaler.transform(train_targets.cpu().numpy()), dtype=torch.float32)
+        valid_targets = torch.tensor(out_scaler.transform(valid_targets.cpu().numpy()), dtype=torch.float32)
+        test_targets = torch.tensor(out_scaler.transform(test_targets.cpu().numpy()), dtype=torch.float32)
         
         # Store the scaler if you need to inverse transform later
         self.out_scaler = out_scaler
@@ -214,12 +213,12 @@ class EnsembleDataModule(pl.LightningDataModule):
         in_scaler = MinMaxScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        in_scaler.fit(train_ensemble_preds.numpy())
+        in_scaler.fit(train_ensemble_preds.cpu().numpy())
         
         ## Transform all datasets and convert back to tensors
-        train_ensemble_preds = torch.tensor(in_scaler.transform(train_ensemble_preds.numpy()), dtype=torch.float32)
-        valid_ensemble_preds = torch.tensor(in_scaler.transform(valid_ensemble_preds.numpy()), dtype=torch.float32)
-        test_ensemble_preds = torch.tensor(in_scaler.transform(test_ensemble_preds.numpy()), dtype=torch.float32)
+        train_ensemble_preds = torch.tensor(in_scaler.transform(train_ensemble_preds.cpu().numpy()), dtype=torch.float32)
+        valid_ensemble_preds = torch.tensor(in_scaler.transform(valid_ensemble_preds.cpu().numpy()), dtype=torch.float32)
+        test_ensemble_preds = torch.tensor(in_scaler.transform(test_ensemble_preds.cpu().numpy()), dtype=torch.float32)
         
         # Store the scaler if you need to inverse transform later
         self.in_scaler = in_scaler
@@ -231,12 +230,12 @@ class EnsembleDataModule(pl.LightningDataModule):
             past_in_scaler = MinMaxScaler()
             
             ## Fit scaler on training dataset (convert to numpy)
-            past_in_scaler.fit(train_original_inputs.numpy())
+            past_in_scaler.fit(train_original_inputs.cpu().numpy())
             
             ## Transform all datasets and convert back to tensors
-            train_original_inputs = torch.tensor(past_in_scaler.transform(train_original_inputs.numpy()), dtype=torch.float32)
-            valid_original_inputs = torch.tensor(past_in_scaler.transform(valid_original_inputs.numpy()), dtype=torch.float32)
-            test_original_inputs = torch.tensor(past_in_scaler.transform(test_original_inputs.numpy()), dtype=torch.float32)
+            train_original_inputs = torch.tensor(past_in_scaler.transform(train_original_inputs.cpu().numpy()), dtype=torch.float32)
+            valid_original_inputs = torch.tensor(past_in_scaler.transform(valid_original_inputs.cpu().numpy()), dtype=torch.float32)
+            test_original_inputs = torch.tensor(past_in_scaler.transform(test_original_inputs.cpu().numpy()), dtype=torch.float32)
             
             # Store the scaler if you need to inverse transform later
             self.past_in_scaler = past_in_scaler
@@ -625,7 +624,7 @@ combiner = EnsembleCombiner(
     include_inputs=with_orig_inputs,  
     input_dim=D,
     generator=NN_rng
-).to(device)
+)
 
 # 4. Create Lightning module
 ensemble_lightning = EnsembleLightningModule(
@@ -741,10 +740,17 @@ new_out_scaler = new_data_module.out_scaler
 new_in_scaler = new_data_module.in_scaler
 if with_orig_inputs:past_in_scaler = new_data_module.past_in_scaler
 
+# FIX: Move all models to CPU for inference
+for model in ensemble_wrapper.models:
+    model.cpu()
+    model.eval()
+combiner.cpu()
+combiner.eval()
+
 #Converting tensors to numpy arrays if this isn't already done
 if (type(test_outputs_T) != np.ndarray):
-    test_outputs_T = test_outputs_T.numpy()
-    test_outputs_P = test_outputs_P.numpy()
+    test_outputs_T = test_outputs_T.cpu().numpy()
+    test_outputs_P = test_outputs_P.cpu().numpy()
 
 #Set up residual array
 res_Ts = np.zeros((n_models+1, test_outputs_T.shape[0], test_outputs_T.shape[1]), dtype=float)
@@ -753,7 +759,7 @@ res_Ps = np.zeros((n_models+1, test_outputs_P.shape[0], test_outputs_P.shape[1])
 for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_inputs, test_outputs_T, test_outputs_P)):
 
     #Convert to numpy and reshape
-    test_input = test_input.numpy()
+    test_input = test_input.cpu().numpy()
 
     pred_outputs_T = np.zeros((n_models+1,O), dtype=float)
     pred_outputs_P = np.zeros((n_models+1,O), dtype=float)
@@ -769,15 +775,21 @@ for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_i
         pred_outputs_T[imodel,:] = pred_output_original[:O]
         pred_outputs_P[imodel,:] = pred_output_original[O:]
 
-    #Retrieve prediction from combiner
-    if with_orig_inputs:
-        pred_output = combiner(
-                            torch.tensor(new_in_scaler.transform(np.concatenate([pred_outputs_T[imodel,:], pred_outputs_P[imodel,:]]).reshape(1, -1))), 
-                            torch.tensor(past_in_scaler.transform(test_input.reshape(1, -1)))
-                            ).detach().numpy()
-    else:
-        pred_output = combiner(torch.tensor(new_in_scaler.transform(torch.cat((pred_outputs_T, pred_outputs_P)).reshape(1, -1)))).detach().numpy()
-                           
+        # Retrieve prediction from combiner - fixed tensor concatenation
+        if with_orig_inputs:
+            # Create properly shaped ensemble predictions tensor
+            ensemble_pred_flat = np.concatenate([pred_outputs_T.flatten(), pred_outputs_P.flatten()])
+            pred_output = combiner(
+                torch.tensor(new_in_scaler.transform(ensemble_pred_flat.reshape(1, -1)), dtype=torch.float32), 
+                torch.tensor(past_in_scaler.transform(test_input.reshape(1, -1)), dtype=torch.float32)
+            ).detach().numpy()
+        else:
+            # Create properly shaped ensemble predictions tensor
+            ensemble_pred_flat = np.concatenate([pred_outputs_T.flatten(), pred_outputs_P.flatten()])
+            pred_output = combiner(
+                torch.tensor(new_in_scaler.transform(ensemble_pred_flat.reshape(1, -1)), dtype=torch.float32)
+            ).detach().numpy()
+
     # Inverse transform to get original scale
     pred_output_original =new_out_scaler.inverse_transform(pred_output.reshape(1, -1)).flatten()
 
@@ -851,7 +863,7 @@ for imodel in range(n_models+1):
     #Plot residuals
     axes[imodel, 0].set_title(label)
     axes[imodel, 0].plot(res_Ts[imodel, :, :].T, alpha=0.1, color=colours[imodel])
-    axes[imodel, 1].plot(res_Ts[imodel, :, :].T, alpha=0.1, color=colours[imodel])
+    axes[imodel, 1].plot(res_Ps[imodel, :, :].T, alpha=0.1, color=colours[imodel])
     for ax in [axes[imodel, 0], axes[imodel, 1]]:
         ax.axhline(0, color='black', linestyle='dashed')
         ax.set_xlabel('Index')
