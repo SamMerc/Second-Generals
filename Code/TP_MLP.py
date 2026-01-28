@@ -89,6 +89,9 @@ learning_rate = 1e-5
 regularization_coeff_l1 = 0.0
 regularization_coeff_l2 = 0.0
 
+#Smoothness constraint coefficient
+smoothness_coeff = 0.001
+
 #Weight decay 
 weight_decay = 0.0
 
@@ -261,12 +264,13 @@ summary(model)
 ###################################
 # PyTorch Lightning Module
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff_l1=0.0, reg_coeff_l2=0.0):
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
         self.reg_coeff_l1 = reg_coeff_l1
         self.reg_coeff_l2 = reg_coeff_l2
+        self.smoothness_coeff = smoothness_coeff
         self.weight_decay = weight_decay
         self.loss_fn = nn.MSELoss()
         self.optimizer_class = optimizer
@@ -288,6 +292,40 @@ class RegressionModule(pl.LightningModule):
                 l2_penalty += torch.sum(param ** 2)
         
         return self.reg_coeff_l1 * l1_penalty, self.reg_coeff_l2 * l2_penalty
+    
+    def compute_smoothness_constraint(self, X, output):
+        """
+        Compute smoothness constraint: ||∇s|| where s is the model output.
+        This penalizes rapid changes in output with respect to input.
+        """
+        if self.smoothness_coeff == 0:
+            return torch.tensor(0., device=self.device)
+        
+        # Clone and enable gradient computation for inputs
+        X_grad = X.clone().detach().requires_grad_(True)
+
+        # Temporarily enable gradients
+        with torch.enable_grad():
+            # Recompute output with gradient tracking
+            output_grad = self.model(X_grad)
+            
+            # Compute gradients of output with respect to input: ∂s/∂x
+            grad_outputs = torch.ones_like(output_grad)
+            gradients = torch.autograd.grad(
+                outputs=output_grad,
+                inputs=X_grad,
+                grad_outputs=grad_outputs,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True
+            )[0]
+            
+            # Smoothness: ||∇s|| = L2 norm of gradient vector for each sample
+            # Shape: gradients is (batch_size, input_dim)
+            # We want: mean over batch of ||∇s|| for each sample
+            smoothness_penalty = torch.mean(torch.norm(gradients, p=2, dim=1))
+        
+        return self.smoothness_coeff * smoothness_penalty
 
     def forward(self, x):
         return self.model(x)
@@ -295,11 +333,17 @@ class RegressionModule(pl.LightningModule):
     def training_step(self, batch):
         X, y = batch
         pred = self(X)
+        
+        # Base loss: ||y - s||
         loss = self.loss_fn(pred, y)
         
-        # Add weight regularization
-        grad_penalty_l1, grad_penalty_l2 = self.compute_weight_regularization()
-        loss += grad_penalty_l1 + grad_penalty_l2
+        # Add weight regularization (L1/L2 on network parameters)
+        l1_penalty, l2_penalty = self.compute_weight_regularization()
+        loss += l1_penalty + l2_penalty
+        
+        # Add smoothness constraint (gradient of output w.r.t. input)
+        smoothness_penalty = self.compute_smoothness_constraint(X, pred)
+        loss += smoothness_penalty
 
         # Log metrics
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -342,7 +386,8 @@ lightning_module = RegressionModule(
     learning_rate=learning_rate,
     reg_coeff_l1=regularization_coeff_l1,
     reg_coeff_l2=regularization_coeff_l2,
-    weight_decay=weight_decay
+    weight_decay=weight_decay,
+    smoothness_coeff=smoothness_coeff,
 )
 
 # Setup logger
@@ -363,20 +408,21 @@ if run_mode == 'use':
     trainer.fit(lightning_module, datamodule=data_module)
     
     # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{learning_rate}LR_{batch_size}BS.ckpt')
+    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt')
     
     print("Done!")
     
 else:
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{learning_rate}LR_{batch_size}BS.ckpt',
+        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt',
         model=model,
         optimizer=Adam,
     learning_rate=learning_rate,
     reg_coeff_l1=regularization_coeff_l1,
     reg_coeff_l2=regularization_coeff_l2,
-    weight_decay=weight_decay
+    weight_decay=weight_decay,
+    smoothness_coeff=smoothness_coeff,
     )
     print("Model loaded!")
 
