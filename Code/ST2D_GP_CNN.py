@@ -76,6 +76,9 @@ NN_seed = 6
 NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
+#Whether to include 2D batch normalization layers in the CNN
+use_batch_norm = False
+
 # Variable to show plots or not 
 show_plot = False
 
@@ -192,22 +195,22 @@ class SimpleCNN(nn.Module):
         self.cnn = nn.Sequential(
             # Input: input_channels x 48 x 69
             nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
+            nn.BatchNorm2d(32) if use_batch_norm else nn.Identity(),
             nn.ReLU(inplace=True),
             # Output: 32 x 48 x 69
             
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
+            nn.BatchNorm2d(64) if use_batch_norm else nn.Identity(),
             nn.ReLU(inplace=True),
             # Output: 64 x 48 x 69
             
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
+            nn.BatchNorm2d(64) if use_batch_norm else nn.Identity(),
             nn.ReLU(inplace=True),
             # Output: 64 x 48 x 69
             
             nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
+            nn.BatchNorm2d(32) if use_batch_norm else nn.Identity(),
             nn.ReLU(inplace=True),
             # Output: 32 x 48 x 69
             

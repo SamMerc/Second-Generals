@@ -76,6 +76,9 @@ NN_seed = 6
 NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
+#Whether to include 2D batch normalization layers in the CNN
+use_batch_norm = False
+
 # Variable to show plots or not 
 show_plot = False
 
@@ -192,16 +195,19 @@ class EncoderDecoder(nn.Module):
         self.encoder = nn.Sequential(
             # Input: input_channels x 48 x 72
             nn.Conv2d(input_channels, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32) if use_batch_norm else nn.Identity(),
             nn.ReLU(inplace=True),
             # Output : 32 x 24 x 36
 
             # Input: 32 x 24 x 36
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64) if use_batch_norm else nn.Identity(),
             nn.ReLU(inplace=True),
             # Output : 64 x 12 x 18
 
             # Input: 64 x 12 x 18
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128) if use_batch_norm else nn.Identity(),
             nn.ReLU(inplace=True),
             # Output : 128 x 6 x 9
 
@@ -211,11 +217,13 @@ class EncoderDecoder(nn.Module):
 
             # Input: 128 x 6 x 9
             nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(64) if use_batch_norm else nn.Identity(),
             nn.ReLU(inplace=True),
             # Output : 64 x 12 x 18
 
             # Input: 64 x 12 x 18
             nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(32) if use_batch_norm else nn.Identity(),
             nn.ReLU(inplace=True),
             # Output : 32 x 24 x 36
 
