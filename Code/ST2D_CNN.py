@@ -55,31 +55,31 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 num_threads = 1
 torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
-torch.set_default_device(device)
 
 #Defining the noise seed for the random partitioning of the training data
 partition_seed = 4
-partition_rng = torch.Generator(device=device)
+partition_rng = torch.Generator()
 partition_rng.manual_seed(partition_seed)
 
 #Defining the noise seed for the generating of batches from the partitioned data
 batch_seed = 5
-batch_rng = torch.Generator(device=device)
+batch_rng = torch.Generator()
 batch_rng.manual_seed(batch_seed)
 
 #Defining the noise seed for the neural network initialization
 NN_seed = 6
-NN_rng = torch.Generator(device=device)
+NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
-# Variable to show plots or not 
-show_plot = False
-
 #Optimizer learning rate
-learning_rate = 1e-5
+learning_rate = 1e-3
 
 #Regularization coefficient
-regularization_coeff = 0.0
+regularization_coeff_l1 = 0.0
+regularization_coeff_l2 = 0.0
+
+#Smoothness constraint coefficient
+smoothness_coeff = 0.0
 
 #Weight decay 
 weight_decay = 0.0
@@ -122,12 +122,12 @@ class CustomDataModule(pl.LightningDataModule):
         out_scaler = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        out_scaler.fit(train_outputs.numpy())
+        out_scaler.fit(train_outputs.cpu().numpy())
         
         ## Transform all datasets and convert back to tensors
-        train_outputs = torch.tensor(out_scaler.transform(train_outputs.numpy()), dtype=torch.float32)
-        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.numpy()), dtype=torch.float32)
-        test_outputs = torch.tensor(out_scaler.transform(test_outputs.numpy()), dtype=torch.float32)
+        train_outputs = torch.tensor(out_scaler.transform(train_outputs.cpu().numpy()), dtype=torch.float32)
+        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.cpu().numpy()), dtype=torch.float32)
+        test_outputs = torch.tensor(out_scaler.transform(test_outputs.cpu().numpy()), dtype=torch.float32)
         
         # Store the scaler if you need to inverse transform later
         self.out_scaler = out_scaler
@@ -137,12 +137,12 @@ class CustomDataModule(pl.LightningDataModule):
         in_scaler = MinMaxScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        in_scaler.fit(train_inputs.numpy())
+        in_scaler.fit(train_inputs.cpu().numpy())
         
         ## Transform all datasets and convert back to tensors
-        train_inputs = torch.tensor(in_scaler.transform(train_inputs.numpy()), dtype=torch.float32)
-        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.numpy()), dtype=torch.float32)
-        test_inputs = torch.tensor(in_scaler.transform(test_inputs.numpy()), dtype=torch.float32)
+        train_inputs = torch.tensor(in_scaler.transform(train_inputs.cpu().numpy()), dtype=torch.float32)
+        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.cpu().numpy()), dtype=torch.float32)
+        test_inputs = torch.tensor(in_scaler.transform(test_inputs.cpu().numpy()), dtype=torch.float32)
         
         # Store the scaler if you need to inverse transform later
         self.in_scaler = in_scaler
@@ -157,19 +157,26 @@ class CustomDataModule(pl.LightningDataModule):
             # Reshape inputs
             if img_height is None or img_width is None:
                 # Auto-calculate square dimensions if not provided
-                total_labels = train_outputs.shape[1]
-                img_size = int(np.sqrt(total_labels / img_channels))
-                if img_size * img_size * img_channels != total_labels:
-                    raise ValueError(f"Cannot reshape {total_labels} features into square image. "
+                total_features = train_inputs.shape[1]
+                img_size = int(np.sqrt(total_features / img_channels))
+                if img_size * img_size * img_channels != total_features:
+                    raise ValueError(f"Cannot reshape {total_features} features into square image. "
                                      f"Please provide img_height and img_width explicitly.")
                 self.img_height = img_size
                 self.img_width = img_size
+            
+            self.train_inputs = train_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
+            self.valid_inputs = valid_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
+            self.test_inputs = test_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
             
             self.train_outputs = train_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
             self.valid_outputs = valid_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
             self.test_outputs = test_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
 
         else:
+            self.train_inputs = train_inputs
+            self.valid_inputs = valid_inputs
+            self.test_inputs = test_inputs
             self.train_outputs = train_outputs
             self.valid_outputs = valid_outputs
             self.test_outputs = test_outputs
@@ -279,7 +286,7 @@ class CNN(nn.Module):
         
         return x
 
-model = CNN(D,1,generator=NN_rng).to(device)
+model = CNN(D,1,generator=NN_rng)
 summary(model)
 
 
@@ -291,59 +298,86 @@ summary(model)
 ###################################
 # PyTorch Lightning Module
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff=0.0):
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0):
         super().__init__()
         self.model = model
         self.learning_rate = learning_rate
-        self.reg_coeff = reg_coeff
+        self.reg_coeff_l1 = reg_coeff_l1
+        self.reg_coeff_l2 = reg_coeff_l2
+        self.smoothness_coeff = smoothness_coeff
         self.weight_decay = weight_decay
         self.loss_fn = nn.MSELoss()
         self.optimizer_class = optimizer
     
-    def compute_gradient_penalty(self, X):
+    def compute_weight_regularization(self):
         """
-        Compute the gradient of model output with respect to input.
-        Returns the L2 norm of the gradients as a regularization term.
+        Compute L1 and L2 regularization on model weights (parameters).
         """
-        if self.reg_coeff == 0:
+        if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
+            return torch.tensor(0., device=self.device), torch.tensor(0., device=self.device)
+        
+        l1_penalty = torch.tensor(0., device=self.device)
+        l2_penalty = torch.tensor(0., device=self.device)
+        
+        for param in self.model.parameters():
+            if self.reg_coeff_l1 > 0:
+                l1_penalty += torch.sum(torch.abs(param))
+            if self.reg_coeff_l2 > 0:
+                l2_penalty += torch.sum(param ** 2)
+        
+        return self.reg_coeff_l1 * l1_penalty, self.reg_coeff_l2 * l2_penalty
+    
+    def compute_smoothness_constraint(self, X, output):
+        """
+        Compute smoothness constraint: ||∇s|| where s is the model output.
+        This penalizes rapid changes in output with respect to input.
+        """
+        if self.smoothness_coeff == 0:
             return torch.tensor(0., device=self.device)
         
         # Clone and enable gradient computation for inputs
         X_grad = X.clone().detach().requires_grad_(True)
 
-        # Temporarily enable gradients (needed for validation/test steps)
+        # Temporarily enable gradients
         with torch.enable_grad():
+            # Recompute output with gradient tracking
+            output_grad = self.model(X_grad)
             
-            # Compute output (need to recompute to track gradients w.r.t. X)
-            output = self.model(X_grad)
-            
-            # Compute gradients of output with respect to input
-            grad_outputs = torch.ones_like(output)
+            # Compute gradients of output with respect to input: ∂s/∂x
+            grad_outputs = torch.ones_like(output_grad)
             gradients = torch.autograd.grad(
-                outputs=output,
+                outputs=output_grad,
                 inputs=X_grad,
                 grad_outputs=grad_outputs,
-                create_graph=True,  # Keep computation graph for backprop
+                create_graph=True,
                 retain_graph=True,
                 only_inputs=True
             )[0]
             
-            # Compute L2 norm of gradients (squared)
-            gradient_penalty = torch.mean(gradients ** 2)
+            # Smoothness: ||∇s|| = L2 norm of gradient vector for each sample
+            # Shape: gradients is (batch_size, input_dim)
+            # We want: mean over batch of ||∇s|| for each sample
+            smoothness_penalty = torch.mean(torch.norm(gradients, p=2, dim=1))
         
-        return self.reg_coeff * gradient_penalty
-    
+        return self.smoothness_coeff * smoothness_penalty
+
     def forward(self, x):
         return self.model(x)
     
     def training_step(self, batch):
         X, y = batch
         pred = self(X)
+        
+        # Base loss: ||y - s||
         loss = self.loss_fn(pred, y)
         
-        # Add gradient regularization
-        grad_penalty = self.compute_gradient_penalty(X)
-        loss += grad_penalty
+        # Add weight regularization (L1/L2 on network parameters)
+        l1_penalty, l2_penalty = self.compute_weight_regularization()
+        loss += l1_penalty + l2_penalty
+        
+        # Add smoothness constraint (gradient of output w.r.t. input)
+        smoothness_penalty = self.compute_smoothness_constraint(X, pred)
+        loss += smoothness_penalty
 
         # Log metrics
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -385,8 +419,10 @@ lightning_module = RegressionModule(
     model=model,
     optimizer=Adam,
     learning_rate=learning_rate,
-    reg_coeff=regularization_coeff,
-    weight_decay=weight_decay
+    reg_coeff_l1=regularization_coeff_l1,
+    reg_coeff_l2=regularization_coeff_l2,
+    weight_decay=weight_decay,
+    smoothness_coeff=smoothness_coeff,
 )
 
 # Setup logger
@@ -407,19 +443,21 @@ if run_mode == 'use':
     trainer.fit(lightning_module, datamodule=data_module)
     
     # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt')
+    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt')
     
     print("Done!")
     
 else:
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff}RC_{learning_rate}LR_{batch_size}BS.ckpt',
+        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt',
         model=model,
         optimizer=Adam,
     learning_rate=learning_rate,
-    reg_coeff=regularization_coeff,
-    weight_decay=weight_decay
+    reg_coeff_l1=regularization_coeff_l1,
+    reg_coeff_l2=regularization_coeff_l2,
+    weight_decay=weight_decay,
+    smoothness_coeff=smoothness_coeff,
     )
     print("Model loaded!")
 
@@ -496,14 +534,14 @@ in_scaler = data_module.in_scaler
 
 #Converting tensors to numpy arrays if this isn't already done
 if (type(test_outputs) != np.ndarray):
-    test_outputs = test_outputs.numpy()
+    test_outputs = test_outputs.cpu().numpy()
 
 res = np.zeros(test_outputs.shape, dtype=float)
 
 for test_idx, (test_input, test_output) in enumerate(zip(test_inputs, test_outputs)):
 
     #Convert to numpy
-    test_input = test_input.numpy()
+    test_input = test_input.cpu().numpy()
 
     #Retrieve prediction
     pred_output_scaled = model(torch.tensor(in_scaler.transform(test_input.reshape(1, -1)))).detach().numpy().reshape(3312)
