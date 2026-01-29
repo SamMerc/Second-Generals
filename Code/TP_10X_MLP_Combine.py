@@ -116,7 +116,6 @@ run_mode = 'use'
 ########################################
 #### Class and Function definitions ####
 ########################################
-
 # PyTorch Lightning DataModule
 class OriginalDataModule(pl.LightningDataModule):
     def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs, test_inputs, test_outputs, batch_size, rng):
@@ -124,22 +123,35 @@ class OriginalDataModule(pl.LightningDataModule):
 
         # Standardizing the output
         ## Create scaler
-        out_scaler = StandardScaler()
+        out_scaler_T = StandardScaler()
+        out_scaler_P = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        out_scaler.fit(train_outputs.cpu().numpy())
-        
+        out_scaler_T.fit(train_outputs[:, :O].cpu().numpy())
+        out_scaler_P.fit(train_outputs[:, O:].cpu().numpy())
+
         ## Transform all datasets and convert back to tensors
-        train_outputs = torch.tensor(out_scaler.transform(train_outputs.cpu().numpy()), dtype=torch.float32)
-        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.cpu().numpy()), dtype=torch.float32)
-        test_outputs = torch.tensor(out_scaler.transform(test_outputs.cpu().numpy()), dtype=torch.float32)
+        train_T_scaled = torch.tensor(out_scaler_T.transform(train_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        train_P_scaled = torch.tensor(out_scaler_P.transform(train_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        valid_T_scaled = torch.tensor(out_scaler_T.transform(valid_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        valid_P_scaled = torch.tensor(out_scaler_P.transform(valid_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        test_T_scaled = torch.tensor(out_scaler_T.transform(test_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        test_P_scaled = torch.tensor(out_scaler_P.transform(test_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
         
+        # Concatenate
+        train_outputs = torch.cat([train_T_scaled, train_P_scaled], dim=1)
+        valid_outputs = torch.cat([valid_T_scaled, valid_P_scaled], dim=1)
+        test_outputs = torch.cat([test_T_scaled, test_P_scaled], dim=1)
+
         # Store the scaler if you need to inverse transform later
-        self.out_scaler = out_scaler
+        self.out_scaler_T = out_scaler_T
+        self.out_scaler_P = out_scaler_P
         
         # Normalizing the input
         ## Create scaler
-        in_scaler = MinMaxScaler()
+        in_scaler = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
         in_scaler.fit(train_inputs.cpu().numpy())
@@ -195,39 +207,79 @@ class EnsembleDataModule(pl.LightningDataModule):
 
         # Standardizing the output
         ## Create scaler
-        out_scaler = StandardScaler()
+        out_scaler_T = StandardScaler()
+        out_scaler_P = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        out_scaler.fit(train_targets.cpu().numpy())
+        out_scaler_T.fit(train_targets[:, :O].cpu().numpy())
+        out_scaler_P.fit(train_targets[:, O:].cpu().numpy())
         
         ## Transform all datasets and convert back to tensors
-        train_targets = torch.tensor(out_scaler.transform(train_targets.cpu().numpy()), dtype=torch.float32)
-        valid_targets = torch.tensor(out_scaler.transform(valid_targets.cpu().numpy()), dtype=torch.float32)
-        test_targets = torch.tensor(out_scaler.transform(test_targets.cpu().numpy()), dtype=torch.float32)
+        train_targets_T = torch.tensor(out_scaler_T.transform(train_targets[:, :O].cpu().numpy()), dtype=torch.float32)
+        train_targets_P = torch.tensor(out_scaler_P.transform(train_targets[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        valid_targets_T = torch.tensor(out_scaler_T.transform(valid_targets[:, :O].cpu().numpy()), dtype=torch.float32)
+        valid_targets_P = torch.tensor(out_scaler_P.transform(valid_targets[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        test_targets_T = torch.tensor(out_scaler_T.transform(test_targets[:, :O].cpu().numpy()), dtype=torch.float32)
+        test_targets_P = torch.tensor(out_scaler_P.transform(test_targets[:, O:].cpu().numpy()), dtype=torch.float32)
         
+        # Concatenate
+        train_targets = torch.cat([train_targets_T, train_targets_P], dim=1)
+        valid_targets = torch.cat([valid_targets_T, valid_targets_P], dim=1)
+        test_targets = torch.cat([test_targets_T, test_targets_P], dim=1)
+
         # Store the scaler if you need to inverse transform later
-        self.out_scaler = out_scaler
+        self.out_scaler_T = out_scaler_T
+        self.out_scaler_P = out_scaler_P
         
         # Normalizing the input
+
+        # Reshape: [batch, n_models, 2*O] -> [batch, n_models*O] for T and P separately
+        n_models = train_ensemble_preds.shape[1]
+        
+        # Extract T and P from all models
+        train_ensemble_T = train_ensemble_preds[:, :, :O].reshape(-1, n_models * O)  # [batch, n_models*O]
+        train_ensemble_P = train_ensemble_preds[:, :, O:].reshape(-1, n_models * O)
+        
+        valid_ensemble_T = valid_ensemble_preds[:, :, :O].reshape(-1, n_models * O)
+        valid_ensemble_P = valid_ensemble_preds[:, :, O:].reshape(-1, n_models * O)
+        
+        test_ensemble_T = test_ensemble_preds[:, :, :O].reshape(-1, n_models * O)
+        test_ensemble_P = test_ensemble_preds[:, :, O:].reshape(-1, n_models * O)
+
         ## Create scaler
-        in_scaler = MinMaxScaler()
+        in_scaler_T = StandardScaler()
+        in_scaler_P = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        in_scaler.fit(train_ensemble_preds.cpu().numpy())
-        
+        in_scaler_T.fit(train_ensemble_T.cpu().numpy())
+        in_scaler_P.fit(train_ensemble_P.cpu().numpy())
+
         ## Transform all datasets and convert back to tensors
-        train_ensemble_preds = torch.tensor(in_scaler.transform(train_ensemble_preds.cpu().numpy()), dtype=torch.float32)
-        valid_ensemble_preds = torch.tensor(in_scaler.transform(valid_ensemble_preds.cpu().numpy()), dtype=torch.float32)
-        test_ensemble_preds = torch.tensor(in_scaler.transform(test_ensemble_preds.cpu().numpy()), dtype=torch.float32)
+        train_ensemble_preds_T = torch.tensor(in_scaler_T.transform(train_ensemble_T.cpu().numpy()), dtype=torch.float32)
+        train_ensemble_preds_P = torch.tensor(in_scaler_P.transform(train_ensemble_P.cpu().numpy()), dtype=torch.float32)
+
+        valid_ensemble_preds_T = torch.tensor(in_scaler_T.transform(valid_ensemble_T.cpu().numpy()), dtype=torch.float32)
+        valid_ensemble_preds_P = torch.tensor(in_scaler_P.transform(valid_ensemble_P.cpu().numpy()), dtype=torch.float32)
+
+        test_ensemble_preds_T = torch.tensor(in_scaler_T.transform(test_ensemble_T.cpu().numpy()), dtype=torch.float32)
+        test_ensemble_preds_P = torch.tensor(in_scaler_P.transform(test_ensemble_P.cpu().numpy()), dtype=torch.float32)
         
+        # Concatenate
+        train_ensemble_preds = torch.cat([train_ensemble_preds_T, train_ensemble_preds_P], dim=1)
+        valid_ensemble_preds = torch.cat([valid_ensemble_preds_T, valid_ensemble_preds_P], dim=1)
+        test_ensemble_preds = torch.cat([test_ensemble_preds_T, test_ensemble_preds_P], dim=1)
+
         # Store the scaler if you need to inverse transform later
-        self.in_scaler = in_scaler
+        self.in_scaler_T = in_scaler_T
+        self.in_scaler_P = in_scaler_P
 
         if train_original_inputs is not None:
 
             # Normalizing the original input
             ## Create scaler
-            past_in_scaler = MinMaxScaler()
+            past_in_scaler = StandardScaler()
             
             ## Fit scaler on training dataset (convert to numpy)
             past_in_scaler.fit(train_original_inputs.cpu().numpy())
@@ -335,15 +387,12 @@ class EnsembleCombiner(nn.Module):
         Returns:
             Combined prediction of shape (batch_size, output_dim)
         """
-        # Flatten ensemble outputs
-        batch_size = ensemble_outputs.shape[0]
-        flat_outputs = ensemble_outputs.reshape(batch_size, -1)
+        # ensemble_outputs is already flattened by the data module
+        combiner_input = ensemble_outputs
         
         # Optionally concatenate with original inputs
         if self.include_inputs and original_inputs is not None:
-            combiner_input = torch.cat([flat_outputs, original_inputs], dim=1)
-        else:
-            combiner_input = flat_outputs
+            combiner_input = torch.cat([combiner_input, original_inputs], dim=1)
         
         # Pass through combiner network
         combined = self.combiner(combiner_input)
@@ -733,11 +782,14 @@ plt.savefig(plot_save_path+'/loss.pdf')
 substep = 100
 
 # Get the scalers from original and new data module
-orig_out_scaler = orig_data_module.out_scaler
+orig_out_scaler_T = orig_data_module.out_scaler_T
+orig_out_scaler_P = orig_data_module.out_scaler_P
 orig_in_scaler = orig_data_module.in_scaler
 
-new_out_scaler = new_data_module.out_scaler
-new_in_scaler = new_data_module.in_scaler
+new_out_scaler_T = new_data_module.out_scaler_T
+new_out_scaler_P = new_data_module.out_scaler_P
+new_in_scaler_T = new_data_module.in_scaler_T
+new_in_scaler_P = new_data_module.in_scaler_P
 if with_orig_inputs:past_in_scaler = new_data_module.past_in_scaler
 
 # FIX: Move all models to CPU for inference
@@ -766,36 +818,41 @@ for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_i
 
     #Retrieve predictions for each model
     for imodel, model in enumerate(ensemble_wrapper.models):
+
         pred_output = model(torch.tensor(orig_in_scaler.transform(test_input.reshape(1, -1)))).detach().numpy()
     
         # Inverse transform to get original scale
-        pred_output_original =orig_out_scaler.inverse_transform(pred_output.reshape(1, -1)).flatten()
-        
-        # Split back into T and P components
-        pred_outputs_T[imodel,:] = pred_output_original[:O]
-        pred_outputs_P[imodel,:] = pred_output_original[O:]
+        pred_T_scaled = pred_output[:, :O]
+        pred_P_scaled = pred_output[:, O:]
+        pred_outputs_T[imodel,:] = orig_out_scaler_T.inverse_transform(pred_T_scaled.reshape(1, -1)).flatten()
+        pred_outputs_P[imodel,:] = orig_out_scaler_P.inverse_transform(pred_P_scaled.reshape(1, -1)).flatten()
 
-        # Retrieve prediction from combiner - fixed tensor concatenation
-        if with_orig_inputs:
-            # Create properly shaped ensemble predictions tensor
-            ensemble_pred_flat = np.concatenate([pred_outputs_T.flatten(), pred_outputs_P.flatten()])
-            pred_output = combiner(
-                torch.tensor(new_in_scaler.transform(ensemble_pred_flat.reshape(1, -1)), dtype=torch.float32), 
-                torch.tensor(past_in_scaler.transform(test_input.reshape(1, -1)), dtype=torch.float32)
-            ).detach().numpy()
-        else:
-            # Create properly shaped ensemble predictions tensor
-            ensemble_pred_flat = np.concatenate([pred_outputs_T.flatten(), pred_outputs_P.flatten()])
-            pred_output = combiner(
-                torch.tensor(new_in_scaler.transform(ensemble_pred_flat.reshape(1, -1)), dtype=torch.float32)
-            ).detach().numpy()
+    #Prepare combiner input
+    ensemble_T_flat = pred_outputs_T.flatten() # Shape: [n_models * O]
+    ensemble_P_flat = pred_outputs_P.flatten() # Shape: [n_models * O]
+
+    #Scale input
+    ensemble_T_scaled = new_in_scaler_T.transform(ensemble_T_flat.reshape(1, -1))
+    ensemble_P_scaled = new_in_scaler_P.transform(ensemble_P_flat.reshape(1, -1))
+
+    combiner_input = torch.tensor(
+        np.concatenate([ensemble_T_scaled, ensemble_P_scaled], axis=1), dtype=torch.float32
+    )
+
+    # Get combiner prediction
+    if with_orig_inputs:
+        pred_output = combiner(
+            combiner_input,
+            torch.tensor(past_in_scaler.transform(test_input.reshape(1, -1)), dtype=torch.float32)
+        ).detach().numpy()
+    else:
+        pred_output = combiner(combiner_input).detach().numpy()
 
     # Inverse transform to get original scale
-    pred_output_original =new_out_scaler.inverse_transform(pred_output.reshape(1, -1)).flatten()
-
-    # Split back into T and P components
-    pred_outputs_T[-1,:] = pred_output_original[:O]
-    pred_outputs_P[-1,:] = pred_output_original[O:]
+    pred_T_scaled = pred_output[:, :O]
+    pred_P_scaled = pred_output[:, O:]
+    pred_outputs_T[-1,:] = new_out_scaler_T.inverse_transform(pred_T_scaled.reshape(1, -1)).flatten()
+    pred_outputs_P[-1,:] = new_out_scaler_P.inverse_transform(pred_P_scaled.reshape(1, -1)).flatten()
     
     #Storing residuals 
     res_Ts[:, test_idx, :] = pred_outputs_T - test_output_T

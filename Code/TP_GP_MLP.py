@@ -221,35 +221,61 @@ class CustomDataModule(pl.LightningDataModule):
 
         # Standardizing the output
         ## Create scaler
-        out_scaler = StandardScaler()
+        out_scaler_T = StandardScaler()
+        out_scaler_P = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        out_scaler.fit(train_outputs.cpu().numpy())
-        
+        out_scaler_T.fit(train_outputs[:, :O].cpu().numpy())
+        out_scaler_P.fit(train_outputs[:, O:].cpu().numpy())
+
         ## Transform all datasets and convert back to tensors
-        train_outputs = torch.tensor(out_scaler.transform(train_outputs.cpu().numpy()), dtype=torch.float32)
-        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.cpu().numpy()), dtype=torch.float32)
-        test_outputs = torch.tensor(out_scaler.transform(test_outputs.cpu().numpy()), dtype=torch.float32)
+        train_T_scaled = torch.tensor(out_scaler_T.transform(train_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        train_P_scaled = torch.tensor(out_scaler_P.transform(train_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        valid_T_scaled = torch.tensor(out_scaler_T.transform(valid_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        valid_P_scaled = torch.tensor(out_scaler_P.transform(valid_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        test_T_scaled = torch.tensor(out_scaler_T.transform(test_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        test_P_scaled = torch.tensor(out_scaler_P.transform(test_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
         
+        # Concatenate
+        train_outputs = torch.cat([train_T_scaled, train_P_scaled], dim=1)
+        valid_outputs = torch.cat([valid_T_scaled, valid_P_scaled], dim=1)
+        test_outputs = torch.cat([test_T_scaled, test_P_scaled], dim=1)
+
         # Store the scaler if you need to inverse transform later
-        self.out_scaler = out_scaler
+        self.out_scaler_T = out_scaler_T
+        self.out_scaler_P = out_scaler_P
         
-        # Normalizing the input
+        # Standardize the input
         ## Create scaler
-        in_scaler = MinMaxScaler()
+        in_scaler_T = StandardScaler()
+        in_scaler_P = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
-        in_scaler.fit(train_inputs.cpu().numpy())
-        
+        in_scaler_T.fit(train_inputs[:, :O].cpu().numpy())
+        out_scaler_P.fit(train_inputs[:, O:].cpu().numpy())
+
         ## Transform all datasets and convert back to tensors
-        train_inputs = torch.tensor(in_scaler.transform(train_inputs.cpu().numpy()), dtype=torch.float32)
-        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.cpu().numpy()), dtype=torch.float32)
-        test_inputs = torch.tensor(in_scaler.transform(test_inputs.cpu().numpy()), dtype=torch.float32)
+        train_T_scaled = torch.tensor(in_scaler_T.transform(train_inputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        train_P_scaled = torch.tensor(in_scaler_P.transform(train_inputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        valid_T_scaled = torch.tensor(in_scaler_T.transform(valid_inputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        valid_P_scaled = torch.tensor(in_scaler_P.transform(valid_inputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        test_T_scaled = torch.tensor(in_scaler_T.transform(test_inputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        test_P_scaled = torch.tensor(in_scaler_P.transform(test_inputs[:, O:].cpu().numpy()), dtype=torch.float32)
         
+        # Concatenate
+        train_inputs = torch.cat([train_T_scaled, train_P_scaled], dim=1)
+        valid_inputs = torch.cat([valid_T_scaled, valid_P_scaled], dim=1)
+        test_inputs = torch.cat([test_T_scaled, test_P_scaled], dim=1)
+
         # Store the scaler if you need to inverse transform later
-        self.in_scaler = in_scaler
+        self.in_scaler_T = in_scaler_T
+        self.in_scaler_P = in_scaler_P
 
-
+        # Storing it and passing it to loaders
         self.train_inputs = train_inputs
         self.train_outputs = train_outputs
         self.valid_inputs = valid_inputs
@@ -624,8 +650,10 @@ plt.savefig(plot_save_path+'/loss.pdf')
 substep = 100
 
 # Get the scalers from data module
-out_scaler = data_module.out_scaler
-in_scaler = data_module.in_scaler
+out_scaler_T = data_module.out_scaler_T
+out_scaler_P = data_module.out_scaler_P
+in_scaler_T = data_module.in_scaler_T
+in_scaler_P = data_module.in_scaler_P
 
 # Move model to CPU for inference to avoid GPU memory issues
 model.cpu()
@@ -644,23 +672,24 @@ NN_res_P = np.zeros(NN_test_outputs_P.shape, dtype=float)
 for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, NN_test_output_T, NN_test_output_P) in enumerate(zip(NN_test_og_inputs, NN_test_inputs_T, NN_test_inputs_P, NN_test_outputs_T, NN_test_outputs_P)):
 
     #Retrieve prediction
-    input_data = torch.cat([GP_test_output_T, GP_test_output_P]).reshape(1, -1).numpy()
-    scaled_input = in_scaler.transform(input_data)
-    NN_pred_output = model(torch.tensor(scaled_input, dtype=torch.float32)).detach().numpy()
-        
-    # Inverse transform to get original scale
-    NN_pred_output_original = out_scaler.inverse_transform(NN_pred_output.reshape(1, -1)).flatten()
+    scaled_GP_test_output_T = torch.tensor(in_scaler_T.transform(GP_test_output_T.reshape(1, -1)), dtype=torch.float32)
+    scaled_GP_test_output_P = torch.tensor(in_scaler_P.transform(GP_test_output_P.reshape(1, -1)), dtype=torch.float32)
+    scaled_input = torch.cat([scaled_GP_test_output_T, scaled_GP_test_output_P], dim=1)
 
-    #Shift back into T and P components
-    NN_pred_output_T = NN_pred_output_original[:O]
-    NN_pred_output_P = NN_pred_output_original[O:]
+    NN_pred_output = model(torch.tensor(scaled_input, dtype=torch.float32)).detach().numpy()
+    
+    #Inverse scaling
+    pred_T_scaled = NN_pred_output[:, :O]
+    pred_P_scaled = NN_pred_output[:, O:]
+    NN_pred_output_T = out_scaler_T.inverse_transform(pred_T_scaled.reshape(1, -1)).flatten()
+    NN_pred_output_P = out_scaler_P.inverse_transform(pred_P_scaled.reshape(1, -1)).flatten()
 
     #Convert to numpy
     NN_test_input = NN_test_input.cpu().numpy()
 
     #Storing residuals 
-    GP_res_T[NN_test_idx, :] = GP_test_output_T.numpy() - NN_test_output_T
-    GP_res_P[NN_test_idx, :] = GP_test_output_P.numpy() - NN_test_output_P
+    GP_res_T[NN_test_idx, :] = GP_test_output_T - NN_test_output_T
+    GP_res_P[NN_test_idx, :] = GP_test_output_P - NN_test_output_P
     NN_res_T[NN_test_idx, :] = NN_pred_output_T - NN_test_output_T
     NN_res_P[NN_test_idx, :] = NN_pred_output_P - NN_test_output_P
 
