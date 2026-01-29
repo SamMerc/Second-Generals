@@ -33,10 +33,10 @@ raw_T_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=
 #File containing pressure values
 raw_P_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/NN/'
+model_save_path = base_dir+'Model_Storage/NN_fixedstand/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/NN/'
+plot_save_path = base_dir+'Plots/NN_fixedstand/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -83,14 +83,14 @@ nn_width = 102
 nn_depth = 5
 
 #Optimizer learning rate
-learning_rate = 1e-5
+learning_rate = 1e-3
 
 #Regularization coefficient
 regularization_coeff_l1 = 0.0
 regularization_coeff_l2 = 0.0
 
 #Smoothness constraint coefficient
-smoothness_coeff = 0.001
+smoothness_coeff = 0.0
 
 #Weight decay 
 weight_decay = 0.0
