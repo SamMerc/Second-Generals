@@ -462,7 +462,7 @@ ax1.legend()
 ax1.grid()
 ax2.grid()
 plt.subplots_adjust(hspace=0)
-plt.savefig(plot_save_path+'/loss.pdf')
+plt.savefig(plot_save_path+'loss.pdf')
 
 #Comparing predicted T-P profiles vs true T-P profiles with residuals
 substep = 100
@@ -535,7 +535,7 @@ for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_i
         axs['res_pressure'].sharex(axs['results'])
 
         plt.suptitle(rf'H$_2$ : {test_input[0]} bar, CO$_2$ : {test_input[1]} bar, LoD : {test_input[2]:.0f} days, Obliquity : {test_input[3]} deg')
-        plt.savefig(plot_save_path+f'/pred_vs_actual_n.{test_idx}.pdf')
+        plt.savefig(plot_save_path+f'pred_vs_actual_n.{test_idx}.pdf')
     
     
 print('\n','--- NN Residuals ---')
@@ -564,5 +564,5 @@ stats_text = (
 fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
         verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-plt.savefig(plot_save_path+f'/res_NN.pdf', bbox_inches='tight')
+plt.savefig(plot_save_path+f'res_NN.pdf', bbox_inches='tight')
 plt.show()

@@ -32,10 +32,10 @@ base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing surface temperature map
 raw_ST_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/GP_ST_stand_norm/'
+model_save_path = base_dir+'Model_Storage/GP_ST_fixedstand/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/GP_ST_stand_norm/'
+plot_save_path = base_dir+'Plots/GP_ST_fixedstand/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -102,10 +102,10 @@ smoothness_coeff = 0.0
 weight_decay = 0.0
 
 #Batch size 
-batch_size = 200
+batch_size = 32
 
 #Number of epochs 
-n_epochs = 2000
+n_epochs = 10
 
 #Mode for optimization
 run_mode = 'use'

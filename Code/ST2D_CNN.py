@@ -31,10 +31,10 @@ base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing surface temperature map
 raw_ST_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/NN_ST/'
+model_save_path = base_dir+'Model_Storage/NN_ST_fixedstand_nosmooth_noreg_nobatchnorm/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/NN_ST/'
+plot_save_path = base_dir+'Plots/NN_ST_fixedstand_nosmooth_noreg_nobatchnorm/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -88,7 +88,7 @@ smoothness_coeff = 0.0
 weight_decay = 0.0
 
 #Batch size 
-batch_size = 200
+batch_size = 64
 
 #Number of epochs 
 n_epochs = 10
@@ -168,18 +168,11 @@ class CustomDataModule(pl.LightningDataModule):
                 self.img_height = img_size
                 self.img_width = img_size
             
-            self.train_inputs = train_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
-            self.valid_inputs = valid_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
-            self.test_inputs = test_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
-            
             self.train_outputs = train_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
             self.valid_outputs = valid_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
             self.test_outputs = test_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
 
         else:
-            self.train_inputs = train_inputs
-            self.valid_inputs = valid_inputs
-            self.test_inputs = test_inputs
             self.train_outputs = train_outputs
             self.valid_outputs = valid_outputs
             self.test_outputs = test_outputs
