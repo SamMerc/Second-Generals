@@ -254,7 +254,7 @@ class CustomDataModule(pl.LightningDataModule):
         
         ## Fit scaler on training dataset (convert to numpy)
         in_scaler_T.fit(train_inputs[:, :O].cpu().numpy())
-        out_scaler_P.fit(train_inputs[:, O:].cpu().numpy())
+        in_scaler_P.fit(train_inputs[:, O:].cpu().numpy())
 
         ## Transform all datasets and convert back to tensors
         train_T_scaled = torch.tensor(in_scaler_T.transform(train_inputs[:, :O].cpu().numpy()), dtype=torch.float32)

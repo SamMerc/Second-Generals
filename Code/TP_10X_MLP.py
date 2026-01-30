@@ -338,13 +338,9 @@ class RegressionModule(pl.LightningModule):
 ######################
 #### Run training ####
 ######################
-# # Distribute tasks - for HPC usage
-task_arrays = [NN_seeds]
-param_combos = list(itertools.product(*task_arrays))
-param_combos = [list(c) for c in param_combos]
-
+# Distribute tasks - for HPC usage
 my_task_id = int(sys.argv[1])
-NN_seed = param_combos[my_task_id - 1]
+NN_seed = NN_seeds[my_task_id - 1]
 
 #Generate key
 NN_rng = torch.Generator(device=device)
