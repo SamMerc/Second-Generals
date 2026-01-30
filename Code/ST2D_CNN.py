@@ -137,7 +137,7 @@ class CustomDataModule(pl.LightningDataModule):
         
         # Normalizing the input
         ## Create scaler
-        in_scaler = MinMaxScaler()
+        in_scaler = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
         in_scaler.fit(train_inputs.cpu().numpy())
