@@ -85,8 +85,10 @@ NN_rng.manual_seed(NN_seed)
 with_orig_inputs = False
 
 #Neural network width and depth
-nn_width = 102
-nn_depth = 5
+old_nn_width = 102
+old_nn_depth = 5
+new_nn_width = 1020
+new_nn_depth = 5
 
 #Optimizer learning rate
 old_learning_rate = 1e-5
@@ -199,41 +201,23 @@ class EnsembleDataModule(pl.LightningDataModule):
                  valid_ensemble_preds, valid_targets,
                  test_ensemble_preds, test_targets,
                  batch_size, rng,
+                 original_in_scaler=None,
                  train_original_inputs=None,
                  valid_original_inputs=None,
                  test_original_inputs=None):
         super().__init__()
-        
+    
+        if train_original_inputs is not None:
 
-        # Standardizing the output
-        ## Create scaler
-        out_scaler_T = StandardScaler()
-        out_scaler_P = StandardScaler()
-        
-        ## Fit scaler on training dataset (convert to numpy)
-        out_scaler_T.fit(train_targets[:, :O].cpu().numpy())
-        out_scaler_P.fit(train_targets[:, O:].cpu().numpy())
-        
-        ## Transform all datasets and convert back to tensors
-        train_targets_T = torch.tensor(out_scaler_T.transform(train_targets[:, :O].cpu().numpy()), dtype=torch.float32)
-        train_targets_P = torch.tensor(out_scaler_P.transform(train_targets[:, O:].cpu().numpy()), dtype=torch.float32)
+            # Store original inputs if we want to pass them to combiner too
+            self.train_original_inputs = torch.tensor(original_in_scaler.transform(train_original_inputs.cpu().numpy()), dtype=torch.float32)
+            self.valid_original_inputs = torch.tensor(original_in_scaler.transform(valid_original_inputs.cpu().numpy()), dtype=torch.float32)
+            self.test_original_inputs = torch.tensor(original_in_scaler.transform(test_original_inputs.cpu().numpy()), dtype=torch.float32)
 
-        valid_targets_T = torch.tensor(out_scaler_T.transform(valid_targets[:, :O].cpu().numpy()), dtype=torch.float32)
-        valid_targets_P = torch.tensor(out_scaler_P.transform(valid_targets[:, O:].cpu().numpy()), dtype=torch.float32)
-
-        test_targets_T = torch.tensor(out_scaler_T.transform(test_targets[:, :O].cpu().numpy()), dtype=torch.float32)
-        test_targets_P = torch.tensor(out_scaler_P.transform(test_targets[:, O:].cpu().numpy()), dtype=torch.float32)
-        
-        # Concatenate
-        train_targets = torch.cat([train_targets_T, train_targets_P], dim=1)
-        valid_targets = torch.cat([valid_targets_T, valid_targets_P], dim=1)
-        test_targets = torch.cat([test_targets_T, test_targets_P], dim=1)
-
-        # Store the scaler if you need to inverse transform later
-        self.out_scaler_T = out_scaler_T
-        self.out_scaler_P = out_scaler_P
-        
-        # Normalizing the input
+        else:
+            self.train_original_inputs = None
+            self.valid_original_inputs = None
+            self.test_original_inputs = None
 
         # Reshape: [batch, n_models, 2*O] -> [batch, n_models*O] for T and P separately
         n_models = train_ensemble_preds.shape[1]
@@ -247,50 +231,11 @@ class EnsembleDataModule(pl.LightningDataModule):
         
         test_ensemble_T = test_ensemble_preds[:, :, :O].reshape(-1, n_models * O)
         test_ensemble_P = test_ensemble_preds[:, :, O:].reshape(-1, n_models * O)
-
-        ## Create scaler
-        in_scaler_T = StandardScaler()
-        in_scaler_P = StandardScaler()
-        
-        ## Fit scaler on training dataset (convert to numpy)
-        in_scaler_T.fit(train_ensemble_T.cpu().numpy())
-        in_scaler_P.fit(train_ensemble_P.cpu().numpy())
-
-        ## Transform all datasets and convert back to tensors
-        train_ensemble_preds_T = torch.tensor(in_scaler_T.transform(train_ensemble_T.cpu().numpy()), dtype=torch.float32)
-        train_ensemble_preds_P = torch.tensor(in_scaler_P.transform(train_ensemble_P.cpu().numpy()), dtype=torch.float32)
-
-        valid_ensemble_preds_T = torch.tensor(in_scaler_T.transform(valid_ensemble_T.cpu().numpy()), dtype=torch.float32)
-        valid_ensemble_preds_P = torch.tensor(in_scaler_P.transform(valid_ensemble_P.cpu().numpy()), dtype=torch.float32)
-
-        test_ensemble_preds_T = torch.tensor(in_scaler_T.transform(test_ensemble_T.cpu().numpy()), dtype=torch.float32)
-        test_ensemble_preds_P = torch.tensor(in_scaler_P.transform(test_ensemble_P.cpu().numpy()), dtype=torch.float32)
         
         # Concatenate
-        train_ensemble_preds = torch.cat([train_ensemble_preds_T, train_ensemble_preds_P], dim=1)
-        valid_ensemble_preds = torch.cat([valid_ensemble_preds_T, valid_ensemble_preds_P], dim=1)
-        test_ensemble_preds = torch.cat([test_ensemble_preds_T, test_ensemble_preds_P], dim=1)
-
-        # Store the scaler if you need to inverse transform later
-        self.in_scaler_T = in_scaler_T
-        self.in_scaler_P = in_scaler_P
-
-        if train_original_inputs is not None:
-
-            # Normalizing the original input
-            ## Create scaler
-            past_in_scaler = StandardScaler()
-            
-            ## Fit scaler on training dataset (convert to numpy)
-            past_in_scaler.fit(train_original_inputs.cpu().numpy())
-            
-            ## Transform all datasets and convert back to tensors
-            train_original_inputs = torch.tensor(past_in_scaler.transform(train_original_inputs.cpu().numpy()), dtype=torch.float32)
-            valid_original_inputs = torch.tensor(past_in_scaler.transform(valid_original_inputs.cpu().numpy()), dtype=torch.float32)
-            test_original_inputs = torch.tensor(past_in_scaler.transform(test_original_inputs.cpu().numpy()), dtype=torch.float32)
-            
-            # Store the scaler if you need to inverse transform later
-            self.past_in_scaler = past_in_scaler
+        train_ensemble_preds = torch.cat([train_ensemble_T, train_ensemble_P], dim=1)
+        valid_ensemble_preds = torch.cat([valid_ensemble_T, valid_ensemble_P], dim=1)
+        test_ensemble_preds = torch.cat([test_ensemble_T, test_ensemble_P], dim=1)
 
         self.train_ensemble_preds = train_ensemble_preds
         self.train_targets = train_targets
@@ -298,11 +243,6 @@ class EnsembleDataModule(pl.LightningDataModule):
         self.valid_targets = valid_targets
         self.test_ensemble_preds = test_ensemble_preds
         self.test_targets = test_targets
-        
-        # Store original inputs if we want to pass them to combiner too
-        self.train_original_inputs = train_original_inputs
-        self.valid_original_inputs = valid_original_inputs
-        self.test_original_inputs = test_original_inputs
         
         self.batch_size = batch_size
         self.rng = rng
@@ -398,62 +338,14 @@ class EnsembleCombiner(nn.Module):
         combined = self.combiner(combiner_input)
         return combined
 
-
-class EnsembleWrapper:
-    """
-    Wrapper to load and use multiple trained models as an ensemble.
-    """
-    def __init__(self, model_paths, device='cpu'):
-        """
-        Args:
-            model_paths: List of paths to saved model checkpoints
-            device: Device to load models on
-        """
-        self.device = device
-        self.models = []
-        
-        # Load all models
-        for path in model_paths:
-            # Load the lightning module which contains the model
-            lightning_module = pl.LightningModule.load_from_checkpoint(
-                path,
-                map_location=device
-            )
-            model = lightning_module.model
-            model.eval()  # Set to evaluation mode
-            model.to(device)
-            self.models.append(model)
-        
-        self.n_models = len(self.models)
-    
-    @torch.no_grad()
-    def get_ensemble_predictions(self, inputs):
-        """
-        Get predictions from all ensemble models.
-        
-        Args:
-            inputs: Tensor of shape (batch_size, input_dim)
-        
-        Returns:
-            Tensor of shape (batch_size, n_models, output_dim)
-        """
-        predictions = []
-        for model in self.models:
-            pred = model(inputs)
-            predictions.append(pred)
-        
-        # Stack along new dimension
-        return torch.stack(predictions, dim=1)
-
-
-class EnsembleLightningModule(pl.LightningModule):
+class RegressionModule(pl.LightningModule):
     """
     PyTorch Lightning module for training the ensemble combiner.
     """
-    def __init__(self, ensemble_wrapper, optimizer, combiner_model, weight_decay=0.0, learning_rate=1e-4, reg_coeff_l1=0.0, reg_coeff_l2=0.0):
+    def __init__(self, optimizer, model, ensemble_wrapper=None, weight_decay=0.0, learning_rate=1e-4, reg_coeff_l1=0.0, reg_coeff_l2=0.0):
         super().__init__()
         self.ensemble_wrapper = ensemble_wrapper
-        self.combiner = combiner_model
+        self.model = model
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.reg_coeff_l1 = reg_coeff_l1
@@ -461,10 +353,11 @@ class EnsembleLightningModule(pl.LightningModule):
         self.loss_fn = nn.MSELoss()
         self.optimizer_class = optimizer
         
-        # Freeze ensemble models (we only train the combiner)
-        for model in self.ensemble_wrapper.models:
-            for param in model.parameters():
-                param.requires_grad = False
+        # Freeze ensemble models (we only train the model)
+        if ensemble_wrapper is not None:
+            for model in self.ensemble_wrapper.models:
+                for param in model.parameters():
+                    param.requires_grad = False
     
     def compute_weight_regularization(self):
         """
@@ -476,7 +369,7 @@ class EnsembleLightningModule(pl.LightningModule):
         l1_penalty = torch.tensor(0., device=self.device)
         l2_penalty = torch.tensor(0., device=self.device)
         
-        for param in self.combiner.parameters():
+        for param in self.model.parameters():
             if self.reg_coeff_l1 > 0:
                 l1_penalty += torch.sum(torch.abs(param))
             if self.reg_coeff_l2 > 0:
@@ -486,7 +379,7 @@ class EnsembleLightningModule(pl.LightningModule):
     
     def forward(self, ensemble_preds, original_inputs=None):
         # Combine predictions with the meta-learner
-        combined = self.combiner(ensemble_preds, original_inputs)
+        combined = self.model(ensemble_preds, original_inputs)
         return combined
     
     def training_step(self, batch):
@@ -531,7 +424,83 @@ class EnsembleLightningModule(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        return self.optimizer_class(self.combiner.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        return self.optimizer_class(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+
+
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, depth, generator=None):
+        super().__init__()
+        layers = []
+        # Set seed if generator provided
+        if generator is not None:
+            torch.manual_seed(generator.initial_seed())
+        # Input layer
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        # Hidden layers
+        for _ in range(depth):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+        # Output layer
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        # Pack all layers into a Sequential container
+        self.linear_relu_stack = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        logits = self.linear_relu_stack(x)
+        return logits
+    
+class EnsembleWrapper:
+    """
+    Wrapper to load and use multiple trained models as an ensemble.
+    """
+    def __init__(self, model_paths, device='cpu'):
+        """
+        Args:
+            model_paths: List of paths to saved model checkpoints
+            device: Device to load models on
+        """
+        self.device = device
+        self.models = []
+        
+        # Load all models
+        for path in model_paths:
+
+            # Load the lightning module which contains the model
+            lightning_module = RegressionModule.load_from_checkpoint(
+                path,
+                model = NeuralNetwork(D, old_nn_width, 2*O, old_nn_depth),
+                optimizer=Adam,
+                learning_rate=old_learning_rate,
+                reg_coeff_l1=old_regularization_coeff_l1,
+                reg_coeff_l2=old_regularization_coeff_l2,
+                weight_decay=old_weight_decay
+            )
+            model = lightning_module.model
+            model.eval()  # Set to evaluation mode
+            model.to(device)
+            self.models.append(model)
+        
+        self.n_models = len(self.models)
+    
+    @torch.no_grad()
+    def get_ensemble_predictions(self, inputs):
+        """
+        Get predictions from all ensemble models.
+        
+        Args:
+            inputs: Tensor of shape (batch_size, input_dim)
+        
+        Returns:
+            Tensor of shape (batch_size, n_models, output_dim)
+        """
+        predictions = []
+        for model in self.models:
+            pred = model(inputs)
+            predictions.append(pred)
+        
+        # Stack along new dimension
+        return torch.stack(predictions, dim=1)
 
 
 #######################
@@ -640,7 +609,6 @@ print(f"Found {len(model_paths)} trained models")
 # Create ensemble wrapper
 ensemble_wrapper = EnsembleWrapper(
     model_paths=model_paths,
-    base_model_class=None,  # Not needed since we load from checkpoint
     device=device
 )
 
@@ -654,6 +622,7 @@ if with_orig_inputs:
         prep_data['valid_ensemble_preds'], prep_data['valid_targets'],
         prep_data['test_ensemble_preds'], prep_data['test_targets'],
         new_batch_size, batch_rng,
+        orig_data_module.in_scaler, 
         prep_data['train_inputs'], prep_data['valid_inputs'], prep_data['test_inputs'] 
     )
 else:
@@ -668,19 +637,21 @@ else:
 combiner = EnsembleCombiner(
     n_models=len(model_paths),
     output_dim=2 * O,
-    hidden_dim=nn_width,
-    depth=nn_depth,
+    hidden_dim=new_nn_width,
+    depth=new_nn_depth,
     include_inputs=with_orig_inputs,  
     input_dim=D,
     generator=NN_rng
 )
 
 # 4. Create Lightning module
-ensemble_lightning = EnsembleLightningModule(
+ensemble_lightning = RegressionModule(
     ensemble_wrapper=ensemble_wrapper,
-    combiner_model=combiner,
+    model=combiner,
     learning_rate=new_learning_rate,
     optimizer=Adam, 
+    reg_coeff_l1=new_regularization_coeff_l1,
+    reg_coeff_l2=new_regularization_coeff_l2,
     weight_decay=new_weight_decay,
 )
 
@@ -709,13 +680,15 @@ if run_mode == 'use':
     
 else:
     # Load model
-    lightning_module = EnsembleLightningModule.load_from_checkpoint(
+    lightning_module = RegressionModule.load_from_checkpoint(
         model_save_path + f'{new_n_epochs}epochs_{new_weight_decay}WD_{new_regularization_coeff_l1+new_regularization_coeff_l2}RC_{new_learning_rate}LR_{new_batch_size}BS.ckpt',
         ensemble_wrapper=ensemble_wrapper,
-        combiner_model=combiner,
+        model=combiner,
         learning_rate=new_learning_rate,
         optimizer=Adam, 
-        weight_decay=new_weight_decay
+        reg_coeff_l1=new_regularization_coeff_l1,
+        reg_coeff_l2=new_regularization_coeff_l2,
+        weight_decay=new_weight_decay,
     )
     print("Model loaded!")
 
@@ -782,15 +755,9 @@ plt.savefig(plot_save_path+'/loss.pdf')
 substep = 100
 
 # Get the scalers from original and new data module
-orig_out_scaler_T = orig_data_module.out_scaler_T
-orig_out_scaler_P = orig_data_module.out_scaler_P
-orig_in_scaler = orig_data_module.in_scaler
-
-new_out_scaler_T = new_data_module.out_scaler_T
-new_out_scaler_P = new_data_module.out_scaler_P
-new_in_scaler_T = new_data_module.in_scaler_T
-new_in_scaler_P = new_data_module.in_scaler_P
-if with_orig_inputs:past_in_scaler = new_data_module.past_in_scaler
+out_scaler_T = orig_data_module.out_scaler_T
+out_scaler_P = orig_data_module.out_scaler_P
+in_scaler = orig_data_module.in_scaler
 
 # FIX: Move all models to CPU for inference
 for model in ensemble_wrapper.models:
@@ -815,44 +782,43 @@ for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_i
 
     pred_outputs_T = np.zeros((n_models+1,O), dtype=float)
     pred_outputs_P = np.zeros((n_models+1,O), dtype=float)
+    raw_outputs_T = np.zeros((n_models+1,O), dtype=float)
+    raw_outputs_P = np.zeros((n_models+1,O), dtype=float)
 
     #Retrieve predictions for each model
     for imodel, model in enumerate(ensemble_wrapper.models):
 
-        pred_output = model(torch.tensor(orig_in_scaler.transform(test_input.reshape(1, -1)))).detach().numpy()
+        pred_output = model(torch.tensor(in_scaler.transform(test_input.reshape(1, -1)))).detach().numpy()
     
-        # Inverse transform to get original scale
-        pred_T_scaled = pred_output[:, :O]
-        pred_P_scaled = pred_output[:, O:]
-        pred_outputs_T[imodel,:] = orig_out_scaler_T.inverse_transform(pred_T_scaled.reshape(1, -1)).flatten()
-        pred_outputs_P[imodel,:] = orig_out_scaler_P.inverse_transform(pred_P_scaled.reshape(1, -1)).flatten()
+        # Store scaled outputs - used as input to the combiner
+        raw_outputs_T[imodel,:] = pred_output[:, :O]
+        raw_outputs_P[imodel,:] = pred_output[:, O:]
 
     #Prepare combiner input
-    ensemble_T_flat = pred_outputs_T.flatten() # Shape: [n_models * O]
-    ensemble_P_flat = pred_outputs_P.flatten() # Shape: [n_models * O]
-
-    #Scale input
-    ensemble_T_scaled = new_in_scaler_T.transform(ensemble_T_flat.reshape(1, -1))
-    ensemble_P_scaled = new_in_scaler_P.transform(ensemble_P_flat.reshape(1, -1))
+    ensemble_T = raw_outputs_T.flatten().reshape(1, -1) # Shape: [n_models * O]
+    ensemble_P = raw_outputs_P.flatten().reshape(1, -1) # Shape: [n_models * O]
 
     combiner_input = torch.tensor(
-        np.concatenate([ensemble_T_scaled, ensemble_P_scaled], axis=1), dtype=torch.float32
+        np.concatenate([ensemble_T, ensemble_P], axis=1), dtype=torch.float32
     )
 
     # Get combiner prediction
     if with_orig_inputs:
         pred_output = combiner(
             combiner_input,
-            torch.tensor(past_in_scaler.transform(test_input.reshape(1, -1)), dtype=torch.float32)
+            torch.tensor(in_scaler.transform(test_input.reshape(1, -1)), dtype=torch.float32)
         ).detach().numpy()
     else:
         pred_output = combiner(combiner_input).detach().numpy()
 
+    # Store scaled outputs
+    raw_outputs_T[-1,:] = pred_output[:, :O]
+    raw_outputs_P[-1,:] = pred_output[:, O:]
+
     # Inverse transform to get original scale
-    pred_T_scaled = pred_output[:, :O]
-    pred_P_scaled = pred_output[:, O:]
-    pred_outputs_T[-1,:] = new_out_scaler_T.inverse_transform(pred_T_scaled.reshape(1, -1)).flatten()
-    pred_outputs_P[-1,:] = new_out_scaler_P.inverse_transform(pred_P_scaled.reshape(1, -1)).flatten()
+    for imodel in range(n_models+1):
+        pred_outputs_T[imodel,:] = out_scaler_T.inverse_transform(raw_outputs_T[imodel,:].reshape(1, -1)).flatten()
+        pred_outputs_P[imodel,:] = out_scaler_P.inverse_transform(raw_outputs_P[imodel,:].reshape(1, -1)).flatten()
     
     #Storing residuals 
     res_Ts[:, test_idx, :] = pred_outputs_T - test_output_T
