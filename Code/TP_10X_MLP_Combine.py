@@ -527,7 +527,7 @@ def prepare_ensemble_data(ensemble_wrapper, original_data_module, device='cpu'):
     # Process each split
     for split_name, loader in [
         ('train', original_data_module.train_dataloader()),
-        ('val', original_data_module.val_dataloader()),
+        ('valid', original_data_module.val_dataloader()),
         ('test', original_data_module.test_dataloader())
     ]:
         all_inputs = []
