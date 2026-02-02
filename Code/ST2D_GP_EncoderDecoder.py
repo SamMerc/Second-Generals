@@ -228,7 +228,7 @@ class EncoderDecoder(nn.Module):
             # Output : 32 x 24 x 36
 
             # Input: 32 x 24 x 36
-            nn.ConvTranspose2d(32, output_channels, kernel_size=3, stride=2, padding=1),
+            nn.ConvTranspose2d(32, output_channels, kernel_size=3, stride=2, padding=1, output_padding=1),
             nn.Sigmoid(),
             # Output : output_channels x 48 x 72
 
