@@ -348,7 +348,9 @@ NN_rng.manual_seed(NN_seed)
 
 #Update paths
 model_save_path += f'NeuralNetwork_{my_task_id}/'
+check_and_make_dir(model_save_path)
 plot_save_path += f'NeuralNetwork_{my_task_id}/'
+check_and_make_dir(plot_save_path)
 
 #Generate model
 model = NeuralNetwork(D, nn_width, 2*O, nn_depth, generator=NN_rng)
