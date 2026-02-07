@@ -680,7 +680,7 @@ if run_mode == 'use':
     
 else:
     # Load model
-    lightning_module = RegressionModule.load_from_checkpoint(
+    ensemble_lightning = RegressionModule.load_from_checkpoint(
         model_save_path + f'{new_n_epochs}epochs_{new_weight_decay}WD_{new_regularization_coeff_l1+new_regularization_coeff_l2}RC_{new_learning_rate}LR_{new_batch_size}BS.ckpt',
         ensemble_wrapper=ensemble_wrapper,
         model=combiner,
@@ -693,63 +693,70 @@ else:
     print("Model loaded!")
 
 #Testing model on test dataset
-trainer.test(lightning_module, datamodule=new_data_module)
+trainer.test(ensemble_lightning, datamodule=new_data_module)
 
 # --- Accessing Training History After Training ---
 # Find the version directory (e.g., version_0, version_1, etc.)
-log_dir = model_save_path+'logs/NeuralNetwork'
-versions = [d for d in os.listdir(log_dir) if d.startswith('version_')]
-latest_version = sorted(versions)[-1]  # Get the latest version
-csv_path = os.path.join(log_dir, latest_version, 'metrics.csv')
-
-# Read the metrics
-metrics_df = pd.read_csv(csv_path)
-
-# Extract losses per epoch
-train_losses = metrics_df[metrics_df['train_loss_epoch'].notna()]['train_loss_epoch'].tolist()
-eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
+if run_mode == 'use':
+    # Only read metrics if we just trained the model
+    log_dir = model_save_path+'logs/NeuralNetwork'
+    versions = [d for d in os.listdir(log_dir) if d.startswith('version_')]
+    latest_version = sorted(versions)[-1]  # Get the latest version
+    csv_path = os.path.join(log_dir, latest_version, 'metrics.csv')
+    
+    # Read the metrics
+    metrics_df = pd.read_csv(csv_path)
+    
+    # Extract losses per epoch
+    train_losses = metrics_df[metrics_df['train_loss_epoch'].notna()]['train_loss_epoch'].tolist()
+    eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
+else:
+    print("Skipping loss curve plotting - model loaded from checkpoint")
+    train_losses = []
+    eval_losses = []
 
 
 ##########################
 #### Diagnostic plots ####
 ##########################
-# Loss curves
-fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios':[3, 1]}, figsize=(10, 6))
+if run_mode == 'use':
+    # Loss curves
+    fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios':[3, 1]}, figsize=(10, 6))
 
-# Calculate number of batches per epoch
-n_batches = len(train_losses) // new_n_epochs
+    # Calculate number of batches per epoch
+    n_batches = len(train_losses) // new_n_epochs
 
-# Create x-axis in terms of epochs (0 to n_epochs)
-x_all = np.linspace(0, new_n_epochs, len(train_losses))
-x_epoch = np.arange(new_n_epochs+1)
+    # Create x-axis in terms of epochs (0 to n_epochs)
+    x_all = np.linspace(0, new_n_epochs, len(train_losses))
+    x_epoch = np.arange(new_n_epochs+1)
 
-# Plot transparent background showing all batch losses
-ax1.plot(x_all, train_losses, alpha=0.3, color='C0', linewidth=0.5)
-ax1.plot(x_all, eval_losses, alpha=0.3, color='C1', linewidth=0.5)
+    # Plot transparent background showing all batch losses
+    ax1.plot(x_all, train_losses, alpha=0.3, color='C0', linewidth=0.5)
+    ax1.plot(x_all, eval_losses, alpha=0.3, color='C1', linewidth=0.5)
 
-# Plot solid lines showing epoch-level losses (every n_batches steps)
-train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]  # Last batch of each epoch
-eval_epoch = [eval_losses[0]] + eval_losses[n_batches-1::n_batches]
-ax1.plot(x_epoch, train_epoch, label="Train", color='C0', linewidth=2, marker='o')
-ax1.plot(x_epoch, eval_epoch, label="Validation", color='C1', linewidth=2, marker='o')
+    # Plot solid lines showing epoch-level losses (every n_batches steps)
+    train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]  # Last batch of each epoch
+    eval_epoch = [eval_losses[0]] + eval_losses[n_batches-1::n_batches]
+    ax1.plot(x_epoch, train_epoch, label="Train", color='C0', linewidth=2, marker='o')
+    ax1.plot(x_epoch, eval_epoch, label="Validation", color='C1', linewidth=2, marker='o')
 
-# Same for difference plot
-diff_all = np.array(train_losses) - np.array(eval_losses)
-diff_epoch = np.array(train_epoch) - np.array(eval_epoch)
+    # Same for difference plot
+    diff_all = np.array(train_losses) - np.array(eval_losses)
+    diff_epoch = np.array(train_epoch) - np.array(eval_epoch)
 
-ax2.plot(x_all, diff_all, alpha=0.3, color='C2', linewidth=0.5)
-ax2.plot(x_epoch, diff_epoch, color='C2', linewidth=2, marker='o')
+    ax2.plot(x_all, diff_all, alpha=0.3, color='C2', linewidth=0.5)
+    ax2.plot(x_epoch, diff_epoch, color='C2', linewidth=2, marker='o')
 
-ax1.set_yscale('log')
-ax2.set_yscale('log')
-ax2.set_xlabel("Epoch")
-ax1.set_ylabel("MSE Loss")
-ax2.set_ylabel("Loss Diff.")
-ax1.legend()
-ax1.grid()
-ax2.grid()
-plt.subplots_adjust(hspace=0)
-plt.savefig(plot_save_path+'/loss.pdf')
+    ax1.set_yscale('log')
+    ax2.set_yscale('log')
+    ax2.set_xlabel("Epoch")
+    ax1.set_ylabel("MSE Loss")
+    ax2.set_ylabel("Loss Diff.")
+    ax1.legend()
+    ax1.grid()
+    ax2.grid()
+    plt.subplots_adjust(hspace=0)
+    plt.savefig(plot_save_path+'/loss.pdf')
 
 #Comparing predicted T-P profiles vs true T-P profiles with residuals
 substep = 100
@@ -795,12 +802,12 @@ for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_i
         raw_outputs_P[imodel,:] = pred_output[:, O:]
 
     #Prepare combiner input
-    ensemble_T = raw_outputs_T.flatten().reshape(1, -1) # Shape: [n_models * O]
-    ensemble_P = raw_outputs_P.flatten().reshape(1, -1) # Shape: [n_models * O]
+    ensemble_T = raw_outputs_T[:-1,:].flatten().reshape(1, -1) # Shape: [n_models * O] = [10*51 = 510]
+    ensemble_P = raw_outputs_P[:-1,:].flatten().reshape(1, -1) # Shape: [n_models * O] = [10*51 = 510]
 
     combiner_input = torch.tensor(
         np.concatenate([ensemble_T, ensemble_P], axis=1), dtype=torch.float32
-    )
+    ) # Shape: [1, 510 + 510] = [1, 1020]
 
     # Get combiner prediction
     if with_orig_inputs:
@@ -832,13 +839,18 @@ for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_i
                             width_ratios=(3, 1), height_ratios=(1, 3),
                             layout='constrained') 
 
-        for imodel in range(n_models+1):       
+        for imodel in range(n_models+1):
+            color = 'orange' if imodel == n_models else 'green'
+            if imodel == n_models:plotlabel='Combiner'
+            elif imodel==0:plotlabel= 'Model 1-10'  
+            else: plotlabel=''
             axs['results'].plot(test_output_T, test_output_P, '.', linestyle='-', color='blue', linewidth=2)
-            axs['results'].plot(pred_outputs_T[imodel, :], pred_outputs_P[imodel, :], color='green', linewidth=2)
+            
+            axs['results'].plot(pred_outputs_T[imodel, :], pred_outputs_P[imodel, :], color=color, alpha=0.2, linewidth=2, label=plotlabel)
 
-            axs['res_temperature'].plot(res_Ts[imodel, test_idx, :], test_output_P, '.', linestyle='-', color='green', linewidth=2)
+            axs['res_temperature'].plot(res_Ts[imodel, test_idx, :], test_output_P, '.', linestyle='-', color=color, alpha=0.2, linewidth=2)
 
-            axs['res_pressure'].plot(test_output_T, res_Ps[imodel, test_idx, :], '.', linestyle='-', color='green', linewidth=2)
+            axs['res_pressure'].plot(test_output_T, res_Ps[imodel, test_idx, :], '.', linestyle='-', color=color, alpha=0.2, linewidth=2)
 
         axs['results'].invert_yaxis()
         axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
@@ -866,46 +878,43 @@ for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_i
         plt.savefig(plot_save_path+f'/pred_vs_actual_n.{test_idx}.pdf')
     
     
-fig, axes = plt.subplots(11, 2, sharex=True, figsize=[50, 8])
-# Initialize statistics text 
-stats_text = (
-    f"--- NN Residuals ---\n"
-)
-print('\n','--- NN Residuals ---')
-
-#Define colours 
+fig, axes = plt.subplots(11, 2, sharex=True, figsize=[8, 50])
+# Define colours 
 colours = plt.get_cmap('viridis')(np.linspace(0., 1, n_models+1))
 
 for imodel in range(n_models+1):
-    print('\n',f'    --- Model {imodel+1} ---')
+    print('\n', f'    --- Model {imodel+1} ---')
     print(f'    Temperature Residuals : Median = {np.median(res_Ts[imodel, :, :]):.2f} K, Std = {np.std(res_Ts[imodel, :, :]):.2f} K')
-    print(rf'   Pressure Residuals : Median = {np.median(res_Ps[imodel, :, :]):.3f} $log_{10}$ bar, Std = {np.std(res_Ps[imodel, :, :]):.2f} $log_{10}$ bar')
-
+    print(rf'   Pressure Residuals : Median = {np.median(res_Ps[imodel, :, :]):.3f} $log_{{10}}$ bar, Std = {np.std(res_Ps[imodel, :, :]):.2f} $log_{{10}}$ bar')
+    
     label = f'Model {imodel+1}' if imodel < n_models else 'Combiner'
-
-    #Plot residuals
+    
+    # Calculate statistics
+    T_median = np.median(res_Ts[imodel, :, :])
+    T_std = np.std(res_Ts[imodel, :, :])
+    P_median = np.median(res_Ps[imodel, :, :])
+    P_std = np.std(res_Ps[imodel, :, :])
+    
+    # Plot residuals (without label on individual lines)
     axes[imodel, 0].set_title(label)
     axes[imodel, 0].plot(res_Ts[imodel, :, :].T, alpha=0.1, color=colours[imodel])
     axes[imodel, 1].plot(res_Ps[imodel, :, :].T, alpha=0.1, color=colours[imodel])
+    
+    # Add a single dummy line for the legend with statistics
+    axes[imodel, 0].plot([], [], color=colours[imodel], linewidth=2, 
+                        label=f'Median = {T_median*1e3:.0f} x1e-3\nStd = {T_std*1e3:.0f} x1e-3')
+    axes[imodel, 1].plot([], [], color=colours[imodel], linewidth=2,
+                        label=f'Median = {P_median*1e3:.0f} x1e-3\nStd = {P_std*1e3:.0f} x1e-3')
+    
     for ax in [axes[imodel, 0], axes[imodel, 1]]:
         ax.axhline(0, color='black', linestyle='dashed')
         ax.set_xlabel('Index')
         ax.grid()
-    axes[imodel, 0].set_ylabel('Temperature')
+        ax.legend(loc='best')
+    
+    axes[imodel, 0].set_ylabel('Temperature (K)')
     axes[imodel, 1].set_ylabel('log$_{10}$ Pressure (bar)')
 
-    stats_text += (
-        f'    --- Model {imodel+1} ---'
-        f"Temperature Residuals : Median = {np.median(res_Ts[imodel, :, :]):.2f} K, Std = {np.std(res_Ts[imodel, :, :]):.2f} K\n"
-        f"Pressure Residuals : Median = {np.median(res_Ps[imodel, :, :]):.3f} $log_{{10}}$ bar, Std = {np.std(res_Ps[imodel, :, :]):.2f} $log_{{10}}$ bar"
-    )
-
-plt.subplots_adjust(hspace=0.1, bottom=0.25)
-
-#Add statistics text at the bottom
-fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
-        verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-plt.legend()
+plt.tight_layout()
 plt.savefig(plot_save_path+f'/res_NN.pdf', bbox_inches='tight')
 plt.show()
