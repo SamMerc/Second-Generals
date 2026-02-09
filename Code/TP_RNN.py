@@ -35,8 +35,12 @@ N = raw_inputs.shape[0] #Number of data points
 D = raw_inputs.shape[1] #Number of features
 O = raw_outputs_T.shape[1] #Number of outputs
 
-
-
+# Define device and instantiate model
+# device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+device = "cpu"
+num_threads = 2
+torch.set_num_threads(num_threads)
+print(f"Using {device} device with {num_threads} threads")
 
 
 
@@ -71,17 +75,17 @@ generator = torch.Generator().manual_seed(partition_seed)
 train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(N), data_partitions, generator=generator)
 ## Generate the data partitions
 ### Training
-train_inputs = shrink_inputs[train_idx]
-train_outputs_T = shrink_outputs_T[train_idx]
-train_outputs_P = shrink_outputs_P[train_idx]
+train_inputs = shrink_inputs[train_idx].to(device)
+train_outputs_T = shrink_outputs_T[train_idx].to(device)
+train_outputs_P = shrink_outputs_P[train_idx].to(device)
 ### Validation
-valid_inputs = shrink_inputs[valid_idx]
-valid_outputs_T = shrink_outputs_T[valid_idx]
-valid_outputs_P = shrink_outputs_P[valid_idx]
+valid_inputs = shrink_inputs[valid_idx].to(device)
+valid_outputs_T = shrink_outputs_T[valid_idx].to(device)
+valid_outputs_P = shrink_outputs_P[valid_idx].to(device)
 ### Testing
-test_inputs = shrink_inputs[test_idx]
-test_outputs_T = shrink_outputs_T[test_idx]
-test_outputs_P = shrink_outputs_P[test_idx]
+test_inputs = shrink_inputs[test_idx].to(device)
+test_outputs_T = shrink_outputs_T[test_idx].to(device)
+test_outputs_P = shrink_outputs_P[test_idx].to(device)
 
 
 
@@ -157,13 +161,6 @@ class DeepRNN(nn.Module):
         return y_seq
     
 
-# Define device and instantiate model
-# device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-device = "cpu"
-num_threads = 2
-torch.set_num_threads(num_threads)
-print(f"Using {device} device with {num_threads} threads")
-
 #Define sizes
 hidden_size=100
 model = DeepRNN(input_size=D, hidden_size=hidden_size, output_size=O).to(device)
@@ -203,7 +200,7 @@ def eval_loop(inputs, targets, model, loss_fn):
 
 #Run the optimization
 #Define number of epochs 
-n_epochs = 100
+n_epochs = 50000
 train_losses = np.zeros(n_epochs, dtype=float)
 val_losses = np.zeros(n_epochs, dtype=float)
 
@@ -258,18 +255,23 @@ plt.close()
 substep = 1000
 
 #Converting tensors to numpy arrays if this isn't already done
-if (type(test_outputs_T) != np.ndarray):
+# --- Convert tensors to numpy arrays safely ---
+if not isinstance(test_outputs_T, np.ndarray):
     test_outputs_T = test_outputs_T.detach().cpu().numpy()
     test_outputs_P = test_outputs_P.detach().cpu().numpy()
+    test_inputs_cpu = test_inputs.detach().cpu()  # for iterating below
+else:
+    test_inputs_cpu = test_inputs
 
-for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_inputs, test_outputs_T, test_outputs_P)):
+for test_idx, (test_input, test_output_T, test_output_P) in enumerate(zip(test_inputs_cpu, test_outputs_T, test_outputs_P)):
 
     #Retrieve prediction
-    pred_output_T = model(test_input.reshape(1, 1, D)).detach().numpy()
+    pred_output_T = model(test_input.reshape(1, 1, D).to(device)).detach().cpu().numpy()
     pred_output_T = pred_output_T.reshape(O)
 
     #Convert to numpy
-    test_input = test_input.numpy()
+    if torch.is_tensor(test_input):
+        test_input = test_input.cpu().numpy()
 
     #Plotting
     if (test_idx % substep == 0):
@@ -298,7 +300,7 @@ if (type(test_outputs_T) != np.ndarray):
 for test_idx, (test_input, test_output_T) in enumerate(zip(test_inputs, test_outputs_T)):
 
     #Retrieve prediction
-    residuals[test_idx] = model(test_input.reshape(1, 1, D)).detach().numpy().reshape(O) - test_output_T
+    residuals[test_idx] = model(test_input.reshape(1, 1, D).to(device)).detach().cpu().numpy().reshape(O) - test_output_T
 
 
 fig, ax = plt.subplots(figsize=[8, 6])
@@ -309,3 +311,4 @@ plt.ylabel('Temperature (K)')
 plt.savefig(plot_save_path+f'/residuals.pdf')
 plt.close()
 print(f'Median: {np.median(residuals):.3f} K, Standard deviation: {np.std(residuals):.3f} K')
+
