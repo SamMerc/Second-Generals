@@ -71,8 +71,8 @@ NN_seed = 6
 NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
-#Whether to include 2D batch normalization layers in the CNN
-use_batch_norm = False
+#Normalization layer to use in the CNN
+norm = 'batch' # can be 'batch', 'group', 'layered' or None
 
 #Optimizer learning rate
 learning_rate = 1e-3
@@ -235,21 +235,32 @@ class CNN(nn.Module):
             nn.Linear(512, 128 * 6 * 9)  # 6x9 feature maps with 128 channels
         )
 
+        # Helper function to get normalization layer
+        def get_norm(channels):
+            if norm == 'batch':
+                return nn.BatchNorm2d(channels)
+            elif norm == 'group':
+                return nn.GroupNorm(num_groups=32, num_channels=channels)  # 32 groups
+            elif norm == 'layer':
+                return nn.GroupNorm(num_groups=1, num_channels=channels)  # LayerNorm equivalent
+            else:  # None
+                return nn.Identity()
+            
         # Decoder layers - progressively upsample
         self.decoder = nn.Sequential(
             # Input: 128 x 6 x 9
             nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(128) if use_batch_norm else nn.Identity(),
+            get_norm(128),
             nn.ReLU(inplace=True),
             # Output: 128 x 12 x 18
             
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(64) if use_batch_norm else nn.Identity(),
+            get_norm(64),
             nn.ReLU(inplace=True),
             # Output: 64 x 24 x 36
             
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.BatchNorm2d(32) if use_batch_norm else nn.Identity(),
+            get_norm(32),
             nn.ReLU(inplace=True),
             # Output: 32 x 48 x 72
             

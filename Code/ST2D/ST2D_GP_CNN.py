@@ -76,8 +76,8 @@ NN_seed = 6
 NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
-#Whether to include 2D batch normalization layers in the CNN
-use_batch_norm = False
+#Normalization layer to use in the CNN
+norm = 'batch' # can be 'batch', 'group', 'layered' or None
 
 # Variable to show plots or not 
 show_plot = False
@@ -191,26 +191,37 @@ class SimpleCNN(nn.Module):
         if generator is not None:
             torch.manual_seed(generator.initial_seed())
 
+        # Helper function to get normalization layer
+        def get_norm(channels):
+            if norm == 'batch':
+                return nn.BatchNorm2d(channels)
+            elif norm == 'group':
+                return nn.GroupNorm(num_groups=32, num_channels=channels)  # 32 groups
+            elif norm == 'layer':
+                return nn.GroupNorm(num_groups=1, num_channels=channels)  # LayerNorm equivalent
+            else:  # None
+                return nn.Identity()
+            
         # Direct CNN - no dimensionality reduction
         self.cnn = nn.Sequential(
             # Input: input_channels x 48 x 69
             nn.Conv2d(input_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32) if use_batch_norm else nn.Identity(),
+            get_norm(32),
             nn.ReLU(inplace=True),
             # Output: 32 x 48 x 69
             
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64) if use_batch_norm else nn.Identity(),
+            get_norm(64),
             nn.ReLU(inplace=True),
             # Output: 64 x 48 x 69
             
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64) if use_batch_norm else nn.Identity(),
+            get_norm(64),
             nn.ReLU(inplace=True),
             # Output: 64 x 48 x 69
             
             nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32) if use_batch_norm else nn.Identity(),
+            get_norm(32),
             nn.ReLU(inplace=True),
             # Output: 32 x 48 x 69
             
