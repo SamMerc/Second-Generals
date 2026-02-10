@@ -30,10 +30,10 @@ base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing surface temperature map
 raw_ST_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/NN_ST_fixedstand_nosmooth_noreg_nobatchnorm/'
+model_save_path = base_dir+'Model_Storage/NN_ST_FlowMatching/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/NN_ST_fixedstand_nosmooth_noreg_nobatchnorm/'
+plot_save_path = base_dir+'Plots/NN_ST_FlowMatching/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -71,9 +71,6 @@ NN_seed = 6
 NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
-#Normalization layer to use in the CNN
-norm = 'batch' # can be 'batch', 'group', 'layered' or None
-
 #Optimizer learning rate
 learning_rate = 1e-3
 
@@ -88,7 +85,7 @@ weight_decay = 0.0
 batch_size = 64
 
 #Number of epochs 
-n_epochs = 10
+n_epochs = 200
 
 #Number of Euler steps for integral evaluation at inference
 # More steps = more accurate but slower. 50–100 is usually plenty.
@@ -324,8 +321,13 @@ class VelocityUNet(nn.Module):
 
     COND_DIM = 256   # dimension of the shared conditioning embedding
 
-    def __init__(self, img_channels: int = 1, cond_input_dim: int = 4):
+    def __init__(self, img_channels: int = 1, cond_input_dim: int = 4, generator=None):
         super().__init__()
+
+        # Set seed if generator provided
+        if generator is not None:
+            torch.manual_seed(generator.initial_seed())
+
         C = self.COND_DIM
 
         # ── Conditioning encoder ─────────────────────────────────────────
@@ -378,7 +380,7 @@ class VelocityUNet(nn.Module):
         return self.out_conv(d1)                # (B, 1,   46, 72)
 
 
-model = VelocityUNet(img_channels=1, cond_input_dim=D)
+model = VelocityUNet(img_channels=1, cond_input_dim=D, generator=NN_rng)
 summary(model, input_data=[
     torch.zeros(2, 1, IMG_H, IMG_W),
     torch.zeros(2, D),
