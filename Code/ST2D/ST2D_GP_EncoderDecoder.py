@@ -77,7 +77,7 @@ NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
 #Normalization layer to use in the CNN
-norm = 'batch' # can be 'batch', 'group', 'layered' or None
+norm = 'batch' # can be 'batch', 'group', 'layer' or None
 
 # Variable to show plots or not 
 show_plot = False
