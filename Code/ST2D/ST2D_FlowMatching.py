@@ -272,7 +272,10 @@ class ConditionEncoder(nn.Module):
         )
 
     def forward(self, cond: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """cond: (B, 4), t: (B,)  →  (B, out_dim)"""
+        """
+        cond: (B, 4), t: (B,)  →  (B, out_dim)
+        out_dim = 64 + 4 = 68
+        """
         t_emb = self.time_emb(t)
         return self.net(torch.cat([cond, t_emb], dim=-1))
 
@@ -410,7 +413,7 @@ class FlowMatchingModule(pl.LightningModule):
 
     def _forward_process(self, x1: torch.Tensor, z0: torch.Tensor,
                           t: torch.Tensor) -> torch.Tensor:
-        """x_t = (1-t)*z0 + t*x1.  t is broadcast over (H, W, C)."""
+        """x_t = (1-t)*z0 + t*x1.  t is broadcast over (C, H, W)."""
         t_view = t.view(-1, 1, 1, 1)
         return (1.0 - t_view) * z0 + t_view * x1
 
@@ -443,9 +446,9 @@ class FlowMatchingModule(pl.LightningModule):
         x_t = self._forward_process(x1, z0, t)        # noisy interpolation
 
         v_target = self._velocity_target(x1, z0)      # ground-truth velocity
-        v_pred   = self(x_t, cond, t)                  # predicted velocity
+        v_pred   = self(x_t, cond, t)                 # predicted velocity
 
-        loss = self.loss_fn(v_pred, v_target)
+        loss = self.loss_fn(v_pred, v_target)         # MSE between predicted and true velocity
         l1, l2 = self._weight_reg()
         loss = loss + l1 + l2
 
