@@ -11,6 +11,7 @@ import os
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
+import scipy
 from scipy.stats import pearsonr, spearmanr
 
 
@@ -54,28 +55,48 @@ batch_size       = 200
 
 # -----------------------------------------------------------------------
 # MULTI-MODEL COMPARISON CONFIG
-# Required keys : 'label', 'ckpt', 'seed'
-# Optional keys : 'nn_width', 'nn_depth'  (fall back to defaults above)
+# Required keys : 'label', 'ckpt', 'seed', 'model_type'
+# PNNA: model_type='pnna' (standard NN on raw 4-D inputs)
+# GPNNA: model_type='gpnna', 'n_neighbors': int (GP → NN two-stage)
+# Optional keys : 'nn_width', 'nn_depth'
 # -----------------------------------------------------------------------
 MODEL_CONFIGS = [
+    #PNNA
     {
-        'label' : 'PNNA - Baseline',
-        'ckpt'  : 'NN_fixedstand_nosmooth_noreg/100000epochs_0.0WD_0.0RC_0.0SC_0.001LR_200BS.ckpt',
-        'seed'  : 6,
+        'label'      : 'PNNA - Baseline',
+        'ckpt'       : 'NN_fixedstand_nosmooth_noreg/100000epochs_0.0WD_0.0RC_0.0SC_0.001LR_200BS.ckpt',
+        'seed'       : 6,
+        'model_type' : 'pnna',
     },
     {
-        'label' : 'PNNA - L2 Reg',
-        'ckpt'  : 'NN_fixedstand_nosmooth_reg/100000epochs_0.0WD_0.01RC_0.0SC_0.001LR_200BS.ckpt',
-        'seed'  : 6,
+        'label'      : 'PNNA - L2 Reg',
+        'ckpt'       : 'NN_fixedstand_nosmooth_reg/100000epochs_0.0WD_0.01RC_0.0SC_0.001LR_200BS.ckpt',
+        'seed'       : 6,
+        'model_type' : 'pnna',
     },
     {
-        'label' : 'PNNA - Smooth',
-        'ckpt'  : 'NN_smooth/100000epochs_0.0WD_0.0RC_0.001SC_0.005LR_200BS.ckpt',
-        'seed'  : 6,
+        'label'      : 'PNNA - Smooth',
+        'ckpt'       : 'NN_smooth/100000epochs_0.0WD_0.0RC_0.001SC_0.005LR_200BS.ckpt',
+        'seed'       : 6,
+        'model_type' : 'pnna',
+    },
+    # GPNNA
+    {
+        'label'       : 'GPNNA - Baseline',
+        'ckpt'        : 'GP_fixedstand_nosmooth_noreg/100000epochs_0.0WD_0.0RC_0.0SC_0.001LR_200BS.ckpt',
+        'seed'        : 6,
+        'model_type'  : 'gpnna',
+        'n_neighbors' : 10,
+    },
+    {
+        'label'       : 'GPNNA - Smooth',
+        'ckpt'        : 'GP_fixedstand_smooth_noreg/100000epochs_0.0WD_0.0RC_0.001SC_0.001LR_200BS.ckpt',
+        'seed'        : 6,
+        'model_type'  : 'gpnna',
+        'n_neighbors' : 10,
     },
 ]
 
-# Sanity-check: all checkpoints must exist before we do any work
 for cfg in MODEL_CONFIGS:
     full = model_save_path + cfg['ckpt']
     if not os.path.exists(full):
@@ -84,6 +105,38 @@ for cfg in MODEL_CONFIGS:
             "Check MODEL_CONFIGS and model_save_path."
         )
 print("All checkpoints found.\n")
+
+
+##############################################
+#### Conditional Gaussian Process (for GPNNA)
+##############################################
+
+def Sai_CGP(obs_features, obs_labels, query_features):
+    """
+    Conditional Gaussian Process
+
+    Inputs
+    ------
+    obs_features   : ndarray (D, N) — D-dim features of N ensemble points
+    obs_labels     : ndarray (K, N) — K-dim labels of N ensemble points
+    query_features : ndarray (D, 1) — D-dim features of query point
+
+    Outputs
+    -------
+    query_labels     : ndarray (K, N) — updated K-dim labels
+    query_cov_labels : ndarray (K, K) — covariance of ensemble labels
+    """
+    n = obs_features.shape[1]
+    Cyx = (obs_labels @ obs_features.T) / (n - 1)
+    Cxy = (obs_features @ obs_labels.T) / (n - 1)
+    Cxx = (obs_features @ obs_features.T) / (n - 1)
+    Cyy = (obs_labels @ obs_labels.T) / (n - 1)
+    Cxx += 1e-8 * np.eye(Cxx.shape[0])
+
+    query_labels     = obs_labels + (Cyx @ scipy.linalg.pinv(Cxx) @ (query_features - obs_features))
+    query_cov_labels = Cyy - Cyx @ scipy.linalg.pinv(Cxx) @ Cxy
+
+    return query_labels, query_cov_labels
 
 
 ###########################################
@@ -170,8 +223,11 @@ data_module = CustomDataModule(
     batch_size, batch_rng
 )
 
-# Raw (unscaled) test inputs/outputs used later for plotting
-raw_test_inputs = test_inputs.cpu().numpy()
+# Raw (unscaled) arrays for evaluation
+raw_test_inputs  = test_inputs.cpu().numpy()
+raw_train_inputs = train_inputs.cpu().numpy()   # needed for GPNNA k-NN
+raw_train_outputs_T = train_outputs_T.cpu().numpy()
+raw_train_outputs_P = train_outputs_P.cpu().numpy()
 true_T = test_outputs_T.cpu().numpy()
 true_P = test_outputs_P.cpu().numpy()
 
@@ -232,7 +288,7 @@ class RegressionModule(pl.LightningModule):
 
 
 ##############################################
-#### Helper: evaluate one model on test set ##
+#### Helper: parse hparams from checkpoint name
 ##############################################
 
 def _parse_hparams_from_ckpt_name(ckpt_path):
@@ -259,19 +315,19 @@ def _parse_hparams_from_ckpt_name(ckpt_path):
     }
 
 
-def evaluate_model(cfg, data_module):
-    """
-    Load a checkpoint and return full signed residual profiles on the test set.
+##############################################
+#### Evaluate PNNA model (standard NN)    ##
+##############################################
 
-    Parameters
-    ----------
-    cfg         : one entry from MODEL_CONFIGS
-    data_module : fitted CustomDataModule (provides scalers)
+def evaluate_pnna(cfg, data_module):
+    """
+    Load a PNNA checkpoint and return signed residuals on the test set.
+    PNNA: raw 4-D input → NN → T-P profile
 
     Returns
     -------
-    res_T : ndarray (n_test, O)  — residuals pred - true, temperature in K
-    res_P : ndarray (n_test, O)  — residuals pred - true, pressure in log10 bar
+    res_T : ndarray (n_test, O)
+    res_P : ndarray (n_test, O)
     """
     width     = cfg.get('nn_width', nn_width_default)
     depth     = cfg.get('nn_depth', nn_depth_default)
@@ -283,11 +339,7 @@ def evaluate_model(cfg, data_module):
 
     mdl = NeuralNetwork(D, width, 2 * O, depth, generator=NN_rng)
     lm  = RegressionModule.load_from_checkpoint(
-        ckpt_path,
-        model=mdl,
-        optimizer=Adam,
-        **hparams,
-        reg_coeff_l1=0.0,
+        ckpt_path, model=mdl, optimizer=Adam, **hparams, reg_coeff_l1=0.0,
     )
     mdl = lm.model.cpu().eval()
 
@@ -295,13 +347,157 @@ def evaluate_model(cfg, data_module):
         data_module.in_scaler.transform(raw_test_inputs), dtype=torch.float32
     )
     with torch.no_grad():
-        preds = mdl(scaled_inputs).numpy()   # (n_test, 2*O)
+        preds = mdl(scaled_inputs).numpy()
 
     pred_T = data_module.out_scaler_T.inverse_transform(preds[:, :O])
     pred_P = data_module.out_scaler_P.inverse_transform(preds[:, O:])
 
-    res_T = pred_T - true_T   # (n_test, O) signed residuals
+    res_T = pred_T - true_T
     res_P = pred_P - true_P
+    return res_T, res_P
+
+
+##############################################
+#### Evaluate GPNNA model (GP → NN)       ##
+##############################################
+
+class GPNNADataModule(pl.LightningDataModule):
+    """
+    Like CustomDataModule but uses separate T and P scalers for *both*
+    inputs and outputs (GPNNA needs this because inputs are TP profiles).
+    """
+    def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs,
+                 test_inputs, test_outputs, batch_size, rng):
+        super().__init__()
+
+        # Output scalers (same as before)
+        out_scaler_T = StandardScaler()
+        out_scaler_P = StandardScaler()
+        out_scaler_T.fit(train_outputs[:, :O].cpu().numpy())
+        out_scaler_P.fit(train_outputs[:, O:].cpu().numpy())
+
+        # Input scalers — GPNNA inputs are also TP profiles (from GP)
+        in_scaler_T = StandardScaler()
+        in_scaler_P = StandardScaler()
+        in_scaler_T.fit(train_inputs[:, :O].cpu().numpy())
+        in_scaler_P.fit(train_inputs[:, O:].cpu().numpy())
+
+        def scale_profile(profiles, scaler_T, scaler_P):
+            T_s = torch.tensor(scaler_T.transform(profiles[:, :O].cpu().numpy()), dtype=torch.float32)
+            P_s = torch.tensor(scaler_P.transform(profiles[:, O:].cpu().numpy()), dtype=torch.float32)
+            return torch.cat([T_s, P_s], dim=1)
+
+        self.out_scaler_T = out_scaler_T
+        self.out_scaler_P = out_scaler_P
+        self.in_scaler_T  = in_scaler_T
+        self.in_scaler_P  = in_scaler_P
+
+        self.train_inputs  = scale_profile(train_inputs,  in_scaler_T, in_scaler_P)
+        self.train_outputs = scale_profile(train_outputs, out_scaler_T, out_scaler_P)
+        self.valid_inputs  = scale_profile(valid_inputs,  in_scaler_T, in_scaler_P)
+        self.valid_outputs = scale_profile(valid_outputs, out_scaler_T, out_scaler_P)
+        self.test_inputs   = scale_profile(test_inputs,   in_scaler_T, in_scaler_P)
+        self.test_outputs  = scale_profile(test_outputs,  out_scaler_T, out_scaler_P)
+        self.batch_size    = batch_size
+        self.rng           = rng
+
+    def train_dataloader(self):
+        return DataLoader(TensorDataset(self.train_inputs, self.train_outputs),
+                          batch_size=self.batch_size, shuffle=True, generator=self.rng)
+
+    def val_dataloader(self):
+        return DataLoader(TensorDataset(self.valid_inputs, self.valid_outputs),
+                          batch_size=self.batch_size, generator=self.rng)
+
+    def test_dataloader(self):
+        return DataLoader(TensorDataset(self.test_inputs, self.test_outputs),
+                          batch_size=self.batch_size, generator=self.rng)
+
+
+def evaluate_gpnna(cfg):
+    """
+    Load a GPNNA checkpoint and return signed residuals on the test set.
+    GPNNA: raw 4-D input → GP (k-NN) → NN → T-P profile
+
+    Returns
+    -------
+    res_T : ndarray (n_test, O)
+    res_P : ndarray (n_test, O)
+    """
+    width       = cfg.get('nn_width', nn_width_default)
+    depth       = cfg.get('nn_depth', nn_depth_default)
+    n_neighbors = cfg.get('n_neighbors', 10)
+    ckpt_path   = model_save_path + cfg['ckpt']
+    hparams     = _parse_hparams_from_ckpt_name(ckpt_path)
+
+    NN_rng = torch.Generator()
+    NN_rng.manual_seed(cfg['seed'])
+
+    # GPNNA model: input_dim = 2*O (T and P profiles), output_dim = 2*O
+    mdl = NeuralNetwork(2 * O, width, 2 * O, depth, generator=NN_rng)
+    lm  = RegressionModule.load_from_checkpoint(
+        ckpt_path, model=mdl, optimizer=Adam, **hparams, reg_coeff_l1=0.0,
+    )
+    mdl = lm.model.cpu().eval()
+
+    # Build dummy GPNNA scalers (we only need them for inverse_transform)
+    # Use the *training* GP outputs to fit the input scalers.
+    # For simplicity we'll recompute GP predictions on training set once.
+    print("    [GPNNA] Generating GP predictions on training set to fit scalers...")
+    gp_train_T = np.zeros((len(raw_train_inputs), O), dtype=float)
+    gp_train_P = np.zeros((len(raw_train_inputs), O), dtype=float)
+    for i, q_input in enumerate(raw_train_inputs):
+        distances = np.linalg.norm(raw_train_inputs - q_input, axis=1)
+        k_idx = np.argsort(distances)[:n_neighbors]
+        mean_labels, _ = Sai_CGP(
+            raw_train_inputs[k_idx].T,
+            np.concatenate([raw_train_outputs_T[k_idx], raw_train_outputs_P[k_idx]], axis=1).T,
+            q_input.reshape((D, 1))
+        )
+        gp_train_T[i] = np.mean(mean_labels[:O], axis=1)
+        gp_train_P[i] = np.mean(mean_labels[O:], axis=1)
+
+    in_scaler_T = StandardScaler()
+    in_scaler_P = StandardScaler()
+    in_scaler_T.fit(gp_train_T)
+    in_scaler_P.fit(gp_train_P)
+
+    out_scaler_T = StandardScaler()
+    out_scaler_P = StandardScaler()
+    out_scaler_T.fit(raw_train_outputs_T)
+    out_scaler_P.fit(raw_train_outputs_P)
+
+    # --- Run two-stage inference on test set ---
+    print("    [GPNNA] Running two-stage inference (GP → NN) on test set...")
+    res_T = np.zeros((len(raw_test_inputs), O), dtype=float)
+    res_P = np.zeros((len(raw_test_inputs), O), dtype=float)
+
+    for i, q_input in enumerate(raw_test_inputs):
+        # Stage 1: GP prediction from k-NN in training set
+        distances = np.linalg.norm(raw_train_inputs - q_input, axis=1)
+        k_idx = np.argsort(distances)[:n_neighbors]
+        mean_labels, _ = Sai_CGP(
+            raw_train_inputs[k_idx].T,
+            np.concatenate([raw_train_outputs_T[k_idx], raw_train_outputs_P[k_idx]], axis=1).T,
+            q_input.reshape((D, 1))
+        )
+        gp_T = np.mean(mean_labels[:O], axis=1)
+        gp_P = np.mean(mean_labels[O:], axis=1)
+
+        # Stage 2: NN refinement
+        gp_T_scaled = in_scaler_T.transform(gp_T.reshape(1, -1))
+        gp_P_scaled = in_scaler_P.transform(gp_P.reshape(1, -1))
+        nn_input    = torch.tensor(np.concatenate([gp_T_scaled, gp_P_scaled], axis=1), dtype=torch.float32)
+
+        with torch.no_grad():
+            nn_output = mdl(nn_input).numpy()
+
+        pred_T = out_scaler_T.inverse_transform(nn_output[:, :O]).flatten()
+        pred_P = out_scaler_P.inverse_transform(nn_output[:, O:]).flatten()
+
+        res_T[i] = pred_T - true_T[i]
+        res_P[i] = pred_P - true_P[i]
+
     return res_T, res_P
 
 
@@ -314,38 +510,46 @@ print("--- Evaluating models ---")
 
 #Loop over model configurations and retrieve the residuals on T and P
 for cfg in MODEL_CONFIGS:
-    
     print(f"  Loading: {cfg['label']}  ({cfg['ckpt']})")
-    res_T, res_P = evaluate_model(cfg, data_module)
 
-    # Compute RMSE from residuals for the printed summary
-    rmse_T = np.sqrt(np.mean(res_T ** 2, axis=1)) # (n_test,)
-    rmse_P = np.sqrt(np.mean(res_P ** 2, axis=1)) # (n_test,)
+    model_type = cfg.get('model_type', 'pnna')  # default to pnna if not specified
 
+    if model_type == 'pnna':
+        res_T, res_P = evaluate_pnna(cfg, data_module)
+    elif model_type == 'gpnna':
+        res_T, res_P = evaluate_gpnna(cfg)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+
+    # Compute per-sample RMSE
+    rmse_T = np.sqrt(np.mean(res_T ** 2, axis=1))  # (n_test,)
+    rmse_P = np.sqrt(np.mean(res_P ** 2, axis=1))
+
+    # --- Generate diagnostic plot: RMSE vs input dimensions ---
     fig, axes = plt.subplots(2, 4, figsize=(12, 10))
 
-    for i, test_input in enumerate(test_inputs.T):
-        for j, quantity in enumerate([rmse_T, rmse_P]):
-            
+    for i, test_input_dim in enumerate(raw_test_inputs.T):
+        for j, (quantity, label) in enumerate([(rmse_T, 'Temperature RMSE'),
+                                                 (rmse_P, 'Pressure RMSE')]):
             ax = axes[j, i]
 
-            pearson=pearsonr(test_input, quantity).statistic
-            spearman=spearmanr(test_input, quantity).statistic
+            pearson_r  = pearsonr(test_input_dim, quantity).statistic
+            spearman_r = spearmanr(test_input_dim, quantity).statistic
 
-            ax.plot(test_input, quantity, '.', label=f'Spearman:{spearman:.2f}, \n Pearson:{pearson:.2f}')
+            ax.plot(test_input_dim, quantity, '.',
+                    label=f'Spearman: {spearman_r:.2f}\nPearson: {pearson_r:.2f}')
 
-            if j==1:
+            if i == 0:
+                ax.set_ylabel(label)
+            if j == 1:
                 ax.set_xlabel(INPUT_LABELS[i])
+            if i != 0:
+                ax.sharey(axes[j, 0])
 
-            if i==0:
-                if j==0:ax.set_ylabel('Temperature RMSE')
-                else:ax.set_ylabel('Pressure RMSE')
+            ax.legend(fontsize=8)
+            ax.grid(alpha=0.3)
 
-            else:
-                ax.sharey(axes[j,0])
-
-            ax.legend()
     fig.tight_layout()
-    plt.savefig(plot_save_path + f'RMSE_correlation_model_{cfg['label']}.pdf')
+    safe_label = cfg['label'].replace(' ', '_').replace('-', '').replace('/', '')
+    plt.savefig(plot_save_path + f'RMSE_correlation_model_{safe_label}.pdf')
     plt.close()
-
