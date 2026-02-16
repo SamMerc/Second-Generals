@@ -4,7 +4,6 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.lines as mlines
 import torch
 from torch.optim import Adam
 import pytorch_lightning as pl
@@ -12,7 +11,6 @@ import os
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
-from itertools import combinations
 
 
 ##########################################################
@@ -46,16 +44,16 @@ INPUT_LABELS = [
 ]
 
 ## DATA / PARTITION HYPER-PARAMETERS (must match training run exactly) ##
-data_partitions = [0.7, 0.1, 0.2]
-partition_seed  = 4
-batch_seed      = 5
-nn_width_default = 102    # used when a MODEL_CONFIG entry omits 'nn_width'
-nn_depth_default = 5      # used when a MODEL_CONFIG entry omits 'nn_depth'
-batch_size = 200
+data_partitions  = [0.7, 0.1, 0.2]
+partition_seed   = 4
+batch_seed       = 5
+nn_width_default = 102
+nn_depth_default = 5
+batch_size       = 200
 
 # -----------------------------------------------------------------------
 # MULTI-MODEL COMPARISON CONFIG
-# Required keys : 'label', 'color', 'ckpt'
+# Required keys : 'label', 'color', 'ckpt', 'seed'
 # Optional keys : 'nn_width', 'nn_depth'  (fall back to defaults above)
 # -----------------------------------------------------------------------
 MODEL_CONFIGS = [
@@ -205,20 +203,18 @@ class RegressionModule(pl.LightningModule):
     def __init__(self, model, optimizer, learning_rate, weight_decay=0.0,
                  reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0):
         super().__init__()
-        self.model          = model
-        self.learning_rate  = learning_rate
-        self.reg_coeff_l1   = reg_coeff_l1
-        self.reg_coeff_l2   = reg_coeff_l2
+        self.model            = model
+        self.learning_rate    = learning_rate
+        self.reg_coeff_l1     = reg_coeff_l1
+        self.reg_coeff_l2     = reg_coeff_l2
         self.smoothness_coeff = smoothness_coeff
-        self.weight_decay   = weight_decay
-        self.loss_fn        = nn.MSELoss()
-        self.optimizer_class = optimizer
+        self.weight_decay     = weight_decay
+        self.loss_fn          = nn.MSELoss()
+        self.optimizer_class  = optimizer
 
     def forward(self, x):
         return self.model(x)
 
-    # training/validation/test steps kept minimal — only needed so
-    # load_from_checkpoint can reconstruct the module without errors
     def training_step(self, batch):
         X, y = batch
         return self.loss_fn(self(X), y)
@@ -244,15 +240,13 @@ class RegressionModule(pl.LightningModule):
 def _parse_hparams_from_ckpt_name(ckpt_path):
     """
     Extract learning_rate, reg_coeff_l2, weight_decay, smoothness_coeff
-    from the standardised checkpoint filename convention:
+    from the checkpoint filename convention:
       {epochs}epochs_{wd}WD_{rc}RC_{sc}SC_{lr}LR_{bs}BS.ckpt
-    The path may include subdirectory prefixes — we only parse the basename.
+    Operates on the basename only so subdirectory prefixes are ignored.
     """
-    stem = os.path.basename(ckpt_path).replace('.ckpt', '')
-    parts = stem.split('_')
-    # Build a lookup: suffix → value
+    stem   = os.path.basename(ckpt_path).replace('.ckpt', '')
     lookup = {}
-    for part in parts:
+    for part in stem.split('_'):
         for tag in ('epochs', 'WD', 'RC', 'SC', 'LR', 'BS'):
             if part.endswith(tag):
                 try:
@@ -260,16 +254,16 @@ def _parse_hparams_from_ckpt_name(ckpt_path):
                 except ValueError:
                     pass
     return {
-        'learning_rate'  : lookup.get('LR', 1e-3),
-        'reg_coeff_l2'   : lookup.get('RC', 0.0),
-        'weight_decay'   : lookup.get('WD', 0.0),
+        'learning_rate'   : lookup.get('LR', 1e-3),
+        'reg_coeff_l2'    : lookup.get('RC', 0.0),
+        'weight_decay'    : lookup.get('WD', 0.0),
         'smoothness_coeff': lookup.get('SC', 0.0),
     }
 
 
 def evaluate_model(cfg, data_module):
     """
-    Load a checkpoint and return per-sample RMSE for T and P on the test set.
+    Load a checkpoint and return full signed residual profiles on the test set.
 
     Parameters
     ----------
@@ -278,14 +272,13 @@ def evaluate_model(cfg, data_module):
 
     Returns
     -------
-    rmse_T : ndarray (n_test,)  — per-profile temperature RMSE in K
-    rmse_P : ndarray (n_test,)  — per-profile pressure RMSE in log10 bar
+    res_T : ndarray (n_test, O)  — residuals pred - true, temperature in K
+    res_P : ndarray (n_test, O)  — residuals pred - true, pressure in log10 bar
     """
-    width = cfg.get('nn_width', nn_width_default)
-    depth = cfg.get('nn_depth', nn_depth_default)
+    width     = cfg.get('nn_width', nn_width_default)
+    depth     = cfg.get('nn_depth', nn_depth_default)
     ckpt_path = model_save_path + cfg['ckpt']
-
-    hparams = _parse_hparams_from_ckpt_name(ckpt_path)
+    hparams   = _parse_hparams_from_ckpt_name(ckpt_path)
 
     NN_rng = torch.Generator()
     NN_rng.manual_seed(cfg['seed'])
@@ -296,262 +289,59 @@ def evaluate_model(cfg, data_module):
         model=mdl,
         optimizer=Adam,
         **hparams,
-        reg_coeff_l1=0.0,   # l1 was never used; RC in filename = l2
+        reg_coeff_l1=0.0,
     )
     mdl = lm.model.cpu().eval()
 
     scaled_inputs = torch.tensor(
         data_module.in_scaler.transform(raw_test_inputs), dtype=torch.float32
     )
-
     with torch.no_grad():
         preds = mdl(scaled_inputs).numpy()   # (n_test, 2*O)
 
     pred_T = data_module.out_scaler_T.inverse_transform(preds[:, :O])
     pred_P = data_module.out_scaler_P.inverse_transform(preds[:, O:])
 
-    rmse_T = np.sqrt(np.mean((pred_T - true_T) ** 2, axis=1))
-    rmse_P = np.sqrt(np.mean((pred_P - true_P) ** 2, axis=1))
-    return rmse_T, rmse_P
-
-
-#######################################################
-#### Corner plot: performance across 4-D input space ##
-#######################################################
-
-def make_corner_plot(results, input_data, input_labels, metric='T',
-                     title='Corner Plot', save_path=None):
-    """
-    Corner plot comparing multiple models.
-
-    Diagonal  : overlaid histograms of per-sample RMSE (density), dashed
-                median lines
-    Lower tri : scatter of test points in each (input_i, input_j) plane,
-                coloured by RMSE; models distinguished by marker shape + jitter
-    Upper tri : hidden
-
-    Parameters
-    ----------
-    results      : list of dicts with keys 'label', 'color', 'rmse_T', 'rmse_P'
-    input_data   : ndarray (n_test, 4) — raw (unscaled) test inputs
-    input_labels : list of 4 axis-label strings
-    metric       : 'T' or 'P'
-    title        : figure suptitle
-    save_path    : if given, figure is saved here (no overwrite risk — plots only)
-    """
-    n_dims   = input_data.shape[1]
-    n_models = len(results)
-    markers  = ['o', 's', '^', 'D', 'v', 'P']
-
-    fig, axes = plt.subplots(n_dims, n_dims,
-                             figsize=(3.5 * n_dims, 3.5 * n_dims))
-
-    for row in range(n_dims):
-        for col in range(n_dims):
-            ax = axes[row, col]
-
-            # ── upper-triangle: hide ──────────────────────────────────────
-            if col > row:
-                ax.set_visible(False)
-                continue
-
-            # ── diagonal: RMSE histograms ─────────────────────────────────
-            if col == row:
-                for res in results:
-                    vals = res[f'rmse_{metric}']
-                    ax.hist(vals, bins=30, color=res['color'], alpha=0.5,
-                            label=res['label'], density=True,
-                            histtype='stepfilled', edgecolor='none')
-                    ax.axvline(np.median(vals), color=res['color'],
-                               linestyle='--', linewidth=1.2)
-                ax.set_xlabel(f'RMSE {metric}', fontsize=8)
-                ax.set_ylabel('Density', fontsize=8)
-                if row == 0:
-                    ax.legend(fontsize=6, loc='upper right')
-
-            # ── lower-triangle: scatter coloured by RMSE ──────────────────
-            else:
-                x_data = input_data[:, col]
-                y_data = input_data[:, row]
-                x_range = x_data.max() - x_data.min()
-
-                # Shared colour scale across all models for this panel
-                all_vals = np.concatenate([res[f'rmse_{metric}'] for res in results])
-                vmin, vmax = np.percentile(all_vals, [5, 95])
-
-                sc_handle = None
-                for k, res in enumerate(results):
-                    vals   = res[f'rmse_{metric}']
-                    jitter = 0.01 * (k - (n_models - 1) / 2) * x_range
-                    sc_handle = ax.scatter(
-                        x_data + jitter, y_data,
-                        c=vals, cmap='viridis', vmin=vmin, vmax=vmax,
-                        marker=markers[k % len(markers)],
-                        s=8, alpha=0.6, linewidths=0,
-                    )
-
-                cbar = fig.colorbar(sc_handle, ax=ax, pad=0.02, fraction=0.046)
-                cbar.set_label(f'RMSE {metric}', fontsize=7)
-                cbar.ax.tick_params(labelsize=6)
-
-            # ── axis labels on outer edges only ───────────────────────────
-            if row == n_dims - 1:
-                ax.set_xlabel(input_labels[col], fontsize=9)
-            else:
-                ax.set_xticklabels([])
-
-            if col == 0 and row != col:
-                ax.set_ylabel(input_labels[row], fontsize=9)
-            elif row != col:
-                ax.set_yticklabels([])
-
-            ax.tick_params(labelsize=7)
-            ax.grid(True, linewidth=0.4, alpha=0.4)
-
-    fig.suptitle(title, fontsize=13, y=1.01)
-
-    # ── Legend: marker shape → model identity ─────────────────────────────
-    handles = [
-        mlines.Line2D([], [], marker=markers[k % len(markers)],
-                      color='w', markerfacecolor=res['color'],
-                      markersize=8, label=res['label'])
-        for k, res in enumerate(results)
-    ]
-    fig.legend(handles=handles, loc='upper right', fontsize=9,
-               bbox_to_anchor=(1.0, 1.0), title='Models')
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, bbox_inches='tight')
-        print(f"  Saved: {save_path}")
-    return fig
-
-
-########################################################
-#### Heatmap: binned mean RMSE across all 2-D slices ##
-########################################################
-
-def make_performance_heatmap(results, input_data, input_labels, metric='T',
-                              n_bins=6, save_path=None):
-    """
-    For each pair of input dimensions, show a 2-D heatmap of mean RMSE
-    (test points binned into an n_bins x n_bins grid), one column per model.
-    Colour scale is shared across models for each pair so comparisons are fair.
-
-    Parameters
-    ----------
-    results      : list of dicts with keys 'label', 'color', 'rmse_T', 'rmse_P'
-    input_data   : ndarray (n_test, 4)
-    input_labels : list of 4 strings
-    metric       : 'T' or 'P'
-    n_bins       : grid resolution per axis
-    save_path    : optional save path
-    """
-    pairs    = list(combinations(range(input_data.shape[1]), 2))
-    n_pairs  = len(pairs)
-    n_models = len(results)
-
-    fig, axes = plt.subplots(n_pairs, n_models,
-                             figsize=(4.5 * n_models, 4.0 * n_pairs),
-                             squeeze=False)
-
-    for p_idx, (xi, xj) in enumerate(pairs):
-        x = input_data[:, xi]
-        y = input_data[:, xj]
-        x_edges = np.linspace(x.min(), x.max(), n_bins + 1)
-        y_edges = np.linspace(y.min(), y.max(), n_bins + 1)
-
-        # Build all heatmaps first so colour scale can be shared
-        all_hmaps = []
-        for res in results:
-            vals = res[f'rmse_{metric}']
-            hmap = np.full((n_bins, n_bins), np.nan)
-            for ix in range(n_bins):
-                for iy in range(n_bins):
-                    mask = (
-                        (x >= x_edges[ix]) & (x < x_edges[ix + 1]) &
-                        (y >= y_edges[iy]) & (y < y_edges[iy + 1])
-                    )
-                    if mask.sum() > 0:
-                        hmap[iy, ix] = np.mean(vals[mask])
-            all_hmaps.append(hmap)
-
-        for m_idx, (res, hmap) in enumerate(zip(results, all_hmaps)):
-            ax = axes[p_idx, m_idx]
-            im = ax.imshow(
-                hmap, origin='lower', aspect='auto',
-                extent=[x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]],
-                cmap='viridis')
-            
-            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label(f'Mean RMSE {metric}', fontsize=8)
-            ax.set_xlabel(input_labels[xi], fontsize=9)
-            ax.set_ylabel(input_labels[xj], fontsize=9)
-            ax.set_title(res['label'], fontsize=10)
-            ax.tick_params(labelsize=7)
-
-    fig.suptitle(f'Mean RMSE {metric} across 4-D input space (binned)',
-                 fontsize=13, y=1.01)
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, bbox_inches='tight')
-        print(f"  Saved: {save_path}")
-    return fig
+    res_T = pred_T - true_T   # (n_test, O) signed residuals
+    res_P = pred_P - true_P
+    return res_T, res_P
 
 
 ##########################
 #### Main comparison  ####
 ##########################
 
-# --- 1. Evaluate every model ---
+# # --- 1. Evaluate every model ---
 print("--- Evaluating models ---")
 results = []
 
+#Loop over model configurations and retrieve the residuals on T and P
 for cfg in MODEL_CONFIGS:
     print(f"  Loading: {cfg['label']}  ({cfg['ckpt']})")
-    rmse_T, rmse_P = evaluate_model(cfg, data_module)
-    results.append({
-        'label'  : cfg['label'],
-        'color'  : cfg['color'],
-        'rmse_T' : rmse_T,
-        'rmse_P' : rmse_P,
-    })
-    print(f"    T  →  median = {np.median(rmse_T):.3f} K,           std = {np.std(rmse_T):.3f} K")
-    print(f"    P  →  median = {np.median(rmse_P):.4f} log10 bar,   std = {np.std(rmse_P):.4f}")
+    res_T, res_P = evaluate_model(cfg, data_module)
+    # results.append({
+    #     'label' : cfg['label'],
+    #     'color' : cfg['color'],
+    #     'res_T' : res_T,
+    #     'res_P' : res_P,
+    # })
 
+    # Compute RMSE from residuals for the printed summary
+    rmse_T = np.sqrt(np.mean(res_T ** 2, axis=1)) # (n_test,)
 
-# --- 2. Corner plots ---
-print("\n--- Generating corner plots ---")
+    # Place these values on a 4D grid 
+    mapped_rmse_T = np.repeat(rmse_T, 4).reshape(len(rmse_T), 4) # (n_test, 4)
 
-make_corner_plot(
-    results, raw_test_inputs, INPUT_LABELS,
-    metric='T',
-    title='Corner Plot: Temperature RMSE across Input Space',
-    save_path=plot_save_path + 'corner_T.pdf',
-)
+    # rmse_P = np.sqrt(np.mean(res_P ** 2, axis=1))
+    # print(f"    T  →  median RMSE = {np.median(rmse_T):.3f} K,           std = {np.std(rmse_T):.3f} K")
+    # print(f"    P  →  median RMSE = {np.median(rmse_P):.4f} log10 bar,   std = {np.std(rmse_P):.4f}")
 
-make_corner_plot(
-    results, raw_test_inputs, INPUT_LABELS,
-    metric='P',
-    title=r'Corner Plot: Pressure RMSE (log$_{10}$ bar) across Input Space',
-    save_path=plot_save_path + 'corner_P.pdf',
-)
+    import corner
 
+    fig = corner.corner(mapped_rmse_T,
+                labels = INPUT_LABELS,
+                )
+    plt.show()
 
-# --- 3. Heatmap comparison ---
-print("\n--- Generating heatmap comparison plots ---")
-
-make_performance_heatmap(
-    results, raw_test_inputs, INPUT_LABELS,
-    metric='T', n_bins=6,
-    save_path=plot_save_path + 'heatmap_T.pdf',
-)
-
-make_performance_heatmap(
-    results, raw_test_inputs, INPUT_LABELS,
-    metric='P', n_bins=6,
-    save_path=plot_save_path + 'heatmap_P.pdf',
-)
-
-plt.show()
-print("\nDone.")
+    print('1:', res_T.shape, mapped_rmse_T.shape)
+    raise KeyboardInterrupt('STOP')
