@@ -8,18 +8,17 @@ import torch
 import h5py
 from pathlib import Path
 from torch.optim import AdamW
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning import Trainer
 import pytorch_lightning as pl
 import os
-import wandb
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import pandas as pd
 import seaborn as sns
 from diffusers import UNet2DModel
-
+import torch.nn.functional as F
 
 #########################################################
 #### Part 1: Create HDF5 File from CSV (Run Once)    ####
@@ -148,9 +147,12 @@ class TemperatureMapDataModule(Dataset):
 
         # 3. Normalize Scalars
         if 'scalars' in self.norm_dict and self.norm_dict['scalars'] is not None:
-            s_mean = torch.tensor(self.norm_dict['scalars'][0])
-            s_std = torch.tensor(self.norm_dict['scalars'][1])
+            s_mean = torch.tensor(self.norm_dict['scalars'][0], dtype=torch.float32)
+            s_std = torch.tensor(self.norm_dict['scalars'][1], dtype=torch.float32)
             scalar_cond = (scalar_cond - s_mean) / s_std
+
+        # 4. Pad the images to a 48x72 size
+        target_image = F.pad(target_image, (0, 0, 1, 1))
 
         return target_image, scalar_cond
 
@@ -167,7 +169,7 @@ class ConditionalFlowMatchingModule(pl.LightningModule):
         # DATA PARAMS
         in_channels: int = 1,
         cond_channels: int = 4,
-        image_height: int = 46,
+        image_height: int = 48,
         image_width: int = 72,
         # UNET PARAMS
         model_channels: int = 64,
@@ -193,7 +195,7 @@ class ConditionalFlowMatchingModule(pl.LightningModule):
         
         self.velocity_model = UNet2DModel(
             sample_size=(image_height, image_width),
-            in_channels=in_channels,
+            in_channels=in_channels + cond_channels,
             out_channels=in_channels,
             layers_per_block=layers_per_block,
             block_out_channels=block_out_channels,
@@ -211,10 +213,6 @@ class ConditionalFlowMatchingModule(pl.LightningModule):
             ),
             attention_head_dim=attention_head_dim,
 
-            # CONDITIONING HAPPENS HERE
-            # "projection": Projects scalars via an MLP and adds to time embedding
-            class_embed_type="projection",
-            projection_class_embeddings_input_dim=cond_channels, #4
         )
 
         #You might need to change it for:
@@ -234,13 +232,18 @@ class ConditionalFlowMatchingModule(pl.LightningModule):
         # but im not sure
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond_scalars: torch.Tensor):
+
+        cond_spatial = cond_scalars[:, :, None, None].expand(
+        -1, -1, x_t.shape[2], x_t.shape[3]
+        )
+        x_input = torch.cat([x_t, cond_spatial], dim=1)  # (B, 5, H, W)
+
         # UNet2DModel expects timesteps to be scaled roughly to 0-1000 range usually
         # but pure Flow Matching often works with [0,1]. Diffusers defaults usually prefer larger ints.
         timesteps = t * 1000
         return self.velocity_model(
-            x_t,
+            x_input,
             timesteps, 
-            class_labels=cond_scalars # Pass scalars here directly
             ).sample
     
     def compute_loss(self, batch: tuple) -> torch.Tensor:
@@ -313,7 +316,7 @@ if __name__ == "__main__":
     # ============================================
     
     # Hyperparameters
-    IMG_H, IMG_W = 46, 72
+    IMG_H, IMG_W = 48, 72
     partition_seed = 4
     batch_seed = 5
     NN_seed = 6
@@ -336,11 +339,11 @@ if __name__ == "__main__":
     batch_size = 64
     n_epochs = 200
     NUM_INFERENCE_STEPS = 100
-    num_workers = 4  # Adjust based on your CPU
+    num_workers = 1  # Adjust based on your CPU
     
     run_mode = 'use'  # 'use' to train from scratch, 'load' to load checkpoint
     
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = 'cpu'
     print(f"\nUsing device: {device}")
     
     # =================================== #
@@ -399,7 +402,7 @@ if __name__ == "__main__":
     test_dataset = TemperatureMapDataModule(
         hdf5_path=hdf5_path,
         norm_dict=norm_dict,
-        idx_list=range(partition[1], partition[2]),
+        idx_list=range(partition[1], num_data),
     )
 
     rng = torch.Generator()
@@ -435,19 +438,14 @@ if __name__ == "__main__":
     # ============================================
     # Step 4: Setup Training
     # ============================================
-        
-    wandb_logger = WandbLogger(
-        project="FlowMatching",
-        save_dir = model_save_path + 'logs',
-        name="conditional-unet2d-scalars",
-        log_model='all',
-    )
+
+    csv_logger = CSVLogger(save_dir=model_save_path + 'logs', name="FlowMatching")
 
     pl.seed_everything(NN_seed, workers=True)
     
     trainer = Trainer(
         max_epochs=n_epochs,
-        logger=wandb_logger,
+        logger=csv_logger,
         deterministic=True,
         accelerator="auto",
         devices=1,
@@ -571,8 +569,8 @@ if __name__ == "__main__":
         return img_norm * img_std + img_mean
     
     def denorm_scalars(scalars_norm):
-        s_mean = torch.tensor(scalar_means)
-        s_std = torch.tensor(scalar_stds)
+        s_mean = torch.tensor(scalar_means, dtype=torch.float32)
+        s_std = torch.tensor(scalar_stds, dtype=torch.float32)
         return scalars_norm * s_std + s_mean
     
     # Generate predictions for a few test samples
@@ -584,13 +582,15 @@ if __name__ == "__main__":
         
         # Denormalize
         img_true = denorm_image(img_norm).cpu().numpy()[0]  # (H, W)
+        img_true = img_true[1:-1, :]
         scalars_true = denorm_scalars(scalars_norm).cpu().numpy()
         
         # Generate prediction
         scalars_norm_batch = scalars_norm.unsqueeze(0).to(device)
         img_pred_norm = model.sample(scalars_norm_batch, num_steps=NUM_INFERENCE_STEPS)
         img_pred = denorm_image(img_pred_norm[0]).cpu().numpy()[0]  # (H, W)
-        
+        img_pred = img_pred[1:-1, :]
+
         # Calculate residual
         residual = img_pred - img_true
         
