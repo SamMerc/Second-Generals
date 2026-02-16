@@ -11,6 +11,7 @@ import os
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
+from scipy.stats import pearsonr, spearmanr
 
 
 ##########################################################
@@ -25,7 +26,7 @@ base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 raw_T_data = np.loadtxt(base_dir + 'Data/bt-4500k/training_data_T.csv', delimiter=',')
 raw_P_data = np.loadtxt(base_dir + 'Data/bt-4500k/training_data_P.csv', delimiter=',')
 model_save_path = base_dir + 'Model_Storage/Server/Model_Storage/'
-plot_save_path  = base_dir + 'Plots/Model_Compare_Plots/'
+plot_save_path  = base_dir + 'Plots/Model_Compare_Plots/TP/'
 check_and_make_dir(plot_save_path)   # only the plot dir is ever written to
 
 raw_inputs    = raw_T_data[:, :4]
@@ -53,25 +54,22 @@ batch_size       = 200
 
 # -----------------------------------------------------------------------
 # MULTI-MODEL COMPARISON CONFIG
-# Required keys : 'label', 'color', 'ckpt', 'seed'
+# Required keys : 'label', 'ckpt', 'seed'
 # Optional keys : 'nn_width', 'nn_depth'  (fall back to defaults above)
 # -----------------------------------------------------------------------
 MODEL_CONFIGS = [
     {
         'label' : 'PNNA - Baseline',
-        'color' : 'C0',
         'ckpt'  : 'NN_fixedstand_nosmooth_noreg/100000epochs_0.0WD_0.0RC_0.0SC_0.001LR_200BS.ckpt',
         'seed'  : 6,
     },
     {
         'label' : 'PNNA - L2 Reg',
-        'color' : 'C1',
         'ckpt'  : 'NN_fixedstand_nosmooth_reg/100000epochs_0.0WD_0.01RC_0.0SC_0.001LR_200BS.ckpt',
         'seed'  : 6,
     },
     {
         'label' : 'PNNA - Smooth',
-        'color' : 'C2',
         'ckpt'  : 'NN_smooth/100000epochs_0.0WD_0.0RC_0.001SC_0.005LR_200BS.ckpt',
         'seed'  : 6,
     },
@@ -313,35 +311,41 @@ def evaluate_model(cfg, data_module):
 
 # # --- 1. Evaluate every model ---
 print("--- Evaluating models ---")
-results = []
 
 #Loop over model configurations and retrieve the residuals on T and P
 for cfg in MODEL_CONFIGS:
+    
     print(f"  Loading: {cfg['label']}  ({cfg['ckpt']})")
     res_T, res_P = evaluate_model(cfg, data_module)
-    # results.append({
-    #     'label' : cfg['label'],
-    #     'color' : cfg['color'],
-    #     'res_T' : res_T,
-    #     'res_P' : res_P,
-    # })
 
     # Compute RMSE from residuals for the printed summary
     rmse_T = np.sqrt(np.mean(res_T ** 2, axis=1)) # (n_test,)
+    rmse_P = np.sqrt(np.mean(res_P ** 2, axis=1)) # (n_test,)
 
-    # Place these values on a 4D grid 
-    mapped_rmse_T = np.repeat(rmse_T, 4).reshape(len(rmse_T), 4) # (n_test, 4)
+    fig, axes = plt.subplots(2, 4, figsize=(12, 10))
 
-    # rmse_P = np.sqrt(np.mean(res_P ** 2, axis=1))
-    # print(f"    T  →  median RMSE = {np.median(rmse_T):.3f} K,           std = {np.std(rmse_T):.3f} K")
-    # print(f"    P  →  median RMSE = {np.median(rmse_P):.4f} log10 bar,   std = {np.std(rmse_P):.4f}")
+    for i, test_input in enumerate(test_inputs.T):
+        for j, quantity in enumerate([rmse_T, rmse_P]):
+            
+            ax = axes[j, i]
 
-    import corner
+            pearson=pearsonr(test_input, quantity).statistic
+            spearman=spearmanr(test_input, quantity).statistic
 
-    fig = corner.corner(mapped_rmse_T,
-                labels = INPUT_LABELS,
-                )
-    plt.show()
+            ax.plot(test_input, quantity, '.', label=f'Spearman:{spearman:.2f}, \n Pearson:{pearson:.2f}')
 
-    print('1:', res_T.shape, mapped_rmse_T.shape)
-    raise KeyboardInterrupt('STOP')
+            if j==1:
+                ax.set_xlabel(INPUT_LABELS[i])
+
+            if i==0:
+                if j==0:ax.set_ylabel('Temperature RMSE')
+                else:ax.set_ylabel('Pressure RMSE')
+
+            else:
+                ax.sharey(axes[j,0])
+
+            ax.legend()
+    fig.tight_layout()
+    plt.savefig(plot_save_path + f'RMSE_correlation_model_{cfg['label']}.pdf')
+    plt.close()
+
