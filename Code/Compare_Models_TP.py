@@ -107,33 +107,193 @@ for cfg in MODEL_CONFIGS:
 print("All checkpoints found.\n")
 
 
+#------------#
+#--- PNNA ---#
+#------------#
+
+###########################################
+#### Partition data and build datasets ####
+###########################################
+class PNNA_CustomDataModule(pl.LightningDataModule):
+    def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs, test_inputs, test_outputs, batch_size, rng):
+        super().__init__()
+
+        # Standardizing the output
+        ## Create scaler
+        out_scaler_T = StandardScaler()
+        out_scaler_P = StandardScaler()
+        
+        ## Fit scaler on training dataset (convert to numpy)
+        out_scaler_T.fit(train_outputs[:, :O].cpu().numpy())
+        out_scaler_P.fit(train_outputs[:, O:].cpu().numpy())
+
+        ## Transform all datasets and convert back to tensors
+        train_T_scaled = torch.tensor(out_scaler_T.transform(train_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        train_P_scaled = torch.tensor(out_scaler_P.transform(train_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        valid_T_scaled = torch.tensor(out_scaler_T.transform(valid_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        valid_P_scaled = torch.tensor(out_scaler_P.transform(valid_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        test_T_scaled = torch.tensor(out_scaler_T.transform(test_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        test_P_scaled = torch.tensor(out_scaler_P.transform(test_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+        
+        # Concatenate
+        train_outputs = torch.cat([train_T_scaled, train_P_scaled], dim=1)
+        valid_outputs = torch.cat([valid_T_scaled, valid_P_scaled], dim=1)
+        test_outputs = torch.cat([test_T_scaled, test_P_scaled], dim=1)
+
+        # Store the scaler if you need to inverse transform later
+        self.out_scaler_T = out_scaler_T
+        self.out_scaler_P = out_scaler_P
+        
+        # Normalizing the input
+        ## Create scaler
+        in_scaler = StandardScaler()
+        
+        ## Fit scaler on training dataset (convert to numpy)
+        in_scaler.fit(train_inputs.cpu().numpy())
+        
+        ## Transform all datasets and convert back to tensors
+        train_inputs = torch.tensor(in_scaler.transform(train_inputs.cpu().numpy()), dtype=torch.float32)
+        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.cpu().numpy()), dtype=torch.float32)
+        test_inputs = torch.tensor(in_scaler.transform(test_inputs.cpu().numpy()), dtype=torch.float32)
+        
+        # Store the scaler if you need to inverse transform later
+        self.in_scaler = in_scaler
+
+        # Storing it and passing it to loaders
+        self.train_inputs = train_inputs
+        self.train_outputs = train_outputs
+        self.valid_inputs = valid_inputs
+        self.valid_outputs = valid_outputs
+        self.test_inputs = test_inputs
+        self.test_outputs = test_outputs
+        self.batch_size = batch_size
+        self.rng = rng
+    
+    def train_dataloader(self):
+        dataset = TensorDataset(self.train_inputs, self.train_outputs)
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, generator=self.rng)
+    
+    def val_dataloader(self):
+        dataset = TensorDataset(self.valid_inputs, self.valid_outputs)
+        return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
+
+    def test_dataloader(self):
+        dataset = TensorDataset(self.test_inputs, self.test_outputs)
+        return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
+
+
+
+
+##################
+#### Build NN ####
+##################
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, depth, generator=None):
+        super().__init__()
+        layers = []
+        # Set seed if generator provided
+        if generator is not None:
+            torch.manual_seed(generator.initial_seed())
+        # Input layer
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        # Hidden layers
+        for _ in range(depth):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+        # Output layer
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        # Pack all layers into a Sequential container
+        self.linear_relu_stack = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        logits = self.linear_relu_stack(x)
+        return logits
+
+
 ##############################################
-#### Conditional Gaussian Process (for GPNNA)
+#### Evaluate PNNA model (standard NN)    ##
 ##############################################
+
+def evaluate_pnna(cfg, data_module, raw_test_inputs, true_T, true_P):
+    """
+    Load a PNNA checkpoint and return signed residuals on the test set.
+    PNNA: raw 4-D input → NN → T-P profile
+
+    Returns
+    -------
+    res_T : ndarray (n_test, O)
+    res_P : ndarray (n_test, O)
+    """
+    width     = cfg.get('nn_width', nn_width_default)
+    depth     = cfg.get('nn_depth', nn_depth_default)
+    ckpt_path = model_save_path + cfg['ckpt']
+    hparams   = _parse_hparams_from_ckpt_name(ckpt_path)
+
+    NN_rng = torch.Generator()
+    NN_rng.manual_seed(cfg['seed'])
+
+    mdl = NeuralNetwork(D, width, 2 * O, depth, generator=NN_rng)
+    lm  = RegressionModule.load_from_checkpoint(
+        ckpt_path, model=mdl, optimizer=Adam, **hparams, reg_coeff_l1=0.0,
+    )
+    mdl = lm.model.cpu().eval()
+
+    scaled_inputs = torch.tensor(
+        data_module.in_scaler.transform(raw_test_inputs), dtype=torch.float32
+    )
+    with torch.no_grad():
+        preds = mdl(scaled_inputs).detach().numpy()
+
+    pred_T = data_module.out_scaler_T.inverse_transform(preds[:, :O])
+    pred_P = data_module.out_scaler_P.inverse_transform(preds[:, O:])
+
+    res_T = pred_T - true_T
+    res_P = pred_P - true_P
+    return res_T, res_P
+
+
+#-------------#
+#--- GPNNA ---#
+#-------------#
+
+######################################
+#### Conditional Gaussian Process ####
+######################################
 
 def Sai_CGP(obs_features, obs_labels, query_features):
     """
     Conditional Gaussian Process
-
-    Inputs
-    ------
-    obs_features   : ndarray (D, N) — D-dim features of N ensemble points
-    obs_labels     : ndarray (K, N) — K-dim labels of N ensemble points
-    query_features : ndarray (D, 1) — D-dim features of query point
-
-    Outputs
-    -------
-    query_labels     : ndarray (K, N) — updated K-dim labels
-    query_cov_labels : ndarray (K, K) — covariance of ensemble labels
+    Inputs: 
+        obs_features : ndarray (D, N)
+            D-dimensional features of the N ensemble data points.
+        obs_labels : ndarray (K, N)
+            K-dimensional labels of the N ensemble data points.
+        query_features : ndarray (D, 1)
+            D-dimensional features of the query data point.
+    Outputs:
+        query_labels : ndarray (K, N)
+            K-dimensional labels of the ensemble updated from the query point.
+        query_cov_labels : ndarray (K, K)
+            K-by-K covariance of the ensemble labels.
     """
-    n = obs_features.shape[1]
-    Cyx = (obs_labels @ obs_features.T) / (n - 1)
-    Cxy = (obs_features @ obs_labels.T) / (n - 1)
-    Cxx = (obs_features @ obs_features.T) / (n - 1)
-    Cyy = (obs_labels @ obs_labels.T) / (n - 1)
-    Cxx += 1e-8 * np.eye(Cxx.shape[0])
+    
+    # Defining relevant covariance matrices
+    ## Between feature and label of observation data
+    Cyx = (obs_labels @ obs_features.T) / (obs_features.shape[0] - 1)
+    ## Between label and feature of observation data
+    Cxy = (obs_features @ obs_labels.T) / (obs_features.shape[0] - 1)
+    ## Between feature and feature of observation data
+    Cxx = (obs_features @ obs_features.T) / (obs_features.shape[0] - 1)
+    ## Between label and label of observation data
+    Cyy = (obs_labels @ obs_labels.T) / (obs_features.shape[0] - 1)
+    ## Adding regularizer to avoid singularities
+    Cxx += 1e-8 * np.eye(Cxx.shape[0]) 
 
-    query_labels     = obs_labels + (Cyx @ scipy.linalg.pinv(Cxx) @ (query_features - obs_features))
+    query_labels = obs_labels + (Cyx @ scipy.linalg.pinv(Cxx) @ (query_features - obs_features))
+
     query_cov_labels = Cyy - Cyx @ scipy.linalg.pinv(Cxx) @ Cxy
 
     return query_labels, query_cov_labels
@@ -142,112 +302,142 @@ def Sai_CGP(obs_features, obs_labels, query_features):
 ###########################################
 #### Partition data and build datasets ####
 ###########################################
-class CustomDataModule(pl.LightningDataModule):
-    def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs,
-                 test_inputs, test_outputs, batch_size, rng):
+
+class GPNNADataModule(pl.LightningDataModule):
+    """
+    Like CustomDataModule but uses separate T and P scalers for *both*
+    inputs and outputs (GPNNA needs this because inputs are TP profiles).
+    """
+    def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs, test_inputs, test_outputs, batch_size, rng):
         super().__init__()
 
+        # Standardizing the output
+        ## Create scaler
         out_scaler_T = StandardScaler()
         out_scaler_P = StandardScaler()
+        
+        ## Fit scaler on training dataset (convert to numpy)
         out_scaler_T.fit(train_outputs[:, :O].cpu().numpy())
         out_scaler_P.fit(train_outputs[:, O:].cpu().numpy())
 
-        def scale_outputs(outputs):
-            T_s = torch.tensor(out_scaler_T.transform(outputs[:, :O].cpu().numpy()), dtype=torch.float32)
-            P_s = torch.tensor(out_scaler_P.transform(outputs[:, O:].cpu().numpy()), dtype=torch.float32)
-            return torch.cat([T_s, P_s], dim=1)
+        ## Transform all datasets and convert back to tensors
+        train_T_scaled = torch.tensor(out_scaler_T.transform(train_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        train_P_scaled = torch.tensor(out_scaler_P.transform(train_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
 
-        in_scaler = StandardScaler()
-        in_scaler.fit(train_inputs.cpu().numpy())
+        valid_T_scaled = torch.tensor(out_scaler_T.transform(valid_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        valid_P_scaled = torch.tensor(out_scaler_P.transform(valid_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
 
-        def scale_inputs(inputs):
-            return torch.tensor(in_scaler.transform(inputs.cpu().numpy()), dtype=torch.float32)
+        test_T_scaled = torch.tensor(out_scaler_T.transform(test_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        test_P_scaled = torch.tensor(out_scaler_P.transform(test_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+        
+        # Concatenate
+        train_outputs = torch.cat([train_T_scaled, train_P_scaled], dim=1)
+        valid_outputs = torch.cat([valid_T_scaled, valid_P_scaled], dim=1)
+        test_outputs = torch.cat([test_T_scaled, test_P_scaled], dim=1)
 
+        # Store the scaler if you need to inverse transform later
         self.out_scaler_T = out_scaler_T
         self.out_scaler_P = out_scaler_P
-        self.in_scaler    = in_scaler
+        
+        # Standardize the input
+        ## Create scaler
+        in_scaler_T = StandardScaler()
+        in_scaler_P = StandardScaler()
+        
+        ## Fit scaler on training dataset (convert to numpy)
+        in_scaler_T.fit(train_inputs[:, :O].cpu().numpy())
+        in_scaler_P.fit(train_inputs[:, O:].cpu().numpy())
 
-        self.train_inputs  = scale_inputs(train_inputs)
-        self.train_outputs = scale_outputs(train_outputs)
-        self.valid_inputs  = scale_inputs(valid_inputs)
-        self.valid_outputs = scale_outputs(valid_outputs)
-        self.test_inputs   = scale_inputs(test_inputs)
-        self.test_outputs  = scale_outputs(test_outputs)
-        self.batch_size    = batch_size
-        self.rng           = rng
+        ## Transform all datasets and convert back to tensors
+        train_T_scaled = torch.tensor(in_scaler_T.transform(train_inputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        train_P_scaled = torch.tensor(in_scaler_P.transform(train_inputs[:, O:].cpu().numpy()), dtype=torch.float32)
 
+        valid_T_scaled = torch.tensor(in_scaler_T.transform(valid_inputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        valid_P_scaled = torch.tensor(in_scaler_P.transform(valid_inputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        test_T_scaled = torch.tensor(in_scaler_T.transform(test_inputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        test_P_scaled = torch.tensor(in_scaler_P.transform(test_inputs[:, O:].cpu().numpy()), dtype=torch.float32)
+        
+        # Concatenate
+        train_inputs = torch.cat([train_T_scaled, train_P_scaled], dim=1)
+        valid_inputs = torch.cat([valid_T_scaled, valid_P_scaled], dim=1)
+        test_inputs = torch.cat([test_T_scaled, test_P_scaled], dim=1)
+
+        # Store the scaler if you need to inverse transform later
+        self.in_scaler_T = in_scaler_T
+        self.in_scaler_P = in_scaler_P
+
+        # Storing it and passing it to loaders
+        self.train_inputs = train_inputs
+        self.train_outputs = train_outputs
+        self.valid_inputs = valid_inputs
+        self.valid_outputs = valid_outputs
+        self.test_inputs = test_inputs
+        self.test_outputs = test_outputs
+        self.batch_size = batch_size
+        self.rng = rng
+    
     def train_dataloader(self):
-        return DataLoader(TensorDataset(self.train_inputs, self.train_outputs),
-                          batch_size=self.batch_size, shuffle=True, generator=self.rng)
-
+        dataset = TensorDataset(self.train_inputs, self.train_outputs)
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, generator=self.rng)
+    
     def val_dataloader(self):
-        return DataLoader(TensorDataset(self.valid_inputs, self.valid_outputs),
-                          batch_size=self.batch_size, generator=self.rng)
+        dataset = TensorDataset(self.valid_inputs, self.valid_outputs)
+        return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
 
     def test_dataloader(self):
-        return DataLoader(TensorDataset(self.test_inputs, self.test_outputs),
-                          batch_size=self.batch_size, generator=self.rng)
+        dataset = TensorDataset(self.test_inputs, self.test_outputs)
+        return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
 
 
-## Split data (seeds must match training) ##
-partition_rng = torch.Generator()
-partition_rng.manual_seed(partition_seed)
-batch_rng = torch.Generator()
-batch_rng.manual_seed(batch_seed)
+##############################################
+#### Evaluate GPNNA model (GP → NN)       ##
+##############################################
 
-train_idx, valid_idx, test_idx = torch.utils.data.random_split(
-    range(N), data_partitions, generator=partition_rng
-)
+def evaluate_gpnna(cfg, data_module, raw_test_inputs_T, raw_test_inputs_P, true_T, true_P):
+    """
+    Load a GPNNA checkpoint and return signed residuals on the test set.
+    GPNNA: raw 4-D input → GP (k-NN) → NN → T-P profile
 
-def to_tensor(arr, idx):
-    return torch.tensor(arr[idx], dtype=torch.float32)
+    Returns
+    -------
+    res_T : ndarray (n_test, O)
+    res_P : ndarray (n_test, O)
+    """
+    width       = cfg.get('nn_width', nn_width_default)
+    depth       = cfg.get('nn_depth', nn_depth_default)
+    n_neighbors = cfg.get('n_neighbors', 10)
+    ckpt_path   = model_save_path + cfg['ckpt']
+    hparams     = _parse_hparams_from_ckpt_name(ckpt_path)
 
-train_inputs    = to_tensor(raw_inputs,    train_idx)
-valid_inputs    = to_tensor(raw_inputs,    valid_idx)
-test_inputs     = to_tensor(raw_inputs,    test_idx)
-train_outputs_T = to_tensor(raw_outputs_T, train_idx)
-valid_outputs_T = to_tensor(raw_outputs_T, valid_idx)
-test_outputs_T  = to_tensor(raw_outputs_T, test_idx)
-train_outputs_P = to_tensor(raw_outputs_P, train_idx)
-valid_outputs_P = to_tensor(raw_outputs_P, valid_idx)
-test_outputs_P  = to_tensor(raw_outputs_P, test_idx)
+    NN_rng = torch.Generator()
+    NN_rng.manual_seed(cfg['seed'])
 
-train_outputs = torch.cat([train_outputs_T, train_outputs_P], dim=1)
-valid_outputs = torch.cat([valid_outputs_T, valid_outputs_P], dim=1)
-test_outputs  = torch.cat([test_outputs_T,  test_outputs_P],  dim=1)
+    # GPNNA model: input_dim = 2*O (T and P profiles), output_dim = 2*O
+    mdl = NeuralNetwork(2 * O, width, 2 * O, depth, generator=NN_rng)
+    lm  = RegressionModule.load_from_checkpoint(
+        ckpt_path, model=mdl, optimizer=Adam, **hparams, reg_coeff_l1=0.0,
+    )
+    mdl = lm.model.cpu().eval()
 
-data_module = CustomDataModule(
-    train_inputs, train_outputs,
-    valid_inputs, valid_outputs,
-    test_inputs,  test_outputs,
-    batch_size, batch_rng
-)
+    scaled_inputs_T = torch.tensor(
+        data_module.in_scaler_T.transform(raw_test_inputs_T), dtype=torch.float32
+    )
+    scaled_inputs_P = torch.tensor(
+        data_module.in_scaler_P.transform(raw_test_inputs_P), dtype=torch.float32
+    )
+    scaled_inputs = torch.cat([scaled_inputs_T, scaled_inputs_P], dim=1)
 
-# Raw (unscaled) arrays for evaluation
-raw_test_inputs  = test_inputs.cpu().numpy()
-raw_train_inputs = train_inputs.cpu().numpy()   # needed for GPNNA k-NN
-raw_train_outputs_T = train_outputs_T.cpu().numpy()
-raw_train_outputs_P = train_outputs_P.cpu().numpy()
-true_T = test_outputs_T.cpu().numpy()
-true_P = test_outputs_P.cpu().numpy()
+    with torch.no_grad():
+        preds = mdl(scaled_inputs).detach().numpy()
 
+    pred_T = data_module.out_scaler_T.inverse_transform(preds[:, :O])
+    pred_P = data_module.out_scaler_P.inverse_transform(preds[:, O:])
 
-##################
-#### Build NN ####
-##################
-class NeuralNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, depth, generator=None):
-        if generator is not None:
-            torch.manual_seed(generator.initial_seed())
-        super().__init__()
-        layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
-        for _ in range(depth):
-            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
-        layers.append(nn.Linear(hidden_dim, output_dim))
-        self.linear_relu_stack = nn.Sequential(*layers)
+    res_T = pred_T - true_T
+    res_P = pred_P - true_P
 
-    def forward(self, x):
-        return self.linear_relu_stack(x)
+    return res_T, res_P
 
 
 ###################################
@@ -315,191 +505,6 @@ def _parse_hparams_from_ckpt_name(ckpt_path):
     }
 
 
-##############################################
-#### Evaluate PNNA model (standard NN)    ##
-##############################################
-
-def evaluate_pnna(cfg, data_module):
-    """
-    Load a PNNA checkpoint and return signed residuals on the test set.
-    PNNA: raw 4-D input → NN → T-P profile
-
-    Returns
-    -------
-    res_T : ndarray (n_test, O)
-    res_P : ndarray (n_test, O)
-    """
-    width     = cfg.get('nn_width', nn_width_default)
-    depth     = cfg.get('nn_depth', nn_depth_default)
-    ckpt_path = model_save_path + cfg['ckpt']
-    hparams   = _parse_hparams_from_ckpt_name(ckpt_path)
-
-    NN_rng = torch.Generator()
-    NN_rng.manual_seed(cfg['seed'])
-
-    mdl = NeuralNetwork(D, width, 2 * O, depth, generator=NN_rng)
-    lm  = RegressionModule.load_from_checkpoint(
-        ckpt_path, model=mdl, optimizer=Adam, **hparams, reg_coeff_l1=0.0,
-    )
-    mdl = lm.model.cpu().eval()
-
-    scaled_inputs = torch.tensor(
-        data_module.in_scaler.transform(raw_test_inputs), dtype=torch.float32
-    )
-    with torch.no_grad():
-        preds = mdl(scaled_inputs).numpy()
-
-    pred_T = data_module.out_scaler_T.inverse_transform(preds[:, :O])
-    pred_P = data_module.out_scaler_P.inverse_transform(preds[:, O:])
-
-    res_T = pred_T - true_T
-    res_P = pred_P - true_P
-    return res_T, res_P
-
-
-##############################################
-#### Evaluate GPNNA model (GP → NN)       ##
-##############################################
-
-class GPNNADataModule(pl.LightningDataModule):
-    """
-    Like CustomDataModule but uses separate T and P scalers for *both*
-    inputs and outputs (GPNNA needs this because inputs are TP profiles).
-    """
-    def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs,
-                 test_inputs, test_outputs, batch_size, rng):
-        super().__init__()
-
-        # Output scalers (same as before)
-        out_scaler_T = StandardScaler()
-        out_scaler_P = StandardScaler()
-        out_scaler_T.fit(train_outputs[:, :O].cpu().numpy())
-        out_scaler_P.fit(train_outputs[:, O:].cpu().numpy())
-
-        # Input scalers — GPNNA inputs are also TP profiles (from GP)
-        in_scaler_T = StandardScaler()
-        in_scaler_P = StandardScaler()
-        in_scaler_T.fit(train_inputs[:, :O].cpu().numpy())
-        in_scaler_P.fit(train_inputs[:, O:].cpu().numpy())
-
-        def scale_profile(profiles, scaler_T, scaler_P):
-            T_s = torch.tensor(scaler_T.transform(profiles[:, :O].cpu().numpy()), dtype=torch.float32)
-            P_s = torch.tensor(scaler_P.transform(profiles[:, O:].cpu().numpy()), dtype=torch.float32)
-            return torch.cat([T_s, P_s], dim=1)
-
-        self.out_scaler_T = out_scaler_T
-        self.out_scaler_P = out_scaler_P
-        self.in_scaler_T  = in_scaler_T
-        self.in_scaler_P  = in_scaler_P
-
-        self.train_inputs  = scale_profile(train_inputs,  in_scaler_T, in_scaler_P)
-        self.train_outputs = scale_profile(train_outputs, out_scaler_T, out_scaler_P)
-        self.valid_inputs  = scale_profile(valid_inputs,  in_scaler_T, in_scaler_P)
-        self.valid_outputs = scale_profile(valid_outputs, out_scaler_T, out_scaler_P)
-        self.test_inputs   = scale_profile(test_inputs,   in_scaler_T, in_scaler_P)
-        self.test_outputs  = scale_profile(test_outputs,  out_scaler_T, out_scaler_P)
-        self.batch_size    = batch_size
-        self.rng           = rng
-
-    def train_dataloader(self):
-        return DataLoader(TensorDataset(self.train_inputs, self.train_outputs),
-                          batch_size=self.batch_size, shuffle=True, generator=self.rng)
-
-    def val_dataloader(self):
-        return DataLoader(TensorDataset(self.valid_inputs, self.valid_outputs),
-                          batch_size=self.batch_size, generator=self.rng)
-
-    def test_dataloader(self):
-        return DataLoader(TensorDataset(self.test_inputs, self.test_outputs),
-                          batch_size=self.batch_size, generator=self.rng)
-
-
-def evaluate_gpnna(cfg):
-    """
-    Load a GPNNA checkpoint and return signed residuals on the test set.
-    GPNNA: raw 4-D input → GP (k-NN) → NN → T-P profile
-
-    Returns
-    -------
-    res_T : ndarray (n_test, O)
-    res_P : ndarray (n_test, O)
-    """
-    width       = cfg.get('nn_width', nn_width_default)
-    depth       = cfg.get('nn_depth', nn_depth_default)
-    n_neighbors = cfg.get('n_neighbors', 10)
-    ckpt_path   = model_save_path + cfg['ckpt']
-    hparams     = _parse_hparams_from_ckpt_name(ckpt_path)
-
-    NN_rng = torch.Generator()
-    NN_rng.manual_seed(cfg['seed'])
-
-    # GPNNA model: input_dim = 2*O (T and P profiles), output_dim = 2*O
-    mdl = NeuralNetwork(2 * O, width, 2 * O, depth, generator=NN_rng)
-    lm  = RegressionModule.load_from_checkpoint(
-        ckpt_path, model=mdl, optimizer=Adam, **hparams, reg_coeff_l1=0.0,
-    )
-    mdl = lm.model.cpu().eval()
-
-    # Build dummy GPNNA scalers (we only need them for inverse_transform)
-    # Use the *training* GP outputs to fit the input scalers.
-    # For simplicity we'll recompute GP predictions on training set once.
-    print("    [GPNNA] Generating GP predictions on training set to fit scalers...")
-    gp_train_T = np.zeros((len(raw_train_inputs), O), dtype=float)
-    gp_train_P = np.zeros((len(raw_train_inputs), O), dtype=float)
-    for i, q_input in enumerate(raw_train_inputs):
-        distances = np.linalg.norm(raw_train_inputs - q_input, axis=1)
-        k_idx = np.argsort(distances)[:n_neighbors]
-        mean_labels, _ = Sai_CGP(
-            raw_train_inputs[k_idx].T,
-            np.concatenate([raw_train_outputs_T[k_idx], raw_train_outputs_P[k_idx]], axis=1).T,
-            q_input.reshape((D, 1))
-        )
-        gp_train_T[i] = np.mean(mean_labels[:O], axis=1)
-        gp_train_P[i] = np.mean(mean_labels[O:], axis=1)
-
-    in_scaler_T = StandardScaler()
-    in_scaler_P = StandardScaler()
-    in_scaler_T.fit(gp_train_T)
-    in_scaler_P.fit(gp_train_P)
-
-    out_scaler_T = StandardScaler()
-    out_scaler_P = StandardScaler()
-    out_scaler_T.fit(raw_train_outputs_T)
-    out_scaler_P.fit(raw_train_outputs_P)
-
-    # --- Run two-stage inference on test set ---
-    print("    [GPNNA] Running two-stage inference (GP → NN) on test set...")
-    res_T = np.zeros((len(raw_test_inputs), O), dtype=float)
-    res_P = np.zeros((len(raw_test_inputs), O), dtype=float)
-
-    for i, q_input in enumerate(raw_test_inputs):
-        # Stage 1: GP prediction from k-NN in training set
-        distances = np.linalg.norm(raw_train_inputs - q_input, axis=1)
-        k_idx = np.argsort(distances)[:n_neighbors]
-        mean_labels, _ = Sai_CGP(
-            raw_train_inputs[k_idx].T,
-            np.concatenate([raw_train_outputs_T[k_idx], raw_train_outputs_P[k_idx]], axis=1).T,
-            q_input.reshape((D, 1))
-        )
-        gp_T = np.mean(mean_labels[:O], axis=1)
-        gp_P = np.mean(mean_labels[O:], axis=1)
-
-        # Stage 2: NN refinement
-        gp_T_scaled = in_scaler_T.transform(gp_T.reshape(1, -1))
-        gp_P_scaled = in_scaler_P.transform(gp_P.reshape(1, -1))
-        nn_input    = torch.tensor(np.concatenate([gp_T_scaled, gp_P_scaled], axis=1), dtype=torch.float32)
-
-        with torch.no_grad():
-            nn_output = mdl(nn_input).numpy()
-
-        pred_T = out_scaler_T.inverse_transform(nn_output[:, :O]).flatten()
-        pred_P = out_scaler_P.inverse_transform(nn_output[:, O:]).flatten()
-
-        res_T[i] = pred_T - true_T[i]
-        res_P[i] = pred_P - true_P[i]
-
-    return res_T, res_P
-
 
 ##########################
 #### Main comparison  ####
@@ -514,10 +519,177 @@ for cfg in MODEL_CONFIGS:
 
     model_type = cfg.get('model_type', 'pnna')  # default to pnna if not specified
 
+    #Define RNGs
+    partition_rng = torch.Generator()
+    partition_rng.manual_seed(partition_seed)
+    batch_rng = torch.Generator()
+    batch_rng.manual_seed(batch_seed)
+    
     if model_type == 'pnna':
-        res_T, res_P = evaluate_pnna(cfg, data_module)
+        ## Split data (seeds must match training) ##
+        train_idx, valid_idx, test_idx = torch.utils.data.random_split(
+            range(N), data_partitions, generator=partition_rng
+        )
+
+        ## Generate the data partitions
+        ### Training
+        train_inputs = torch.tensor(raw_inputs[train_idx], dtype=torch.float32)
+        train_outputs_T = torch.tensor(raw_outputs_T[train_idx], dtype=torch.float32)
+        train_outputs_P = torch.tensor(raw_outputs_P[train_idx], dtype=torch.float32)
+        ### Validation
+        valid_inputs = torch.tensor(raw_inputs[valid_idx], dtype=torch.float32)
+        valid_outputs_T = torch.tensor(raw_outputs_T[valid_idx], dtype=torch.float32)
+        valid_outputs_P = torch.tensor(raw_outputs_P[valid_idx], dtype=torch.float32)
+        ### Testing
+        test_inputs = torch.tensor(raw_inputs[test_idx], dtype=torch.float32)
+        test_outputs_T = torch.tensor(raw_outputs_T[test_idx], dtype=torch.float32)
+        test_outputs_P = torch.tensor(raw_outputs_P[test_idx], dtype=torch.float32)
+
+        ## Concatenating outputs
+        train_outputs = torch.cat([
+            train_outputs_T,
+            train_outputs_P
+        ], dim=1)
+
+        valid_outputs = torch.cat([
+            valid_outputs_T,
+            valid_outputs_P
+        ], dim=1)
+
+        test_outputs = torch.cat([
+            test_outputs_T,
+            test_outputs_P
+        ], dim=1)
+
+        # Create DataModule
+        data_module = PNNA_CustomDataModule(
+            train_inputs, train_outputs,
+            valid_inputs, valid_outputs,
+            test_inputs, test_outputs,
+            batch_size, batch_rng
+        )
+
+        # Raw (unscaled) arrays for evaluation
+        raw_test_inputs  = test_inputs.cpu().numpy()
+        true_T = test_outputs_T.cpu().numpy()
+        true_P = test_outputs_P.cpu().numpy()
+    
+        res_T, res_P = evaluate_pnna(cfg, data_module, raw_test_inputs, true_T, true_P)
+
     elif model_type == 'gpnna':
-        res_T, res_P = evaluate_gpnna(cfg)
+        
+        #######################################################
+        #### Partition data into training and testing sets ####
+        #######################################################
+        ## Retrieving indices of data partitions
+        train_idx, test_idx = torch.utils.data.random_split(range(N), [0.8, 0.2], generator=partition_rng)
+        ## Generate the data partitions
+        ### Training
+        train_inputs = raw_inputs[train_idx]
+        train_outputs_T = raw_outputs_T[train_idx]
+        train_outputs_P = raw_outputs_P[train_idx]
+
+        ### Testing
+        test_inputs = raw_inputs[test_idx]
+        test_outputs_T = raw_outputs_T[test_idx]
+        test_outputs_P = raw_outputs_P[test_idx]
+
+
+        ############################
+        #### Build training set ####
+        ############################
+        #Initialize array to store inputs
+        train_NN_inputs_T = np.zeros(train_outputs_T.shape, dtype=float)
+        train_NN_inputs_P = np.zeros(train_outputs_P.shape, dtype=float)
+
+        for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(train_inputs, train_outputs_T, train_outputs_P)):
+
+            #Calculate proximity of query point to observations
+            distances = np.sqrt( (query_input[0] - train_inputs[:,0])**2 + (query_input[1] - train_inputs[:,1])**2 + (query_input[2] - train_inputs[:,2])**2 + (query_input[3] - train_inputs[:,3])**2 )
+
+            #Choose the N closest points
+            N_closest_idx = np.argsort(distances)[:cfg['n_neighbors']]
+            prox_train_inputs = train_inputs[N_closest_idx, :]
+            prox_train_outputs_T = train_outputs_T[N_closest_idx, :]
+            prox_train_outputs_P = train_outputs_P[N_closest_idx, :]
+            
+            #Find the query labels from nearest neigbours
+            mean_test_output, cov_test_output = Sai_CGP(prox_train_inputs.T, np.concat((prox_train_outputs_T, prox_train_outputs_P), axis=1).T, query_input.reshape((1, 4)).T)
+            model_test_output_T = np.mean(mean_test_output[:O],axis=1)
+            model_test_output_P = np.mean(mean_test_output[O:],axis=1)
+            model_test_output_Terr = np.sqrt(np.diag(cov_test_output))[:O]
+            model_test_output_Perr = np.sqrt(np.diag(cov_test_output))[O:]
+            train_NN_inputs_T[query_idx, :] = model_test_output_T
+            train_NN_inputs_P[query_idx, :] = model_test_output_P
+
+
+        # Split training dataset into training, validation, and testing, and format it correctly
+        ## Retrieving indices of data partitions
+        train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(train_inputs.shape[0]), data_partitions, generator=partition_rng)
+
+        ## Generate the data partitions
+        ### Training
+        NN_train_inputs_T = torch.tensor(train_NN_inputs_T[train_idx], dtype=torch.float32)
+        NN_train_inputs_P = torch.tensor(train_NN_inputs_P[train_idx], dtype=torch.float32)
+        NN_train_outputs_T = torch.tensor(train_outputs_T[train_idx], dtype=torch.float32)
+        NN_train_outputs_P = torch.tensor(train_outputs_P[train_idx], dtype=torch.float32)
+        ### Validation
+        NN_valid_inputs_T = torch.tensor(train_NN_inputs_T[valid_idx], dtype=torch.float32)
+        NN_valid_inputs_P = torch.tensor(train_NN_inputs_P[valid_idx], dtype=torch.float32)
+        NN_valid_outputs_T = torch.tensor(train_outputs_T[valid_idx], dtype=torch.float32)
+        NN_valid_outputs_P = torch.tensor(train_outputs_P[valid_idx], dtype=torch.float32)
+        ### Testing
+        NN_test_og_inputs = torch.tensor(train_inputs[test_idx], dtype=torch.float32) 
+        NN_test_inputs_T = torch.tensor(train_NN_inputs_T[test_idx], dtype=torch.float32)
+        NN_test_inputs_P = torch.tensor(train_NN_inputs_P[test_idx], dtype=torch.float32)
+        NN_test_outputs_T = torch.tensor(train_outputs_T[test_idx], dtype=torch.float32)
+        NN_test_outputs_P = torch.tensor(train_outputs_P[test_idx], dtype=torch.float32)
+
+        ## Concatenating inputs and outputs
+        NN_train_inputs = torch.cat([
+            NN_train_inputs_T,
+            NN_train_inputs_P
+        ], dim=1)
+        NN_train_outputs = torch.cat([
+            NN_train_outputs_T,
+            NN_train_outputs_P
+        ], dim=1)
+
+        NN_valid_inputs = torch.cat([
+            NN_valid_inputs_T,
+            NN_valid_inputs_P
+        ], dim=1)
+        NN_valid_outputs = torch.cat([
+            NN_valid_outputs_T,
+            NN_valid_outputs_P
+        ], dim=1)
+
+        NN_test_inputs = torch.cat([
+            NN_test_inputs_T,
+            NN_test_inputs_P
+        ], dim=1)
+        NN_test_outputs = torch.cat([
+            NN_test_outputs_T,
+            NN_test_outputs_P
+        ], dim=1)
+
+        # Create DataModule
+        data_module = GPNNADataModule(
+            NN_train_inputs, NN_train_outputs,
+            NN_valid_inputs, NN_valid_outputs,
+            NN_test_inputs, NN_test_outputs,
+            batch_size, batch_rng
+        )
+
+        # Raw (unscaled) arrays for evaluation
+        raw_test_inputs  = NN_test_og_inputs.cpu().numpy()
+        raw_test_inputs_T  = NN_test_inputs_T.cpu().numpy()
+        raw_test_inputs_P  = NN_test_inputs_P.cpu().numpy()
+        true_T = NN_test_outputs_T.cpu().numpy()
+        true_P = NN_test_outputs_P.cpu().numpy()
+
+        res_T, res_P = evaluate_gpnna(cfg, data_module, raw_test_inputs_T, raw_test_inputs_P, true_T, true_P)
+
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
