@@ -61,6 +61,12 @@ if 'logged' in distance_metric:
     raw_inputs[:, 1] = np.log10(raw_inputs[:, 1]) #CO2
 
 
+INPUT_LABELS = [
+    r'H$_2$ Pressure (bar)',
+    r'CO$_2$ Pressure (bar)',
+    r'LoD (days)',
+    r'Obliquity (deg)',
+]
 
 
 ############################################################
@@ -68,6 +74,7 @@ if 'logged' in distance_metric:
 ############################################################
 
 # --- P profiles ---
+## Base 
 fig, ax = plt.subplots(figsize=(8, 6))
 for i, raw_output_P in enumerate(raw_outputs_P):
     ax.plot(raw_output_P, color=cm.get_cmap('coolwarm')(i / (len(raw_outputs_P) - 1)))
@@ -81,16 +88,58 @@ plt.colorbar(sm, ax=ax, label='Profile Index')
 plt.savefig(plot_save_path + 'ALL_P_profiles.pdf')
 plt.show()
 
+## Correlations with input parameters
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+for j, ax in enumerate(axes.flatten()):
+    
+    # Normalize based on actual input values
+    norm = mcolors.Normalize(vmin=min(raw_inputs[:, j]), vmax=max(raw_inputs[:, j]))
+    cmap = cm.get_cmap('coolwarm')
+
+    for i, raw_output_P in enumerate(raw_outputs_P):
+        ax.plot(raw_output_P, color=cmap(norm(raw_inputs[i, j])))
+    
+    if j > 1:ax.set_xlabel('Index')
+    if j==0 or j== 2:ax.set_ylabel(r'log$_{10}$ Pressure (bar)')
+    ax.invert_yaxis()
+
+    sm = cm.ScalarMappable(cmap='coolwarm', norm=norm)
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label=INPUT_LABELS[j])
+plt.subplots_adjust(hspace=0.1)
+plt.savefig(plot_save_path + 'CORRELATED_P_profiles.pdf')
+plt.show()
+
 # --- T profiles ---
 fig, ax = plt.subplots(figsize=(8, 6))
 for i, raw_output_T in enumerate(raw_outputs_T):
-    ax.plot(raw_output_T, color=cm.get_cmap('coolwarm')(i / (len(raw_outputs_T) - 1)))
+    ax.plot(raw_output_T)
 ax.set_xlabel('Index')
 ax.set_ylabel('Temperature (K)')
-sm = cm.ScalarMappable(cmap='coolwarm', norm=mcolors.Normalize(vmin=0, vmax=len(raw_outputs_T) - 1))
-sm.set_array([])
-plt.colorbar(sm, ax=ax, label='Profile Index')
 plt.savefig(plot_save_path + 'ALL_T_profiles.pdf')
+plt.show()
+
+## Correlations with input parameters
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+for j, ax in enumerate(axes.flatten()):
+    
+    # Normalize based on actual input values
+    norm = mcolors.Normalize(vmin=min(raw_inputs[:, j]), vmax=max(raw_inputs[:, j]))
+    cmap = cm.get_cmap('coolwarm')
+
+    for i, raw_output_T in enumerate(raw_outputs_T):
+        ax.plot(raw_output_T, color=cmap(norm(raw_inputs[i, j])))
+    
+    if j > 1:ax.set_xlabel('Index')
+    if j==0 or j== 2:ax.set_ylabel(r'Temperature (K)')
+
+    sm = cm.ScalarMappable(cmap='coolwarm', norm=norm)
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label=INPUT_LABELS[j])
+plt.subplots_adjust(hspace=0.1)
+plt.savefig(plot_save_path + 'CORRELATED_T_profiles.pdf')
 plt.show()
 
 # --- P Covariance plot ---
