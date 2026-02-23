@@ -36,11 +36,18 @@ raw_outputs_P = raw_P_data[:, 5:]
 #Convert raw outputs to log10 scale so we don't have to deal with it later
 raw_outputs_P = np.log10(raw_outputs_P/1000)
 
-
 #Storing useful quantitites
 N = raw_inputs.shape[0] #Number of data points
 D = raw_inputs.shape[1] #Number of features
 O = raw_outputs_T.shape[1] #Number of outputs
+
+
+# Shuffle data
+rp = np.random.permutation(N) #random permutation of the indices
+# Apply random permutation to shuffle the data
+raw_inputs = raw_inputs[rp, :]
+raw_outputs_T = raw_outputs_T[rp, :]
+raw_outputs_P = raw_outputs_P[rp, :]
 
 ## HYPER-PARAMETERS ##
 #Definine partitiion for splitting NN dataset
@@ -69,6 +76,10 @@ INPUT_LABELS = [
 ]
 
 plot_1 = False
+plot_2 = True
+
+refinement_iterations = 1
+
 
 ############################################################
 #### Plot curves, covariance matrices and eigenspectrum ####
@@ -190,135 +201,45 @@ if plot_1:
     plt.savefig(plot_save_path + 'SVD_P.pdf')
     plt.show()
 
-###############################################
-#### Ensemble Conditional Gaussian Process ####
-########### (Visualization Example) ###########
-###############################################
-
-# Num_points = 50000
-
-# #Generate some base data for visualization (replace with actual data in practice)
-# t = np.linspace(-2*np.pi, 2*np.pi, Num_points)
-# x1 = np.cos(t) + 0.1 * np.random.randn(Num_points) #shape: (N,)
-# x2 = np.sin(t) + 0.1 * np.random.randn(Num_points) #shape: (N,)
-# X = np.vstack([x1, x2]) #shape: (2, N)
-
-# y = np.sin(x1 * x2) + 5 * np.exp(-x1**2 - x2**2) #shape: (N,)
-# Y = y.reshape(1, -1) #shape: (1, N)
-
-# # Train/test split
-# XTr = X[:, :40000];  XTs = X[:, 10000:]
-# YTr = Y[:, :40000];  YTs = Y[:, 10000:]
-
-# #Define number of neighbors to use in KNN search
-# K = 10
-
-# # Pick a random test query
-# idx = np.random.randint(0, XTs.shape[1])
-# Xq = XTs[:, idx:idx+1]   # shape: (2, 1)
-
-# # Initial KNN search using Mahalanobis distance
-# def mahalanobis_knn(X_train, X_query, k):
-#     """Find k nearest neighbors using Mahalanobis distance."""
-#     nbrs = NearestNeighbors(n_neighbors=k, metric='mahalanobis', metric_params={'VI': np.linalg.inv(np.cov(X_train))})
-#     nbrs.fit(X_train.T)
-#     distances, indices = nbrs.kneighbors(X_query.T)
-#     return indices[0]   # shape: (k,)
-
-# idxs = mahalanobis_knn(XTr, Xq, K)
-
-# # Precompute inverse covariance for Mahalanobis (used repeatedly)
-# VI = np.linalg.inv(np.cov(XTr))
-
-# def mahalanobis_knn_with_VI(X_train, X_query, k, VI):
-#     nbrs = NearestNeighbors(n_neighbors=k, metric='mahalanobis', metric_params={'VI': VI})
-#     nbrs.fit(X_train.T)
-#     distances, indices = nbrs.kneighbors(X_query.T)
-#     return indices   # shape: (n_queries, k)
-
-# # Iterative refinement loop
-# for i in range(20):
-#     XTrSel = XTr[:, idxs]    # shape: (4, len(idxs))
-#     YTrSel = YTr[:, idxs]    # shape: (M, len(idxs))
-
-#     Xm = XTrSel.mean(axis=1, keepdims=True)   # (4, 1)
-#     Ym = YTrSel.mean(axis=1, keepdims=True)   # (M, 1)
-
-#     dX = XTrSel - Xm   # (4, K)
-#     dY = YTrSel - Ym   # (M, K)
-
-#     Cxx = dX @ dX.T    # (4, 4)
-#     Cyx = dY @ dX.T    # (M, 4)
-#     Cyy = dY @ dY.T    # (M, M)
-#     Cxy = dX @ dY.T    # (4, M)
-
-#     rdgx = np.min(np.linalg.eigvals(Cxx).real)
-#     rdgy = np.min(np.linalg.eigvals(Cyy).real)
-
-#     Mf = Cyx @ np.linalg.pinv(Cxx + rdgx * np.eye(Cxx.shape[0]))  # (M, 4)
-#     Mb = Cxy @ np.linalg.pinv(Cyy + rdgy * np.eye(Cyy.shape[0]))  # (4, M)
-
-#     YhSel = YTrSel + Mf @ (Xq - XTrSel)          # (M, K)
-#     XhSel = XTrSel + Mb @ (Ym - YhSel)            # (4, K)
-
-#     # KNN search: for each column of XhSel, find 1 nearest neighbor in XTr
-#     idxs2 = mahalanobis_knn_with_VI(XTr, XhSel, 1, VI).flatten()
-
-#     idxs = np.unique(idxs2)
-#     lx = len(idxs)
-
-#     if lx < K:
-#         idxs3 = mahalanobis_knn_with_VI(XTr, Xq, K - lx, VI).flatten()
-#         idxs = np.unique(np.concatenate([idxs, idxs3]))
-
-# # Final prediction
-# Yh = Ym + Mf @ (Xq - Xm)   # (M, 1)
-
-# # Extract outputs (MATLAB 1-indexed → Python 0-indexed)
-# lP  = YTs[0:51,  idx]    # ground truth log-pressures
-# eT  = YTs[51:,   idx]    # ground truth temperatures
-# lPh = Yh[0:51,   0]      # predicted log-pressures
-# eTh = Yh[51:,    0]      # predicted temperatures
-
-# # Plot
-# plt.figure()
-# plt.plot(eT,  lP,  'g', label='Ground Truth')
-# plt.plot(eTh, lPh, 'r', label='Predicted')
-# plt.xlabel('Temperature')
-# plt.ylabel('log(Pressure)')
-# plt.legend()
-# plt.tight_layout()
-# plt.show()
-
 
 ###############################################
 #### Ensemble Conditional Gaussian Process ####
 ###############################################
+def Sai_CGP(obs_features, obs_labels, query_features):
+        """
+        Conditional Gaussian Process
+        Inputs: 
+            obs_features : ndarray (D, N)
+                D-dimensional features of the N ensemble data points.
+            obs_labels : ndarray (K, N)
+                K-dimensional labels of the N ensemble data points.
+            query_features : ndarray (D, 1)
+                D-dimensional features of the query data point.
+        Outputs:
+            query_labels : ndarray (K, N)
+                K-dimensional labels of the ensemble updated from the query point.
+            query_cov_labels : ndarray (K, K)
+                K-by-K covariance of the ensemble labels.
+        """
+        
+        # Defining relevant covariance matrices
+        ## Between feature and label of observation data
+        Cyx = (obs_labels @ obs_features.T) / (obs_features.shape[1] - 1)
+        ## Between label and feature of observation data
+        Cxy = (obs_features @ obs_labels.T) / (obs_features.shape[1] - 1)
+        ## Between feature and feature of observation data
+        Cxx = (obs_features @ obs_features.T) / (obs_features.shape[1] - 1)
+        ## Between label and label of observation data
+        Cyy = (obs_labels @ obs_labels.T) / (obs_features.shape[1] - 1)
+        ## Adding regularizer to avoid singularities
+        Cxx += 1e-6 * np.eye(Cxx.shape[0]) 
 
-# Extract features and targets
-x = raw_inputs                                     # shape: (N, 4)
-y = np.hstack([raw_outputs_P, raw_outputs_T])      # shape: (N, M) where M = 51 (P) + 51 (T) = 102
-X = x.T   # shape: (4, N)
-Y = y.T   # shape: (M, N)
+        query_labels = obs_labels + (Cyx @ scipy.linalg.pinv(Cxx) @ (query_features - obs_features))
 
-# Shuffle data
-rp = np.random.permutation(X.shape[1]) #random permutation of the indices
-# Apply random permutation to shuffle the data
-X = X[:, rp]
-Y = Y[:, rp]
+        query_cov_labels = Cyy - Cyx @ scipy.linalg.pinv(Cxx) @ Cxy
 
-# Train/test split
-XTr = X[:, :9000];  XTs = X[:, 9000:]
-YTr = Y[:, :9000];  YTs = Y[:, 9000:]
-
-#Define number of neighbors to use in KNN search
-K = 10
-
-# Pick a random test query
-idx = np.random.randint(0, XTs.shape[1])
-Xq = XTs[:, idx:idx+1]   # shape: (4, 1)
-
-# Initial KNN search using Mahalanobis distance
+        return query_labels, query_cov_labels
+        
 def mahalanobis_knn(X_train, X_query, k):
     """Find k nearest neighbors using Mahalanobis distance."""
     nbrs = NearestNeighbors(n_neighbors=k, metric='mahalanobis', metric_params={'VI': np.linalg.inv(np.cov(X_train))})
@@ -326,183 +247,140 @@ def mahalanobis_knn(X_train, X_query, k):
     distances, indices = nbrs.kneighbors(X_query.T)
     return indices[0]   # shape: (k,)
 
-idxs = mahalanobis_knn(XTr, Xq, K)
-
-# Precompute inverse covariance for Mahalanobis (used repeatedly)
-VI = np.linalg.inv(np.cov(XTr))
-
 def mahalanobis_knn_with_VI(X_train, X_query, k, VI):
     nbrs = NearestNeighbors(n_neighbors=k, metric='mahalanobis', metric_params={'VI': VI})
     nbrs.fit(X_train.T)
     distances, indices = nbrs.kneighbors(X_query.T)
     return indices   # shape: (n_queries, k)
-
-# Iterative refinement loop
-for i in range(20):
-    XTrSel = XTr[:, idxs]    # shape: (4, len(idxs))
-    YTrSel = YTr[:, idxs]    # shape: (M, len(idxs))
-
-    Xm = XTrSel.mean(axis=1, keepdims=True)   # (4, 1)
-    Ym = YTrSel.mean(axis=1, keepdims=True)   # (M, 1)
-
-    dX = XTrSel - Xm   # (4, K)
-    dY = YTrSel - Ym   # (M, K)
-
-    Cxx = dX @ dX.T    # (4, 4)
-    Cyx = dY @ dX.T    # (M, 4)
-    Cyy = dY @ dY.T    # (M, M)
-    Cxy = dX @ dY.T    # (4, M)
-
-    rdgx = np.min(np.linalg.eigvals(Cxx).real)
-    rdgy = np.min(np.linalg.eigvals(Cyy).real)
-
-    Mf = Cyx @ np.linalg.pinv(Cxx + rdgx * np.eye(Cxx.shape[0]))  # (M, 4)
-    Mb = Cxy @ np.linalg.pinv(Cyy + rdgy * np.eye(Cyy.shape[0]))  # (4, M)
-
-    YhSel = YTrSel + Mf @ (Xq - XTrSel)          # (M, K)
-    XhSel = XTrSel + Mb @ (Ym - YhSel)            # (4, K)
-
-    # KNN search: for each column of XhSel, find 1 nearest neighbor in XTr
-    idxs2 = mahalanobis_knn_with_VI(XTr, XhSel, 1, VI).flatten()
-
-    idxs = np.unique(idxs2)
-    lx = len(idxs)
-
-    if lx < K:
-        idxs3 = mahalanobis_knn_with_VI(XTr, Xq, K - lx, VI).flatten()
-        idxs = np.unique(np.concatenate([idxs, idxs3]))
-
-# Final prediction
-Yh = Ym + Mf @ (Xq - Xm)   # (M, 1)
-
-# Extract outputs (MATLAB 1-indexed → Python 0-indexed)
-lP  = YTs[0:51,  idx]    # ground truth log-pressures
-eT  = YTs[51:,   idx]    # ground truth temperatures
-lPh = Yh[0:51,   0]      # predicted log-pressures
-eTh = Yh[51:,    0]      # predicted temperatures
-
-# Plot
-plt.figure()
-plt.plot(eT,  lP,  'g', label='Ground Truth')
-plt.plot(eTh, lPh, 'r', label='Predicted')
-plt.xlabel('Temperature')
-plt.ylabel('log(Pressure)')
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-def Sai_CGP(obs_features, obs_labels, query_features):
-    """
-    Conditional Gaussian Process
-    Inputs: 
-        obs_features : ndarray (D, N)
-            D-dimensional features of the N ensemble data points.
-        obs_labels : ndarray (K, N)
-            K-dimensional labels of the N ensemble data points.
-        query_features : ndarray (D, 1)
-            D-dimensional features of the query data point.
-    Outputs:
-        query_labels : ndarray (K, N)
-            K-dimensional labels of the ensemble updated from the query point.
-        query_cov_labels : ndarray (K, K)
-            K-by-K covariance of the ensemble labels.
-    """
-    
-    # Defining relevant covariance matrices
-    ## Between feature and label of observation data
-    Cyx = (obs_labels @ obs_features.T) / (obs_features.shape[0] - 1)
-    ## Between label and feature of observation data
-    Cxy = (obs_features @ obs_labels.T) / (obs_features.shape[0] - 1)
-    ## Between feature and feature of observation data
-    Cxx = (obs_features @ obs_features.T) / (obs_features.shape[0] - 1)
-    ## Between label and label of observation data
-    Cyy = (obs_labels @ obs_labels.T) / (obs_features.shape[0] - 1)
-    ## Adding regularizer to avoid singularities
-    Cxx += 1e-6 * np.eye(Cxx.shape[0]) 
-
-    query_labels = obs_labels + (Cyx @ scipy.linalg.pinv(Cxx) @ (query_features - obs_features))
-
-    query_cov_labels = Cyy - Cyx @ scipy.linalg.pinv(Cxx) @ Cxy
-
-    return query_labels, query_cov_labels
-
-N_neighbor = N_neigbors
-# Initialize array to store NN inputs / GP outputs
-NN_inputs_T = np.zeros(raw_outputs_T.shape, dtype=float)
-NN_inputs_P = np.zeros(raw_outputs_P.shape, dtype=float)
-
-for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(raw_inputs, raw_outputs_T, raw_outputs_P)):
-
-    # My CGP
-    #Calculate proximity of query point to observations
-    distances = np.sqrt( (query_input[0] - raw_inputs[:,0])**2 + (query_input[1] - raw_inputs[:,1])**2 + (query_input[2] - raw_inputs[:,2])**2 + (query_input[3] - raw_inputs[:,3])**2 )
-
-    #Choose the N closest points
-    # skip the first point since it corresponds to the query point itself
-    N_closest_idx = np.argsort(distances)[1:N_neighbor+1]
-    prox_train_inputs = raw_inputs[N_closest_idx, :]
-    prox_train_outputs_T = raw_outputs_T[N_closest_idx, :]
-    prox_train_outputs_P = raw_outputs_P[N_closest_idx, :]
-
-    #Find the query labels from nearest neigbours
-    mean_test_output, cov_test_output = Sai_CGP(prox_train_inputs.T, np.concat((prox_train_outputs_T, prox_train_outputs_P), axis=1).T, query_input.reshape((1, 4)).T)
-    model_test_output_T = np.mean(mean_test_output[:O],axis=1)
-    model_test_output_P = np.mean(mean_test_output[O:],axis=1)
-    model_test_output_Terr = np.sqrt(np.diag(cov_test_output))[:O]
-    model_test_output_Perr = np.sqrt(np.diag(cov_test_output))[O:]
-    NN_inputs_T[query_idx, :] = model_test_output_T
-    NN_inputs_P[query_idx, :] = model_test_output_P
-
-    #Sai CGP
-    # Initial KNN search using Mahalanobis distance
-    def mahalanobis_knn(X_train, X_query, k):
-        """Find k nearest neighbors using Mahalanobis distance."""
-        nbrs = NearestNeighbors(n_neighbors=k, metric='mahalanobis', metric_params={'VI': np.linalg.inv(np.cov(X_train))})
-        nbrs.fit(X_train.T)
-        distances, indices = nbrs.kneighbors(X_query.T)
-        return indices[0]   # shape: (k,)
-
-    idxs = mahalanobis_knn(XTr, Xq, K)
-
-    # Precompute inverse covariance for Mahalanobis (used repeatedly)
-    VI = np.linalg.inv(np.cov(XTr))
-
-    def mahalanobis_knn_with_VI(X_train, X_query, k, VI):
-        nbrs = NearestNeighbors(n_neighbors=k, metric='mahalanobis', metric_params={'VI': VI})
-        nbrs.fit(X_train.T)
-        distances, indices = nbrs.kneighbors(X_query.T)
-        return indices   # shape: (n_queries, k)
-
-    #Diagnostic plot
-    if show_plot:
-
-        #Plot TP profiles
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 6))
         
-        #ax1 : prediction, truth and the neighbors
-        for prox_idx in range(N_neighbor):
-            ax1.plot(prox_train_outputs_T[prox_idx], prox_train_outputs_P[prox_idx], '.', linestyle='-', color='red', alpha=0.1, linewidth=2, zorder=1, label='Ensemble' if prox_idx==0 else None)
-        
-        #ax2 : prediction, truth and prediction errorbars in T
-        ax2.errorbar(model_test_output_T, model_test_output_P, xerr=model_test_output_Terr, fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4)
-        ax2.fill_betweenx(model_test_output_P, model_test_output_T-model_test_output_Terr, model_test_output_T+model_test_output_Terr, color='green', zorder=2, alpha=0.2)
-        #ax3 : prediction, truth and prediction errorbars in P
-        ax3.errorbar(model_test_output_T, model_test_output_P, yerr=model_test_output_Perr, fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4)
-        ax3.fill_between(model_test_output_T, model_test_output_P-model_test_output_Perr, model_test_output_P+model_test_output_Perr, color='green', zorder=2, alpha=0.2)
+if plot_2:
 
-        for ax in [ax1, ax2, ax3]:
-            ax.plot(model_test_output_T, model_test_output_P, '.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=3, label='Prediction')
+    for N_neighbor in N_neigbors:
 
-            ax.plot(query_output_T, query_output_P, '.', linestyle='-', color='blue', linewidth=2, zorder=3, markersize=10, label='Truth')
+        # Initialize array to store NN inputs / GP outputs
+        myguess_T = np.zeros(raw_outputs_T.shape, dtype=float)
+        myguess_P = np.zeros(raw_outputs_P.shape, dtype=float)
+        Saiguess_T = np.zeros(raw_outputs_T.shape, dtype=float)
+        Saiguess_P = np.zeros(raw_outputs_P.shape, dtype=float)
 
-            ax.invert_yaxis()
-            
-            if ax == ax1 : ax.set_ylabel(r'log$_{10}$ Pressure (bar)')
-            ax.set_xlabel('Temperature (K)')
-            
-            ax.grid()
-            ax.legend()        
+        for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(raw_inputs, raw_outputs_T, raw_outputs_P)):
 
-        plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg')
-        plt.subplots_adjust(wspace=0.2)
-        plt.show()
+            # My CGP
+            #Calculate proximity of query point to observations
+            distances = np.sqrt( (query_input[0] - raw_inputs[:,0])**2 + (query_input[1] - raw_inputs[:,1])**2 + (query_input[2] - raw_inputs[:,2])**2 + (query_input[3] - raw_inputs[:,3])**2 )
+
+            #Choose the N closest points
+            # skip the first point since it corresponds to the query point itself
+            N_closest_idx = np.argsort(distances)[1:N_neighbor+1]
+            prox_train_inputs = raw_inputs[N_closest_idx, :]
+            prox_train_outputs_T = raw_outputs_T[N_closest_idx, :]
+            prox_train_outputs_P = raw_outputs_P[N_closest_idx, :]
+
+            #Find the query labels from nearest neigbours
+            mean_test_output, cov_test_output = Sai_CGP(prox_train_inputs.T, np.concat((prox_train_outputs_T, prox_train_outputs_P), axis=1).T, query_input.reshape((1, 4)).T)
+            model_test_output_T = np.mean(mean_test_output[:O],axis=1)
+            model_test_output_P = np.mean(mean_test_output[O:],axis=1)
+            model_test_output_Terr = np.sqrt(np.diag(cov_test_output))[:O]
+            model_test_output_Perr = np.sqrt(np.diag(cov_test_output))[O:]
+            myguess_T[query_idx, :] = model_test_output_T
+            myguess_P[query_idx, :] = model_test_output_P
+
+            #Sai CGP
+            # Extract features and targets
+            x = raw_inputs                                     # shape: (N, 4)
+            y = np.hstack([raw_outputs_T, raw_outputs_P])      # shape: (N, M) where M = 51 (P) + 51 (T) = 102
+            X = x.T   # shape: (4, N)
+            Y = y.T   # shape: (M, N)
+
+            # Retrieve the query point and reshape it for CGP
+            Xq = X[:, query_idx].reshape(-1, 1)   # shape: (4, 1)
+
+            # Define the training data for CGP (all data points except the query point)
+            XTr = np.delete(X, query_idx, axis=1)
+            YTr = np.delete(Y, query_idx, axis=1)
+
+            # Initial KNN search using Mahalanobis distance
+            idxs = mahalanobis_knn(XTr, Xq, N_neighbor)
+
+            # Precompute inverse covariance for Mahalanobis (used repeatedly)
+            VI = np.linalg.inv(np.cov(XTr))
+
+            # Iterative refinement loop
+            for i in range(refinement_iterations):
+                XTrSel = XTr[:, idxs]    # shape: (4, len(idxs))
+                YTrSel = YTr[:, idxs]    # shape: (M, len(idxs))
+
+                Xm = XTrSel.mean(axis=1, keepdims=True)   # (4, 1)
+                Ym = YTrSel.mean(axis=1, keepdims=True)   # (M, 1)
+
+                dX = XTrSel - Xm   # (4, N_neighbor)
+                dY = YTrSel - Ym   # (M, N_neighbor)
+
+                Cxx = dX @ dX.T    # (4, 4)
+                Cyx = dY @ dX.T    # (M, 4)
+                Cyy = dY @ dY.T    # (M, M)
+                Cxy = dX @ dY.T    # (4, M)
+
+                rdgx = np.min(np.linalg.eigvals(Cxx).real)
+                rdgy = np.min(np.linalg.eigvals(Cyy).real)
+
+                Mf = Cyx @ np.linalg.pinv(Cxx + rdgx * np.eye(Cxx.shape[0]))  # (M, 4)
+                Mb = Cxy @ np.linalg.pinv(Cyy + rdgy * np.eye(Cyy.shape[0]))  # (4, M)
+
+                YhSel = YTrSel + Mf @ (Xq - XTrSel)          # (M, N_neighbor)
+                XhSel = XTrSel + Mb @ (Ym - YhSel)            # (4, N_neighbor)
+
+                # KNN search: for each column of XhSel, find 1 nearest neighbor in XTr
+                idxs2 = mahalanobis_knn_with_VI(XTr, XhSel, 1, VI).flatten()
+
+                idxs = np.unique(idxs2)
+                lx = len(idxs)
+
+                if lx < N_neighbor:
+                    idxs3 = mahalanobis_knn_with_VI(XTr, Xq, N_neighbor - lx, VI).flatten()
+                    idxs = np.unique(np.concatenate([idxs, idxs3]))
+
+            # Final prediction
+            Yh = Ym + Mf @ (Xq - Xm)   # (M, 1)
+            Yh_T = Yh[:O, 0]   # Predicted T
+            Yh_P = Yh[O:, 0]   # Predicted P
+            Saiguess_T[query_idx, :] = Yh_T
+            Saiguess_P[query_idx, :] = Yh_P
+
+            #Diagnostic plot
+            fig, axs = plt.subplot_mosaic([['res_pressure', '.'],
+                                            ['results', 'res_temperature']],
+                                    figsize=(8, 6),
+                                    width_ratios=(3, 1), height_ratios=(1, 3),
+                                    layout='constrained')        
+            axs['results'].plot(query_output_T, query_output_P, '.', linestyle='-', color='blue', linewidth=2, label='Truth')
+            axs['results'].plot(model_test_output_T, model_test_output_P, color='green', linewidth=2, label='My prediction')
+            axs['results'].plot(Yh_T, Yh_P, color='red', linewidth=2, label='Sai prediction')
+            axs['results'].invert_yaxis()
+            axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
+            axs['results'].set_xlabel('Temperature (K)')
+            axs['results'].legend()
+            axs['results'].grid()
+
+            axs['res_temperature'].plot(model_test_output_T - query_output_T, model_test_output_P, '.', linestyle='-', color='green', linewidth=2)
+            axs['res_temperature'].plot(Yh_T - query_output_T, Yh_P, '.', linestyle='-', color='red', linewidth=2)
+            axs['res_temperature'].set_xlabel('Residuals (K)')
+            axs['res_temperature'].invert_yaxis()
+            axs['res_temperature'].grid()
+            # axs['res_temperature'].axvline(0, color='black', linestyle='dashed', zorder=2)
+            axs['res_temperature'].yaxis.tick_right()
+            axs['res_temperature'].yaxis.set_label_position("right")
+            axs['res_temperature'].sharey(axs['results'])
+
+            axs['res_pressure'].plot(model_test_output_T, model_test_output_P - query_output_P, '.', linestyle='-', color='green', linewidth=2)
+            axs['res_pressure'].plot(query_output_T, Yh_P - query_output_P, '.', linestyle='-', color='red', linewidth=2)
+            axs['res_pressure'].set_ylabel('Residuals (bar)')
+            axs['res_pressure'].invert_yaxis()
+            axs['res_pressure'].grid()
+            # axs['res_pressure'].axhline(0, color='black', linestyle='dashed', zorder=2)
+            axs['res_pressure'].xaxis.tick_top()
+            axs['res_pressure'].xaxis.set_label_position("top")
+            axs['res_pressure'].sharex(axs['results'])
+
+            plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg')
+            plt.show()
