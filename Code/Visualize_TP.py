@@ -7,12 +7,13 @@ from turtle import color
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-import scipy
-from tqdm import tqdm
 import seaborn as sns
+from tqdm import tqdm
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
-from sklearn.neighbors import NearestNeighbors
+import jax.numpy as jnp
+from jax import jit, vmap
+from functools import partial
 
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
@@ -59,7 +60,7 @@ data_partition = [0.7, 0.1, 0.2]
 show_plot = True
 
 #Number of nearest neighbors to choose
-N_neigbors = np.linspace(5, 200, 5, dtype=int).tolist()
+N_neigbors = np.linspace(5, 1000, 10, dtype=int).tolist()
 
 #Distance metric to use
 distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
@@ -80,8 +81,7 @@ INPUT_LABELS = [
 plot_1 = False
 plot_2 = True
 
-refinement_iterations = 1
-
+refinement_iterations = 20
 
 ############################################################
 #### Plot curves, covariance matrices and eigenspectrum ####
@@ -207,81 +207,88 @@ if plot_1:
 ###############################################
 #### Ensemble Conditional Gaussian Process ####
 ###############################################
+# ── JAX KNN ───────────────────────────────────────────────────────────────────
+@partial(jit, static_argnames=('k',))
+def _mahal_knn_single(X_train, xq, VI, k):
+    """Single query point. X_train: (D, N), xq: (D,), returns (k,)"""
+    diff = X_train - xq[:, None]                     # (D, N)
+    dists_sq = jnp.sum(diff * (VI @ diff), axis=0)   # (N,)
+    return jnp.argsort(dists_sq)[:k]
+
+@partial(jit, static_argnames=('k',))
+def _mahal_knn_batch(X_train, X_queries, VI, k):
+    """Batch of query points. X_queries: (D, Q), returns (Q, k)"""
+    def single(xq):
+        diff = X_train - xq[:, None]
+        dists_sq = jnp.sum(diff * (VI @ diff), axis=0)
+        return jnp.argsort(dists_sq)[:k]
+    return vmap(single)(X_queries.T)
+
+# ── JAX CGP step ──────────────────────────────────────────────────────────────
+@jit
+def _cgp_step(Xens_NN, Yens_NN, Xq):
+    """Full covariance + forward/backward step for a fixed neighbourhood."""
+    Xm = Xens_NN.mean(axis=1, keepdims=True)
+    Ym = Yens_NN.mean(axis=1, keepdims=True)
+    dX = Xens_NN - Xm
+    dY = Yens_NN - Ym
+
+    Cxx = dX @ dX.T
+    Cyx = dY @ dX.T
+    Cyy = dY @ dY.T
+    Cxy = dX @ dY.T
+
+    # eigvalsh is faster than eigvals for symmetric matrices
+    rdgx = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cxx)))
+    rdgy = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cyy)))
+
+    Mf = Cyx @ jnp.linalg.pinv(Cxx + rdgx * jnp.eye(Cxx.shape[0]))
+    Mb = Cxy @ jnp.linalg.pinv(Cyy + rdgy * jnp.eye(Cyy.shape[0]))
+
+    YhSel = Yens_NN + Mf @ (Xq - Xens_NN)
+    XhSel = Xens_NN + Mb @ (Ym - YhSel)
+
+    Yh     = Ym + Mf @ (Xq - Xm)
+    cov_Yh = Cyy - Mf @ Cxy
+
+    return Mf, YhSel, XhSel, Xm, Ym, Yh, cov_Yh
+
+# ── Main function ─────────────────────────────────────────────────────────────
 def ens_CGP(Xens, Yens, Xq, N_neighbor, refinement_iterations):
-    """Ensemble Conditional Gaussian Process (ens-CGP) implementation for a single query point.
-    Parameters:
-    Xens: (D, N) array of input features which compose the ensemble
-    Yens: (M, N) array of output targets which compose the ensemble
-    Xq: (D, 1) array of input features for the query point
-    N_neighbor: Number of nearest neighbors to use in the CGP
-    refinement_iterations: Number of iterations for the refinement loop
-    Returns:
-    Yh_T: (O,) array of predicted temperature profile for the query point
-    Yh_P: (M-O,) array of predicted pressure profile for the query point
     """
+    Parameters:
+    Xens: array of input features which compose the ensemble. shape:(D, N) 
+    Yens: array of input labels which compose the ensemble. shape:(M, N) 
+    Xq: query point for which we want to compute a prediction. shape:(D, 1)
+    N_neighbor: int, number of neighbors to use in CGP
+    refinement_iterations: int, number of times to refine the neighborhood
+    """
+    # Convert to JAX arrays once — cheap after first call
+    Xens_j = jnp.array(Xens)
+    Yens_j = jnp.array(Yens)
+    Xq_j   = jnp.array(Xq)
+    VI_j   = jnp.linalg.inv(jnp.cov(Xens_j))
 
-    # Precompute inverse covariance for Mahalanobis (used repeatedly)
-    VI = np.linalg.inv(np.cov(Xens))
+    # Initial KNN
+    idxs = np.array(_mahal_knn_single(Xens_j, Xq_j.ravel(), VI_j, N_neighbor))
 
-    # Initial KNN search using Mahalanobis distance
-    idxs = mahalanobis_knn(Xens, Xq, N_neighbor, VI).flatten()  # shape: (N_neighbor,)
-
-    # Iterative refinement loop
+    # Iterative refinement
     for _ in range(refinement_iterations):
-        
-        #Get the nearest neighbors for the current iteration
-        Xens_NN = Xens[:, idxs]    # shape: (D, N_neighbor)
-        Yens_NN = Yens[:, idxs]    # shape: (M, N_neighbor)
+        Mf, YhSel, XhSel, Xm, Ym, Yh, cov_Yh = _cgp_step(
+            Xens_j[:, idxs], Yens_j[:, idxs], Xq_j
+        )
 
-        #Get the means of the nearest neighbors
-        Xm = Xens_NN.mean(axis=1, keepdims=True)   # (D, 1)
-        Ym = Yens_NN.mean(axis=1, keepdims=True)   # (M, 1)
-
-        #Build the covariance matrices
-        dX = Xens_NN - Xm   # (D, N_neighbor)
-        dY = Yens_NN - Ym   # (M, N_neighbor)
-
-        Cxx = dX @ dX.T    # (D, D)
-        Cyx = dY @ dX.T    # (M, D)
-        Cyy = dY @ dY.T    # (M, M)
-        Cxy = dX @ dY.T    # (D, M)
-
-        #Get the regularization terms based on the minimum eigenvalues of the covariance matrices
-        rdgx = max(1e-10, np.min(np.linalg.eigvals(Cxx).real))
-        rdgy = max(1e-10, np.min(np.linalg.eigvals(Cyy).real))
-
-        #Get the forward and backward mapping matrices with regularization
-        Mf = Cyx @ np.linalg.pinv(Cxx + rdgx * np.eye(Cxx.shape[0]))  # (M, D)
-        Mb = Cxy @ np.linalg.pinv(Cyy + rdgy * np.eye(Cyy.shape[0]))  # (D, M)
-
-        #Get the forward and backward predictions for the nearest neighbors
-        YhSel = Yens_NN + Mf @ (Xq - Xens_NN)          # (M, N_neighbor)
-        XhSel = Xens_NN + Mb @ (Ym - YhSel)            # (D, N_neighbor)
-
-        #Perform KNN search around the forward-backward refined predictions and combine with original KNN if needed
-        idxs2 = mahalanobis_knn(Xens, XhSel, 1, VI).flatten()
-
-        idxs = np.unique(idxs2)
-        lx = len(idxs)
+        # Dynamic parts must stay in numpy due to variable shape from np.unique
+        idxs2 = np.array(_mahal_knn_batch(Xens_j, XhSel, VI_j, 1)).flatten()
+        idxs  = np.unique(idxs2)
+        lx    = len(idxs)
 
         if lx < N_neighbor:
-            idxs3 = mahalanobis_knn(Xens, Xq, N_neighbor - lx, VI).flatten()
-            idxs = np.unique(np.concatenate([idxs, idxs3]))
+            idxs3 = np.array(_mahal_knn_single(Xens_j, Xq_j.ravel(), VI_j, N_neighbor - lx))
+            idxs  = np.unique(np.concatenate([idxs, idxs3]))
 
-    # Final prediction and errorbars
-    Yh = Ym + Mf @ (Xq - Xm)   # (M, 1)
-    cov_Yh = Cyy - Mf @ Cxy   # (M, M)
-    err_Yh = np.sqrt(np.diag(cov_Yh))                  # (M,)
-    
-    #Flatten the output to return 1D arrays for T and P
-    return Yh.flatten(), err_Yh
-
-
-def mahalanobis_knn(X_train, X_query, k, VI):
-    nbrs = NearestNeighbors(n_neighbors=k, metric='mahalanobis', metric_params={'VI': VI})
-    nbrs.fit(X_train.T)
-    _, indices = nbrs.kneighbors(X_query.T)
-    return indices   # shape: (n_queries, k)
+    err_Yh = jnp.sqrt(jnp.maximum(0.0, jnp.diag(cov_Yh)))
+    return np.array(Yh.flatten()), np.array(err_Yh)
         
 if plot_2:
 
@@ -290,15 +297,17 @@ if plot_2:
     bias_P = np.zeros(len(N_neigbors), dtype=float)
     var_T = np.zeros(len(N_neigbors), dtype=float)
     var_P = np.zeros(len(N_neigbors), dtype=float)
+    MSE_T = np.zeros(len(N_neigbors), dtype=float)
+    MSE_P = np.zeros(len(N_neigbors), dtype=float)
 
-    for NNidx, N_neighbor in enumerate(N_neigbors):
+    for NNidx, N_neighbor in enumerate(tqdm(N_neigbors)):
 
         guess_T = np.zeros(raw_outputs_T.shape, dtype=float)
         guess_Terr = np.zeros(raw_outputs_T.shape, dtype=float)
         guess_P = np.zeros(raw_outputs_P.shape, dtype=float)
         guess_Perr = np.zeros(raw_outputs_P.shape, dtype=float)
 
-        for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(raw_inputs, raw_outputs_T, raw_outputs_P)):
+        for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
 
             # Define the training data for CGP (all data points except the query point)
             XTr = np.delete(
@@ -319,37 +328,37 @@ if plot_2:
             guess_Perr[query_idx, :] = err_Yh[O:]
 
             #Diagnostic plot
-            fig, axs = plt.subplot_mosaic([['res_pressure', '.'],
-                                            ['results', 'res_temperature']],
-                                    figsize=(8, 6),
-                                    width_ratios=(3, 1), height_ratios=(1, 3),
-                                    layout='constrained')        
-            axs['results'].plot(query_output_T, query_output_P, '.', linestyle='-', color='blue', linewidth=2, label='Truth')
-            axs['results'].errorbar(guess_T[query_idx, :], guess_P[query_idx, :], xerr=guess_Terr[query_idx, :], yerr=guess_Perr[query_idx, :], fmt='o', linestyle='-', color='green', linewidth=2, label='Prediction')
-            axs['results'].invert_yaxis()
-            axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
-            axs['results'].set_xlabel('Temperature (K)')
-            axs['results'].legend()
-            axs['results'].grid()
+            # fig, axs = plt.subplot_mosaic([['res_pressure', '.'],
+            #                                 ['results', 'res_temperature']],
+            #                         figsize=(8, 6),
+            #                         width_ratios=(3, 1), height_ratios=(1, 3),
+            #                         layout='constrained')        
+            # axs['results'].plot(query_output_T, query_output_P, '.', linestyle='-', color='blue', linewidth=2, label='Truth')
+            # axs['results'].errorbar(guess_T[query_idx, :], guess_P[query_idx, :], xerr=guess_Terr[query_idx, :], yerr=guess_Perr[query_idx, :], fmt='o', linestyle='-', color='green', linewidth=2, label='Prediction')
+            # axs['results'].invert_yaxis()
+            # axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
+            # axs['results'].set_xlabel('Temperature (K)')
+            # axs['results'].legend()
+            # axs['results'].grid()
 
-            axs['res_temperature'].errorbar(guess_T[query_idx, :] - query_output_T, query_output_P, xerr=guess_Terr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2)
-            axs['res_temperature'].set_xlabel('Residuals (K)')
-            axs['res_temperature'].invert_yaxis()
-            axs['res_temperature'].grid()
-            axs['res_temperature'].yaxis.tick_right()
-            axs['res_temperature'].yaxis.set_label_position("right")
-            axs['res_temperature'].sharey(axs['results'])
+            # axs['res_temperature'].errorbar(guess_T[query_idx, :] - query_output_T, query_output_P, xerr=guess_Terr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2)
+            # axs['res_temperature'].set_xlabel('Residuals (K)')
+            # axs['res_temperature'].invert_yaxis()
+            # axs['res_temperature'].grid()
+            # axs['res_temperature'].yaxis.tick_right()
+            # axs['res_temperature'].yaxis.set_label_position("right")
+            # axs['res_temperature'].sharey(axs['results'])
 
-            axs['res_pressure'].errorbar(query_output_T, guess_P[query_idx, :] - query_output_P, yerr=guess_Perr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2)
-            axs['res_pressure'].set_ylabel('Residuals (bar)')
-            axs['res_pressure'].invert_yaxis()
-            axs['res_pressure'].grid()
-            axs['res_pressure'].xaxis.tick_top()
-            axs['res_pressure'].xaxis.set_label_position("top")
-            axs['res_pressure'].sharex(axs['results'])
+            # axs['res_pressure'].errorbar(query_output_T, guess_P[query_idx, :] - query_output_P, yerr=guess_Perr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2)
+            # axs['res_pressure'].set_ylabel('Residuals (bar)')
+            # axs['res_pressure'].invert_yaxis()
+            # axs['res_pressure'].grid()
+            # axs['res_pressure'].xaxis.tick_top()
+            # axs['res_pressure'].xaxis.set_label_position("top")
+            # axs['res_pressure'].sharex(axs['results'])
 
-            plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg')
-            plt.close()
+            # plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg')
+            # plt.close()
 
         #Compute bias and variance for T and P predictions
         bias_T[NNidx] = np.mean(guess_T - raw_outputs_T)
@@ -358,12 +367,17 @@ if plot_2:
         var_T[NNidx] = np.mean(guess_Terr**2) #Use the predicted errorbars as a proxy for variance
         var_P[NNidx] = np.mean(guess_Perr**2)
 
+        MSE_T[NNidx] = bias_T[NNidx]**2 + var_T[NNidx]
+        MSE_P[NNidx] = bias_P[NNidx]**2 + var_P[NNidx]
+
     #Plot bias and variance as a function of N_neighbors
-    fig, ax = plt.subplots(2, 2, figsize=(8, 6))
+    fig, ax = plt.subplots(3, 2, figsize=(8, 6))
     ax[0,0].plot(N_neigbors, bias_T, label='Bias T', color='blue')
     ax[0,1].plot(N_neigbors, bias_P, label='Bias P', color='orange')
     ax[1,0].plot(N_neigbors, var_T, label='Variance T', color='blue', linestyle='--')
     ax[1,1].plot(N_neigbors, var_P, label='Variance P', color='orange', linestyle='--')
+    ax[2,0].plot(N_neigbors, MSE_T, label='MSE T', color='blue')
+    ax[2,1].plot(N_neigbors, MSE_P, label='MSE P', color='orange')
     ax[0,0].set_xlabel('Number of Neighbors')
     ax[0,1].set_xlabel('Number of Neighbors')
     ax[1,0].set_ylabel('Bias / Variance')
@@ -376,5 +390,5 @@ if plot_2:
     ax[0,1].legend()
     ax[1,0].legend()
     ax[1,1].legend()
-    # plt.savefig(plot_save_path + 'Bias_Variance.pdf')
+    plt.savefig(plot_save_path + 'Bias_Variance.pdf')
     plt.show()
