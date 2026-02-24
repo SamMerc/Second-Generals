@@ -153,9 +153,12 @@ def _mahal_knn_batch(X_train, X_queries, VI, k):
     return vmap(single)(X_queries.T)
 
 # ── JAX CGP step ──────────────────────────────────────────────────────────────
-@jit
-def _cgp_step(Xens_NN, Yens_NN, Xq):
-    """Full covariance + forward/backward step for a fixed neighbourhood."""
+@partial(jit, static_argnames=('N_neighbor',))
+def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
+    """idxs is always shape (N_neighbor,) — no dynamic shapes."""
+    Xens_NN = Xens[:, idxs]   # shape always (D, N_neighbor) ← fixed!
+    Yens_NN = Yens[:, idxs]   # shape always (M, N_neighbor) ← fixed!
+
     Xm = Xens_NN.mean(axis=1, keepdims=True)
     Ym = Yens_NN.mean(axis=1, keepdims=True)
     dX = Xens_NN - Xm
@@ -166,7 +169,6 @@ def _cgp_step(Xens_NN, Yens_NN, Xq):
     Cyy = dY @ dY.T
     Cxy = dX @ dY.T
 
-    # eigvalsh is faster than eigvals for symmetric matrices
     rdgx = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cxx)))
     rdgy = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cyy)))
 
@@ -176,44 +178,40 @@ def _cgp_step(Xens_NN, Yens_NN, Xq):
     YhSel = Yens_NN + Mf @ (Xq - Xens_NN)
     XhSel = Xens_NN + Mb @ (Ym - YhSel)
 
+    # Fixed-size unique: always returns exactly N_neighbor indices
+    idxs2 = _mahal_knn_batch(Xens, XhSel, VI, 1).flatten()   # (N_neighbor,)
+    idxs_new = jnp.unique(idxs2, size=N_neighbor,
+                          fill_value=-1)                       # (N_neighbor,) ← fixed!
+
+    # Top-up: always pull N_neighbor candidates from Xq, use where idxs_new has fill
+    idxs_topup = _mahal_knn_single(Xens, Xq.ravel(), VI, N_neighbor)
+    idxs_final = jnp.where(idxs_new >= 0, idxs_new, idxs_topup)
+
     Yh     = Ym + Mf @ (Xq - Xm)
     cov_Yh = Cyy - Mf @ Cxy
 
-    return Mf, YhSel, XhSel, Xm, Ym, Yh, cov_Yh
+    return idxs_final, Mf, Cxy, Xm, Ym, Yh, cov_Yh
 
 # ── Main function ─────────────────────────────────────────────────────────────
-def ens_CGP(Xens, Yens, Xq, N_neighbor, refinement_iterations):
+def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, refinement_iterations):
     """
     Parameters:
-    Xens: array of input features which compose the ensemble. shape:(D, N) 
-    Yens: array of input labels which compose the ensemble. shape:(M, N) 
+    Xens_j: array of input features which compose the ensemble. shape:(D, N) 
+    Yens_j: array of input labels which compose the ensemble. shape:(M, N) 
     Xq: query point for which we want to compute a prediction. shape:(D, 1)
+    VI_j: inverse of the covariance matrix for the input ensemble. shape:(D, D)
     N_neighbor: int, number of neighbors to use in CGP
     refinement_iterations: int, number of times to refine the neighborhood
     """
-    # Convert to JAX arrays once — cheap after first call
-    Xens_j = jnp.array(Xens)
-    Yens_j = jnp.array(Yens)
-    Xq_j   = jnp.array(Xq)
-    VI_j   = jnp.linalg.inv(jnp.cov(Xens_j))
+    # No more jnp.array() conversions — passed in pre-converted
+    Xq_j = jnp.array(Xq.ravel())   # (D,) — only Xq changes per query point
 
-    # Initial KNN
-    idxs = np.array(_mahal_knn_single(Xens_j, Xq_j.ravel(), VI_j, N_neighbor))
+    idxs = _mahal_knn_single(Xens_j, Xq_j, VI_j, N_neighbor)  # (N_neighbor,) fixed
 
-    # Iterative refinement
     for _ in range(refinement_iterations):
-        Mf, YhSel, XhSel, Xm, Ym, Yh, cov_Yh = _cgp_step(
-            Xens_j[:, idxs], Yens_j[:, idxs], Xq_j
+        idxs, _, _, _, _, Yh, cov_Yh = _cgp_step_fixed(
+            Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
         )
-
-        # Dynamic parts must stay in numpy due to variable shape from np.unique
-        idxs2 = np.array(_mahal_knn_batch(Xens_j, XhSel, VI_j, 1)).flatten()
-        idxs  = np.unique(idxs2)
-        lx    = len(idxs)
-
-        if lx < N_neighbor:
-            idxs3 = np.array(_mahal_knn_single(Xens_j, Xq_j.ravel(), VI_j, N_neighbor - lx))
-            idxs  = np.unique(np.concatenate([idxs, idxs3]))
 
     err_Yh = jnp.sqrt(jnp.maximum(0.0, jnp.diag(cov_Yh)))
     return np.array(Yh.flatten()), np.array(err_Yh)
@@ -244,11 +242,18 @@ if plot_2:
                             axis=1
                             )
 
-            Yh, err_Yh = ens_CGP(XTr, YTr, query_input.reshape(-1, 1), N_neighbor, refinement_iterations)
+            Yh, err_Yh = ens_CGP(
+                                jnp.array(XTr),
+                                jnp.array(YTr),
+                                query_input, 
+                                jnp.linalg.inv(jnp.cov(XTr)),
+                                N_neighbor, 
+                                refinement_iterations
+                )
             guess_ST2D[query_idx, :] = Yh
             guess_ST2Derr[query_idx, :] = err_Yh
 
-        #Diagnostic plot
+            #Diagnostic plot
             fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 8), sharex=True, layout='constrained')        
             
             # Compute global vmin/vmax across all datasets
