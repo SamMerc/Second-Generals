@@ -2,8 +2,6 @@
 #### Importing libraries ####
 #############################
 
-from turtle import color
-
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -60,7 +58,7 @@ data_partition = [0.7, 0.1, 0.2]
 show_plot = True
 
 #Number of nearest neighbors to choose
-N_neigbors = np.linspace(5, 1000, 10, dtype=int).tolist()
+N_neigbors = np.arange(1, 100).tolist()
 
 #Distance metric to use
 distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
@@ -290,13 +288,18 @@ def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, refinement_iterations):
         
 if plot_2:
 
+    # Use a subset of the true distribution for these tests
+    raw_inputs = raw_inputs[:1000, :]
+    raw_outputs_T = raw_outputs_T[:1000, :]
+    raw_outputs_P = raw_outputs_P[:1000, :]
+
     #Track the bias and variance of the T and P predictions separately as a function of N_neighbors
     bias_T = np.zeros(len(N_neigbors), dtype=float)
     bias_P = np.zeros(len(N_neigbors), dtype=float)
     var_T = np.zeros(len(N_neigbors), dtype=float)
     var_P = np.zeros(len(N_neigbors), dtype=float)
-    MSE_T = np.zeros(len(N_neigbors), dtype=float)
-    MSE_P = np.zeros(len(N_neigbors), dtype=float)
+    mse_T = np.zeros(len(N_neigbors), dtype=float)
+    mse_P = np.zeros(len(N_neigbors), dtype=float)
 
     for NNidx, N_neighbor in enumerate(tqdm(N_neigbors)):
 
@@ -366,34 +369,30 @@ if plot_2:
             # plt.close()
 
         #Compute bias and variance for T and P predictions
-        bias_T[NNidx] = np.mean(guess_T - raw_outputs_T)
-        bias_P[NNidx] = np.mean(guess_P - raw_outputs_P)
+        bias_T[NNidx] = np.median(guess_T - raw_outputs_T)
+        bias_P[NNidx] = np.median(guess_P - raw_outputs_P)
 
-        var_T[NNidx] = np.mean(guess_Terr**2) #Use the predicted errorbars as a proxy for variance
-        var_P[NNidx] = np.mean(guess_Perr**2)
+        var_T[NNidx] = np.median(guess_Terr**2) #Use the predicted errorbars as a proxy for variance
+        var_P[NNidx] = np.median(guess_Perr**2)
 
-        MSE_T[NNidx] = bias_T[NNidx]**2 + var_T[NNidx]
-        MSE_P[NNidx] = bias_P[NNidx]**2 + var_P[NNidx]
+        mse_T[NNidx] = bias_T[NNidx]**2 + var_T[NNidx]
+        mse_P[NNidx] = bias_P[NNidx]**2 + var_P[NNidx]
 
     #Plot bias and variance as a function of N_neighbors
-    fig, ax = plt.subplots(3, 2, figsize=(8, 6))
-    ax[0,0].plot(N_neigbors, bias_T, label='Bias T', color='blue')
-    ax[0,1].plot(N_neigbors, bias_P, label='Bias P', color='orange')
-    ax[1,0].plot(N_neigbors, var_T, label='Variance T', color='blue', linestyle='--')
-    ax[1,1].plot(N_neigbors, var_P, label='Variance P', color='orange', linestyle='--')
-    ax[2,0].plot(N_neigbors, MSE_T, label='MSE T', color='blue')
-    ax[2,1].plot(N_neigbors, MSE_P, label='MSE P', color='orange')
-    ax[0,0].set_xlabel('Number of Neighbors')
-    ax[0,1].set_xlabel('Number of Neighbors')
-    ax[1,0].set_ylabel('Bias / Variance')
-    ax[1,1].set_ylabel('Bias / Variance')
-    ax[0,0].set_title('Bias T')
-    ax[0,1].set_title('Bias P')
-    ax[1,0].set_title('Variance T')
-    ax[1,1].set_title('Variance P')
-    ax[0,0].legend()
-    ax[0,1].legend()
-    ax[1,0].legend()
-    ax[1,1].legend()
+    fig, ax = plt.subplots(3, 2, sharex=True, figsize=(8, 6))
+    ax[0,0].plot(N_neigbors, bias_T, color='blue')
+    ax[0,1].plot(N_neigbors, bias_P, color='orange')
+    ax[1,0].plot(N_neigbors, var_T, color='blue', linestyle='--')
+    ax[1,1].plot(N_neigbors, var_P, color='orange', linestyle='--')
+    ax[2,0].plot(N_neigbors, mse_T, color='blue')
+    ax[2,1].plot(N_neigbors, mse_P, color='orange')
+    ax[2,0].set_xlabel('Number of Neighbors')
+    ax[2,1].set_xlabel('Number of Neighbors')
+    ax[0,0].set_ylabel('Bias T')
+    ax[0,1].set_ylabel('Bias P')
+    ax[1,0].set_ylabel('Variance T')
+    ax[1,1].set_ylabel('Variance P')
+    ax[2,0].set_ylabel('MSE T')
+    ax[2,1].set_ylabel('MSE P')
     plt.savefig(plot_save_path + 'Bias_Variance.pdf')
-    plt.show()
+    plt.close()

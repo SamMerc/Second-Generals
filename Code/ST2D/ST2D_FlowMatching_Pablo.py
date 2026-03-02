@@ -172,29 +172,33 @@ class ConditionalFlowMatchingModule(pl.LightningModule):
         image_height: int = 48,
         image_width: int = 72,
         # UNET PARAMS
-        model_channels: int = 64,
-        channel_mult: tuple = (1, 2, 4),
+        model_channels: int = 128,
+        channel_mult: tuple = (1, 2, 4, 4),
         layers_per_block: int = 2,
         attention_head_dim: int = 8,
         # OPTIMIZATION
         lr: float = 1e-4,
-        num_inference_steps: int = 100,
+        num_sample_images: int = 8,
+        num_integration_steps: int = 250,
         **kwargs
     ):
         super().__init__()
         self.save_hyperparameters()
         
         self.lr = lr
-        self.num_inference_steps = num_inference_steps
+        self.num_sample_images = num_sample_images
+        self.num_integration_steps = num_integration_steps
         self.in_channels = in_channels
         self.cond_channels = cond_channels
-        self.image_height = image_height
-        self.image_width = image_width
-        
+        self.image_height, self.image_width = self._validate_image_size(
+            image_height, image_width
+        )
+        self.image_size = (self.image_height, self.image_width)
+
         block_out_channels = tuple(model_channels * m for m in channel_mult)
         
         self.velocity_model = UNet2DModel(
-            sample_size=(image_height, image_width),
+            sample_size=self.image_size,
             in_channels=in_channels + cond_channels,
             out_channels=in_channels,
             layers_per_block=layers_per_block,
@@ -202,11 +206,13 @@ class ConditionalFlowMatchingModule(pl.LightningModule):
 
             # Standard ResNet/Attention blocks
             down_block_types=(
-                "DownBlock2D",        # ResNet only
-                "AttnDownBlock2D",    # ResNet + Self-Attention
+                "DownBlock2D",      # ResNet only
+                "AttnDownBlock2D",  # ResNet + Self-Attention
                 "AttnDownBlock2D",
+                "DownBlock2D",
             ),
             up_block_types=(
+                "UpBlock2D",
                 "AttnUpBlock2D",
                 "AttnUpBlock2D",
                 "UpBlock2D",
@@ -231,7 +237,24 @@ class ConditionalFlowMatchingModule(pl.LightningModule):
         #         ),
         # but im not sure
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond_scalars: torch.Tensor):
+    @staticmethod
+    def _validate_image_size(img_height: int, img_width: int):
+        if not isinstance(img_height, int) or not isinstance(img_width, int):
+            raise ValueError("img_height and img_width must be integers.")
+
+        if img_height <= 0 or img_width <= 0:
+            raise ValueError("img_height and img_width must be positive.")
+
+        # With 4 down/up blocks, dimensions should be divisible by 2^(4-1)=8.
+        if img_height % 8 != 0 or img_width % 8 != 0:
+            raise ValueError(
+                "img_height and img_width must both be divisible by 8 for this UNet config, "
+                f"got {(img_height, img_width)}."
+            )
+
+        return img_height, img_width
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond_scalars: torch.Tensor) -> torch.Tensor:
 
         cond_spatial = cond_scalars[:, :, None, None].expand(
         -1, -1, x_t.shape[2], x_t.shape[3]
@@ -241,44 +264,53 @@ class ConditionalFlowMatchingModule(pl.LightningModule):
         # UNet2DModel expects timesteps to be scaled roughly to 0-1000 range usually
         # but pure Flow Matching often works with [0,1]. Diffusers defaults usually prefer larger ints.
         timesteps = t * 1000
-        return self.velocity_model(
-            x_input,
-            timesteps, 
-            ).sample
+        batch_size, _, height, width = x_t.shape
+        cond_scalars = cond_scalars.to(dtype=x_t.dtype)
+        cond_map = cond_scalars[:, :, None, None].expand(
+            batch_size, self.cond_channels, height, width
+        )
+        model_input = torch.cat([x_t, cond_map], dim=1)
+
+        return self.velocity_model(model_input, timesteps).sample
     
     def compute_loss(self, batch: tuple) -> torch.Tensor:
-        target_image, cond_scalars = batch # Expects (Image, Scalars)
-        batch_size = target_image.shape[0]
+        x_1, cond_scalars = batch # Expects (Image, Scalars)
+        batch_size = x_1.shape[0]
         
-        x_0 = torch.randn_like(target_image)
-        t = torch.rand(batch_size, device=target_image.device)
+        x_0 = torch.randn_like(x_1)
+        t = torch.rand(batch_size, device=x_1.device)
         
         t_expanded = t[:, None, None, None]
-        x_t = (1 - t_expanded) * x_0 + t_expanded * target_image
-        target_velocity = target_image - x_0
+        x_t = (1 - t_expanded) * x_0 + t_expanded * x_1
+        target_velocity = x_1 - x_0
         
         predicted_velocity = self(x_t, t, cond_scalars)
         loss = nn.functional.mse_loss(predicted_velocity, target_velocity)
         return loss
     
-    def training_step(self, batch: tuple, batch_idx: int):
+    def training_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         loss = self.compute_loss(batch)
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
     
-    def validation_step(self, batch: tuple, batch_idx: int):
+    def validation_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         loss = self.compute_loss(batch)
-        self.log("valid_loss", loss, prog_bar=True, on_epoch=True)
+        self.log("val/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
+
+        # Cache for visualization - always visualizae the same validation batch
+        if batch_idx == 0:
+            self._val_cond_batch = batch[1][:self.num_sample_images].clone()
+            self._val_target_batch = batch[0][:self.num_sample_images].clone()
         return loss
     
-    def test_step(self, batch: tuple, batch_idx: int):
+    def test_step(self, batch: tuple, batch_idx: int) -> torch.Tensor:
         loss = self.compute_loss(batch)
         self.log("test_loss", loss, prog_bar=True, on_epoch=True)
         return loss
     
     @torch.no_grad()
     def sample(self, cond_scalars: torch.Tensor, num_steps: int = None):
-        num_steps = num_steps or self.num_inference_steps
+        num_steps = num_steps or self.num_integration_steps
         num_samples = cond_scalars.shape[0]
         device = cond_scalars.device
         
@@ -338,7 +370,7 @@ if __name__ == "__main__":
     learning_rate = 1e-4
     batch_size = 64
     n_epochs = 200
-    NUM_INFERENCE_STEPS = 100
+    num_integration_epochs = 100
     num_workers = 1  # Adjust based on your CPU
     
     run_mode = 'use'  # 'use' to train from scratch, 'load' to load checkpoint
@@ -423,10 +455,10 @@ if __name__ == "__main__":
         cond_channels=4,
         image_height=IMG_H,
         image_width=IMG_W,
-        model_channels=64,
-        channel_mult=(1, 2, 4),
+        model_channels=128,
+        channel_mult=(1, 2, 4, 4),
         lr=learning_rate,
-        num_inference_steps=NUM_INFERENCE_STEPS,
+        num_integration_steps=num_integration_epochs,
     )
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -482,10 +514,10 @@ if __name__ == "__main__":
             cond_channels=4,
             image_height=IMG_H,
             image_width=IMG_W,
-            model_channels=64,
-            channel_mult=(1, 2, 4),
+            model_channels=128,
+            channel_mult=(1, 2, 4, 4),
             lr=learning_rate,
-            num_inference_steps=NUM_INFERENCE_STEPS,
+            num_integration_steps=num_integration_epochs,
         )
         print(f"✓ Model loaded from: {ckpt_path}")
     
@@ -587,7 +619,7 @@ if __name__ == "__main__":
         
         # Generate prediction
         scalars_norm_batch = scalars_norm.unsqueeze(0).to(device)
-        img_pred_norm = model.sample(scalars_norm_batch, num_steps=NUM_INFERENCE_STEPS)
+        img_pred_norm = model.sample(scalars_norm_batch, num_steps=num_integration_epochs)
         img_pred = denorm_image(img_pred_norm[0]).cpu().numpy()[0]  # (H, W)
         img_pred = img_pred[1:-1, :]
 
