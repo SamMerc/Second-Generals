@@ -58,7 +58,7 @@ data_partition = [0.7, 0.1, 0.2]
 show_plot = True
 
 #Number of nearest neighbors to choose
-N_neigbors = np.arange(1, 100).tolist()
+N_neigbors = np.arange(1, 100, 10).tolist()
 
 #Distance metric to use
 distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
@@ -76,8 +76,8 @@ INPUT_LABELS = [
     r'Obliquity (deg)',
 ]
 
-plot_1 = False
-plot_2 = True
+plot_1 = True
+plot_2 = False
 
 refinement_iterations = 20
 
@@ -90,14 +90,10 @@ if plot_1:
     ## Base 
     fig, ax = plt.subplots(figsize=(8, 6))
     for i, raw_output_P in enumerate(raw_outputs_P):
-        ax.plot(raw_output_P, color=cm.get_cmap('coolwarm')(i / (len(raw_outputs_P) - 1)))
+        ax.plot(raw_output_P)
     ax.set_xlabel('Index')
     ax.set_ylabel(r'log$_{10}$ Pressure (bar)')
     ax.invert_yaxis()
-    # Add colorbar to show index scale
-    sm = cm.ScalarMappable(cmap='coolwarm', norm=mcolors.Normalize(vmin=0, vmax=len(raw_outputs_P) - 1))
-    sm.set_array([])
-    plt.colorbar(sm, ax=ax, label='Profile Index')
     plt.savefig(plot_save_path + 'ALL_P_profiles.pdf')
     plt.show()
 
@@ -179,28 +175,47 @@ if plot_1:
 
     # --- SVD Decomposition for T ---
     _, S_T, _ = np.linalg.svd(raw_outputs_T, full_matrices=False)
+    var_explained_T = np.cumsum(S_T**2) / np.sum(S_T**2)
 
     fig, axes = plt.subplots(figsize=(8,6))
     axes.plot(S_T, color='blue')
     axes.set_xlabel('Component Index')
     axes.set_ylabel('Singular Value')
     axes.set_yscale('log')
-
+    axestwin = axes.twinx()
+    axestwin.set_yscale('log')
+    axestwin.plot(var_explained_T, color='red')
+    axestwin.set_ylabel('Cumulative variance explained')
+    # Find number of components needed to explain threshold % of variance
+    threshold = 0.999
+    n_components_T = np.searchsorted(var_explained_T, threshold) + 1
+    axestwin.axhline(threshold, color='red', linestyle='--', label=f'{threshold*100}% threshold')
+    axestwin.axvline(n_components_T-1, color='green', linestyle='--', label=f'K={n_components_T}')
+    plt.legend()
     plt.savefig(plot_save_path + 'SVD_T.pdf')
     plt.show()
 
     # --- SVD Decomposition for P ---
     _, S_P, _ = np.linalg.svd(raw_outputs_P, full_matrices=False)
+    var_explained_P = np.cumsum(S_P**2) / np.sum(S_P**2)
 
     fig, axes = plt.subplots(figsize=(8,6))
     axes.plot(S_P, color='blue')
     axes.set_xlabel('Component Index')
     axes.set_ylabel('Singular Value')
     axes.set_yscale('log')
-
+    axestwin = axes.twinx()
+    axestwin.set_yscale('log')
+    axestwin.plot(var_explained_P, color='red')
+    axestwin.set_ylabel('Cumulative variance explained')
+    # Find number of components needed to explain threshold % of variance
+    threshold = 0.999
+    n_components_P = np.searchsorted(var_explained_P, threshold) + 1
+    axestwin.axhline(threshold, color='red', linestyle='--', label=f'{threshold*100}% threshold')
+    axestwin.axvline(n_components_P-1, color='green', linestyle='--', label=f'K={n_components_P}')
+    plt.legend()
     plt.savefig(plot_save_path + 'SVD_P.pdf')
     plt.show()
-
 
 ###############################################
 #### Ensemble Conditional Gaussian Process ####
@@ -369,11 +384,11 @@ if plot_2:
             # plt.close()
 
         #Compute bias and variance for T and P predictions
-        bias_T[NNidx] = np.median(guess_T - raw_outputs_T)
-        bias_P[NNidx] = np.median(guess_P - raw_outputs_P)
+        bias_T[NNidx] = np.mean(guess_T) - np.mean(raw_outputs_T)
+        bias_P[NNidx] = np.mean(guess_P) - np.mean(raw_outputs_P)
 
-        var_T[NNidx] = np.median(guess_Terr**2) #Use the predicted errorbars as a proxy for variance
-        var_P[NNidx] = np.median(guess_Perr**2)
+        var_T[NNidx] = np.mean( (guess_T - np.mean(guess_T))**2 )
+        var_P[NNidx] = np.mean( (guess_P - np.mean(guess_P))**2 )
 
         mse_T[NNidx] = bias_T[NNidx]**2 + var_T[NNidx]
         mse_P[NNidx] = bias_P[NNidx]**2 + var_P[NNidx]
