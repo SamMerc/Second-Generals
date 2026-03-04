@@ -57,9 +57,6 @@ data_partition = [0.7, 0.1, 0.2]
 # Variable to show plots or not 
 show_plot = True
 
-#Number of nearest neighbors to choose
-N_neigbors = np.arange(1, 100, 10).tolist()
-
 #Distance metric to use
 distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
 
@@ -76,10 +73,8 @@ INPUT_LABELS = [
     r'Obliquity (deg)',
 ]
 
-plot_1 = True
-plot_2 = False
-
-refinement_iterations = 20
+plot_1 = False
+plot_2 = True
 
 ############################################################
 #### Plot curves, covariance matrices and eigenspectrum ####
@@ -209,7 +204,7 @@ if plot_1:
     axestwin.plot(var_explained_P, color='red')
     axestwin.set_ylabel('Cumulative variance explained')
     # Find number of components needed to explain threshold % of variance
-    threshold = 0.999
+    threshold = 0.9999
     n_components_P = np.searchsorted(var_explained_P, threshold) + 1
     axestwin.axhline(threshold, color='red', linestyle='--', label=f'{threshold*100}% threshold')
     axestwin.axvline(n_components_P-1, color='green', linestyle='--', label=f'K={n_components_P}')
@@ -266,7 +261,7 @@ def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
     # Fixed-size unique: always returns exactly N_neighbor indices
     idxs2 = _mahal_knn_batch(Xens, XhSel, VI, 1).flatten()   # (N_neighbor,)
     idxs_new = jnp.unique(idxs2, size=N_neighbor,
-                          fill_value=-1)                       # (N_neighbor,) ← fixed!
+                          fill_value=-1)                       # (N_neighbor,)
 
     # Top-up: always pull N_neighbor candidates from Xq, use where idxs_new has fill
     idxs_topup = _mahal_knn_single(Xens, Xq.ravel(), VI, N_neighbor)
@@ -278,136 +273,181 @@ def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
     return idxs_final, Mf, Cxy, Xm, Ym, Yh, cov_Yh
 
 # ── Main function ─────────────────────────────────────────────────────────────
-def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, refinement_iterations):
+def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=100):
     """
     Parameters:
     Xens_j: array of input features which compose the ensemble. shape:(D, N) 
     Yens_j: array of input labels which compose the ensemble. shape:(M, N) 
-    Xq: query point for which we want to compute a prediction. shape:(D, 1)
+    Xq: query point for which we want to compute a prediction. shape:(D,) or (D,1)
     VI_j: inverse of the covariance matrix for the input ensemble. shape:(D, D)
     N_neighbor: int, number of neighbors to use in CGP
-    refinement_iterations: int, number of times to refine the neighborhood
+    tol: float, convergence threshold on average relative change in prediction (default 1%)
+    max_iter: int, safety cap on number of iterations (default 100)
     """
-    # No more jnp.array() conversions — passed in pre-converted
-    Xq_j = jnp.array(Xq.ravel())   # (D,) — only Xq changes per query point
+    Xq_j = jnp.array(Xq.ravel())   # (D,)
 
-    idxs = _mahal_knn_single(Xens_j, Xq_j, VI_j, N_neighbor)  # (N_neighbor,) fixed
+    idxs = _mahal_knn_single(Xens_j, Xq_j, VI_j, N_neighbor)
 
-    for _ in range(refinement_iterations):
+    # Run first iteration to get an initial prediction
+    idxs, _, _, _, _, Yh_prev, cov_Yh = _cgp_step_fixed(
+        Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
+    )
+    Yh_prev = np.array(Yh_prev.flatten())
+
+    for i in range(max_iter - 1):
         idxs, _, _, _, _, Yh, cov_Yh = _cgp_step_fixed(
             Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
         )
+        Yh = np.array(Yh.flatten())
+
+        # Average relative change between this and previous prediction
+        # Add small epsilon to denominator to avoid division by zero
+        rel_change = np.mean(
+            np.abs(Yh - Yh_prev) / (np.abs(Yh_prev) + 1e-10)
+        )
+        print('0:', rel_change)
+
+        if rel_change < tol:
+            break
+
+        Yh_prev = Yh
 
     err_Yh = jnp.sqrt(jnp.maximum(0.0, jnp.diag(cov_Yh)))
-    return np.array(Yh.flatten()), np.array(err_Yh)
-        
+    return Yh, np.array(err_Yh), i + 2   # +2 because of the initial iteration before the loop
+
 if plot_2:
 
-    # Use a subset of the true distribution for these tests
-    raw_inputs = raw_inputs[:1000, :]
-    raw_outputs_T = raw_outputs_T[:1000, :]
-    raw_outputs_P = raw_outputs_P[:1000, :]
+    # ── Step 1: pick a single query point ────────────────────────────────────
+    query_idx   = 0
+    query_input = raw_inputs[query_idx, :]       # (4,)
+    query_T     = raw_outputs_T[query_idx, :]    # (O,)
+    query_P     = raw_outputs_P[query_idx, :]    # (O,)
 
-    #Track the bias and variance of the T and P predictions separately as a function of N_neighbors
-    bias_T = np.zeros(len(N_neigbors), dtype=float)
-    bias_P = np.zeros(len(N_neigbors), dtype=float)
-    var_T = np.zeros(len(N_neigbors), dtype=float)
-    var_P = np.zeros(len(N_neigbors), dtype=float)
-    mse_T = np.zeros(len(N_neigbors), dtype=float)
-    mse_P = np.zeros(len(N_neigbors), dtype=float)
+    # Remove query point from the pool so it can't appear in any training set
+    pool_inputs   = np.delete(raw_inputs,    query_idx, axis=0)   # (N-1, 4)
+    pool_outputs_T = np.delete(raw_outputs_T, query_idx, axis=0)  # (N-1, O)
+    pool_outputs_P = np.delete(raw_outputs_P, query_idx, axis=0)  # (N-1, O)
 
-    for NNidx, N_neighbor in enumerate(tqdm(N_neigbors)):
+    # ── Step 2: find the 5000 closest neighbours to the query point ───────────
+    X_pool = pool_inputs.T                                              # (4, N-1)
+    VI_pool = jnp.linalg.inv(jnp.cov(jnp.array(X_pool)))
+    dists   = np.array(_mahal_knn_single(
+                  jnp.array(X_pool),
+                  jnp.array(query_input),
+                  VI_pool,
+                  5000
+              ))   # indices of 5000 nearest neighbours in pool
 
-        guess_T = np.zeros(raw_outputs_T.shape, dtype=float)
-        guess_Terr = np.zeros(raw_outputs_T.shape, dtype=float)
-        guess_P = np.zeros(raw_outputs_P.shape, dtype=float)
-        guess_Perr = np.zeros(raw_outputs_P.shape, dtype=float)
+    # Subset pool to these 5000 neighbours
+    nbr_inputs    = pool_inputs[dists, :]      # (5000, 4)
+    nbr_outputs_T = pool_outputs_T[dists, :]   # (5000, O)
+    nbr_outputs_P = pool_outputs_P[dists, :]   # (5000, O)
 
-        for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
+    # ── Hyper-parameters ──────────────────────────────────────────────────────
+    N_sets        = 50
+    N_subset      = 1000
+    N_neigbors    = [10]
 
-            # Define the training data for CGP (all data points except the query point)
-            XTr = np.delete(
-                raw_inputs.T, #shape: (4, N)
-                query_idx,
-                axis=1
-                )
-            YTr = np.delete(
-                            np.hstack([raw_outputs_T, raw_outputs_P]).T,   # shape: (M, N)
-                            query_idx,
-                            axis=1
-                            )
-            
-            Yh, err_Yh = ens_CGP(
-                                jnp.array(XTr),
-                                jnp.array(YTr),
-                                query_input, 
-                                jnp.linalg.inv(jnp.cov(XTr)),
-                                N_neighbor, 
-                                refinement_iterations
-                )
-            guess_T[query_idx, :] = Yh[:O]
-            guess_P[query_idx, :] = Yh[O:]
-            guess_Terr[query_idx, :] = err_Yh[:O]
-            guess_Perr[query_idx, :] = err_Yh[O:]
+    # ── Step 3+4: for each K, run ens-CGP on 20 random subsets ───────────────
+    # predictions[k_idx, set_idx, :] = predicted Y for that K and subset
+    predictions_T = np.zeros((len(N_neigbors), N_sets, raw_outputs_T.shape[1]))
+    predictions_P = np.zeros((len(N_neigbors), N_sets, raw_outputs_P.shape[1]))
 
-            #Diagnostic plot
-            # fig, axs = plt.subplot_mosaic([['res_pressure', '.'],
-            #                                 ['results', 'res_temperature']],
-            #                         figsize=(8, 6),
-            #                         width_ratios=(3, 1), height_ratios=(1, 3),
-            #                         layout='constrained')        
-            # axs['results'].plot(query_output_T, query_output_P, '.', linestyle='-', color='blue', linewidth=2, label='Truth')
-            # axs['results'].errorbar(guess_T[query_idx, :], guess_P[query_idx, :], xerr=guess_Terr[query_idx, :], yerr=guess_Perr[query_idx, :], fmt='o', linestyle='-', color='green', linewidth=2, label='Prediction')
-            # axs['results'].invert_yaxis()
-            # axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
-            # axs['results'].set_xlabel('Temperature (K)')
-            # axs['results'].legend()
-            # axs['results'].grid()
+    rng = np.random.default_rng(42)
 
-            # axs['res_temperature'].errorbar(guess_T[query_idx, :] - query_output_T, query_output_P, xerr=guess_Terr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2)
-            # axs['res_temperature'].set_xlabel('Residuals (K)')
-            # axs['res_temperature'].invert_yaxis()
-            # axs['res_temperature'].grid()
-            # axs['res_temperature'].yaxis.tick_right()
-            # axs['res_temperature'].yaxis.set_label_position("right")
-            # axs['res_temperature'].sharey(axs['results'])
+    for set_idx in tqdm(range(N_sets), desc='Random subsets'):
 
-            # axs['res_pressure'].errorbar(query_output_T, guess_P[query_idx, :] - query_output_P, yerr=guess_Perr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2)
-            # axs['res_pressure'].set_ylabel('Residuals (bar)')
-            # axs['res_pressure'].invert_yaxis()
-            # axs['res_pressure'].grid()
-            # axs['res_pressure'].xaxis.tick_top()
-            # axs['res_pressure'].xaxis.set_label_position("top")
-            # axs['res_pressure'].sharex(axs['results'])
+        # Draw 500 random points from the 1000 neighbours
+        subset_idxs = rng.choice(1000, size=N_subset, replace=False)
 
-            # plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg')
-            # plt.close()
+        XTr = nbr_inputs[subset_idxs, :].T                              # (4, 500)
+        YTr = np.hstack([
+                  nbr_outputs_T[subset_idxs, :],
+                  nbr_outputs_P[subset_idxs, :]
+              ]).T                                                        # (M, 500)
 
-        #Compute bias and variance for T and P predictions
-        bias_T[NNidx] = np.mean(guess_T) - np.mean(raw_outputs_T)
-        bias_P[NNidx] = np.mean(guess_P) - np.mean(raw_outputs_P)
+        Xens_j = jnp.array(XTr)
+        Yens_j = jnp.array(YTr)
+        VI_j   = jnp.linalg.inv(jnp.cov(Xens_j))
 
-        var_T[NNidx] = np.mean( (guess_T - np.mean(guess_T))**2 )
-        var_P[NNidx] = np.mean( (guess_P - np.mean(guess_P))**2 )
+        for k_idx, N_neighbor in enumerate(N_neigbors):
+            Yh, _, it = ens_CGP(
+                Xens_j, Yens_j,
+                query_input,
+                VI_j,
+                N_neighbor,
+            )
+            print(f'Number of iterations: {it}')
+            predictions_T[k_idx, set_idx, :] = Yh[:O]
+            predictions_P[k_idx, set_idx, :] = Yh[O:]
 
-        mse_T[NNidx] = bias_T[NNidx]**2 + var_T[NNidx]
-        mse_P[NNidx] = bias_P[NNidx]**2 + var_P[NNidx]
+            fig, ax = plt.subplots(figsize=(8, 6))
 
-    #Plot bias and variance as a function of N_neighbors
-    fig, ax = plt.subplots(3, 2, sharex=True, figsize=(8, 6))
-    ax[0,0].plot(N_neigbors, bias_T, color='blue')
-    ax[0,1].plot(N_neigbors, bias_P, color='orange')
-    ax[1,0].plot(N_neigbors, var_T, color='blue', linestyle='--')
-    ax[1,1].plot(N_neigbors, var_P, color='orange', linestyle='--')
-    ax[2,0].plot(N_neigbors, mse_T, color='blue')
-    ax[2,1].plot(N_neigbors, mse_P, color='orange')
-    ax[2,0].set_xlabel('Number of Neighbors')
-    ax[2,1].set_xlabel('Number of Neighbors')
-    ax[0,0].set_ylabel('Bias T')
-    ax[0,1].set_ylabel('Bias P')
-    ax[1,0].set_ylabel('Variance T')
-    ax[1,1].set_ylabel('Variance P')
-    ax[2,0].set_ylabel('MSE T')
-    ax[2,1].set_ylabel('MSE P')
+            ax.plot(query_T, query_P, color='blue')
+            ax.plot(predictions_T[k_idx, set_idx, :], predictions_P[k_idx, set_idx, :], color='green')
+            ax.invert_yaxis()
+            plt.show()
+
+    # ── Step 5: compute bias and variance across the 20 predictions ───────────
+    # For a fixed query point and fixed K:
+    # E[ŷ] = mean over the 20 training sets  → axis=1
+    # Bias  = E[ŷ] - truth                   → scalar per K per output level
+    # Var   = E[(ŷ - E[ŷ])²]                 → scalar per K per output level
+    # Then average over output levels to get one number per K
+
+    bias_T = np.zeros(len(N_neigbors))
+    bias_P = np.zeros(len(N_neigbors))
+    var_T  = np.zeros(len(N_neigbors))
+    var_P  = np.zeros(len(N_neigbors))
+    mse_T  = np.zeros(len(N_neigbors))
+    mse_P  = np.zeros(len(N_neigbors))
+
+    for k_idx in range(len(N_neigbors)):
+
+        mean_pred_T = predictions_T[k_idx].mean(axis=0)   # (O,) — E[ŷ] over sets
+        mean_pred_P = predictions_P[k_idx].mean(axis=0)
+
+        # Bias: mean prediction minus truth, averaged over output levels
+        bias_T[k_idx] = np.mean(mean_pred_T - query_T)
+        bias_P[k_idx] = np.mean(mean_pred_P - query_P)
+
+        # Variance: mean over sets of squared deviation from mean prediction,
+        # then averaged over output levels
+        var_T[k_idx] = np.mean(
+            np.mean((predictions_T[k_idx] - mean_pred_T)**2, axis=0)
+        )
+        var_P[k_idx] = np.mean(
+            np.mean((predictions_P[k_idx] - mean_pred_P)**2, axis=0)
+        )
+
+        mse_T[k_idx] = bias_T[k_idx]**2 + var_T[k_idx]
+        mse_P[k_idx] = bias_P[k_idx]**2 + var_P[k_idx]
+
+    # ── Step 6: plot ──────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(3, 2, sharex=True, figsize=(10, 8))
+
+    for col, (b, v, m, label, color) in enumerate([
+        (np.abs(bias_T), var_T, mse_T, 'T (K)',         'blue'),
+        (np.abs(bias_P), var_P, mse_P, 'P (log10 bar)', 'orange'),
+    ]):
+        ax[0, col].plot(N_neigbors, b,  color=color, marker='o')
+        ax[0, col].axhline(0, color='black', linestyle='--', linewidth=0.8)
+        ax[0, col].set_ylabel(f'Bias {label}')
+
+        ax[1, col].plot(N_neigbors, v,  color=color, marker='o', linestyle='--')
+        ax[1, col].set_ylabel(f'Variance {label}')
+
+        ax[2, col].plot(N_neigbors, m,  color=color, marker='o')
+        ax[2, col].set_ylabel(f'MSE {label}')
+        ax[2, col].set_xlabel('Number of Neighbours K')
+
+    plt.suptitle(
+        rf'Query point — H$_2$: {query_input[0]:.2f} bar, '
+        rf'CO$_2$: {query_input[1]:.2f} bar, '
+        rf'LoD: {query_input[2]:.0f} days, '
+        rf'Obliquity: {query_input[3]:.0f}°',
+        fontsize=10
+    )
+    plt.tight_layout()
     plt.savefig(plot_save_path + 'Bias_Variance.pdf')
     plt.close()
