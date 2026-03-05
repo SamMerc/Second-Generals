@@ -51,11 +51,6 @@ raw_outputs_T = raw_outputs_T[rp, :]
 raw_outputs_P = raw_outputs_P[rp, :]
 
 ## HYPER-PARAMETERS ##
-#Definine partitiion for splitting NN dataset
-data_partition = [0.7, 0.1, 0.2]
-
-# Variable to show plots or not 
-show_plot = True
 
 #Distance metric to use
 distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
