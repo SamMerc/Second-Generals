@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from jax import jit, vmap
 from functools import partial
 from tqdm import tqdm
+from kneed import KneeLocator
 
 
 
@@ -316,8 +317,8 @@ X_features = np.hstack([
 (X_train, X_test,
  resid_T_train, resid_T_test,
  resid_P_train, resid_P_test,
- out_T_train,   out_T_test,
- out_P_train,   out_P_test) = train_test_split(
+ _,   out_T_test,
+ _,   out_P_test) = train_test_split(
     X_features, residuals_T, residuals_P,
     raw_outputs_T, raw_outputs_P,
     test_size=0.2, random_state=42
@@ -364,49 +365,119 @@ n_trees_T = xgb_T.best_iteration + 1
 n_trees_P = xgb_P.best_iteration + 1
 print(f"Trees used — T: {n_trees_T}, P: {n_trees_P}")
 
-# ── Corrected predictions ─────────────────────────────────────────────────────
 cgp_T_test = X_test[:, 4:4+O]
 cgp_P_test = X_test[:, 4+O:4+2*O]
 
-final_T = cgp_T_test + xgb_T.predict(X_test)
-final_P = cgp_P_test + xgb_P.predict(X_test)
+# ── Compute RMSE at each round across the full test set ───────────────────────
+# Collect prediction at every boosting round
+rounds = np.arange(1, max(n_trees_T, n_trees_P) + 1)
 
-# ── Evaluate ──────────────────────────────────────────────────────────────────
 rmse = lambda pred, truth: np.sqrt(np.mean((pred - truth)**2))
 
-print(f"RMSE T — CGP: {rmse(cgp_T_test, out_T_test):.4f}  |  CGP+XGB: {rmse(final_T, out_T_test):.4f}")
-print(f"RMSE P — CGP: {rmse(cgp_P_test, out_P_test):.4f}  |  CGP+XGB: {rmse(final_P, out_P_test):.4f}")
+# This is more informative than a single point — shows global convergence
+rmse_T_per_round = np.zeros(len(rounds))
+rmse_P_per_round = np.zeros(len(rounds))
+
+for r in tqdm(rounds, desc='Computing per-round RMSE'):
+    if r <= n_trees_T:
+        pred_full_T = cgp_T_test + xgb_T.predict(X_test, iteration_range=(0, r))
+        rmse_T_per_round[r-1] = np.sqrt(np.mean((pred_full_T - out_T_test)**2))
+    else:
+        rmse_T_per_round[r-1] = rmse_T_per_round[n_trees_T-1]
+
+    if r <= n_trees_P:
+        pred_full_P = cgp_P_test + xgb_P.predict(X_test, iteration_range=(0, r))
+        rmse_P_per_round[r-1] = np.sqrt(np.mean((pred_full_P - out_P_test)**2))
+    else:
+        rmse_P_per_round[r-1] = rmse_P_per_round[n_trees_P-1]
+
+knee_T = KneeLocator(rounds, rmse_T_per_round, curve='convex', direction='decreasing')
+knee_P = KneeLocator(rounds, rmse_P_per_round, curve='convex', direction='decreasing')
+
+# Compute mean and std of RMSE across CV folds at each round
+# With a single train/test split, approximate with bootstrap
+best_rmse_T = rmse_T_per_round[n_trees_T - 1]
+std_rmse_T  = np.std(rmse_T_per_round[max(0, n_trees_T-20):n_trees_T])
+
+best_rmse_P = rmse_P_per_round[n_trees_P - 1]
+std_rmse_P  = np.std(rmse_P_per_round[max(0, n_trees_P-20):n_trees_P])
+
+# Find earliest round within one std of best
+threshold_T = best_rmse_T + std_rmse_T
+conservative_T = np.argmax(rmse_T_per_round <= threshold_T) + 1
+threshold_P = best_rmse_P + std_rmse_P
+conservative_P = np.argmax(rmse_P_per_round <= threshold_P) + 1
+
+def find_threshold_round(rmse_per_round, pct=0.95):
+    """Find the round that captures pct of total improvement."""
+    initial_rmse = rmse_per_round[0]
+    final_rmse   = rmse_per_round[-1]
+    total_improvement = initial_rmse - final_rmse
+    target_rmse = initial_rmse - pct * total_improvement
+    return np.argmax(rmse_per_round <= target_rmse) + 1
+
+round_95_T = find_threshold_round(rmse_T_per_round, pct=0.95)
+round_95_P = find_threshold_round(rmse_P_per_round, pct=0.95)
+
+print(f"95% improvement T: {round_95_T} trees")
+print(f"95% improvement P: {round_95_P} trees")
+
+# Visualise
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 10))
+
+ax1.plot(rounds, rmse_T_per_round, color='blue', linewidth=1.5)
+ax1.axhline(rmse(cgp_T_test, out_T_test), color='grey', linestyle=':', label='CGP only')
+ax1.axvline(knee_T.knee, color='green', linewidth=2, linestyle='--', label=f'Knee @ {knee_T.knee}')
+ax1.axvline(conservative_T, color='red', linewidth=2, linestyle='--', label=rf'1$\sigma$ error rule @ {conservative_T}')
+ax1.axvline(round_95_T, color='black', linewidth=2, linestyle='--', label=f'95% improvement thresh. @ {round_95_T}')
+ax1.set_xlabel('Number of trees')
+ax1.set_ylabel('RMSE T (K)')
+ax1.set_title('T RMSE vs boosting round')
+ax1.legend()
+ax1.grid()
+
+ax2.plot(rounds, rmse_P_per_round, color='orange', linewidth=1.5)
+ax2.axhline(rmse(cgp_P_test, out_P_test), color='grey', linestyle=':', label='CGP only')
+ax2.axvline(knee_P.knee, color='green', linewidth=2, linestyle='--', label=f'Knee @ {knee_P.knee}')
+ax2.axvline(conservative_P, color='red', linewidth=2, linestyle='--', label=rf'1$\sigma$ error rule @ {conservative_P}')
+ax2.axvline(round_95_P, color='black', linewidth=2, linestyle='--', label=f'95% improvement thresh. @ {round_95_P}')
+ax2.set_xlabel('Number of trees')
+ax2.set_ylabel(r'RMSE P (log$_{10}$ bar)')
+ax2.set_title('P RMSE vs boosting round')
+ax2.legend()
+ax2.grid()
+plt.savefig(plot_save_path + 'RMS_vs_XGBit.pdf')
 
 # ── NN depth guidance ─────────────────────────────────────────────────────────
-max_trees = max(n_trees_T, n_trees_P)
+max_trees = max(knee_T.knee, knee_P.knee)
 print(f"\nXGBoost converged in {max_trees} trees of depth {4}")
 print(f"Suggested NN hidden layers : ~{max_trees // 10}")
 print(f"Suggested neurons per layer: ~{2 * O}")
 
+# ── Corrected predictions at knee point ───────────────────────────────────────
+
+final_T = cgp_T_test + xgb_T.predict(X_test, iteration_range=(0, knee_T.knee))
+final_P = cgp_P_test + xgb_P.predict(X_test, iteration_range=(0, knee_P.knee))
+
 # ── Plot ──────────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(2, 1, sharex=True, figsize=(12, 5))
+fig, axes = plt.subplots(2, 2, sharex=True, figsize=(12, 5))
 
-for ax, cgp, final, truth, label in zip(
-    axes,
-    [cgp_T_test, cgp_P_test],
-    [final_T,    final_P],
-    [out_T_test, out_P_test],
-    ['T (K)',    r'P (log$_{10}$ bar)']
-):
-    
-    for queryidx in range(int(0.2 * N)):
-        if queryidx == 0:
-            ax.plot(cgp[queryidx,:]   - truth[queryidx,:], alpha=0.1, color='blue',  label=f'CGP. Mean = {np.mean(cgp   - truth):.3f}, Std = {np.std(cgp   - truth):.3f}, RMSE = {rmse(cgp,   truth):.4f}')
-            ax.plot(final[queryidx,:]   - truth[queryidx,:], alpha=0.1, color='green', label=f'CGP+XGB. Mean = {np.mean(final   - truth):.3f}, Std = {np.std(final   - truth):.3f}, RMSE = {rmse(final,   truth):.4f}')
-        else:
-            ax.plot(cgp[queryidx,:]   - truth[queryidx,:], alpha=0.1, color='blue')
-            ax.plot(final[queryidx,:]   - truth[queryidx,:], alpha=0.1, color='green')
+for qid in range(int(0.2 * N)):
+    if qid == 0:
+        axes[0,0].plot(cgp_T_test[qid,:]-out_T_test[qid,:], color='green', label=f'CGP. Mean = {np.mean(cgp_T_test   - out_T_test):.3f}, Std = {np.std(cgp_T_test   - out_T_test):.3f}, RMSE = {rmse(cgp_T_test,   out_T_test):.4f}')
+        axes[1,0].plot(cgp_P_test[qid,:]-out_P_test[qid,:], color='green', label=f'CGP. Mean = {np.mean(cgp_P_test   - out_P_test):.3f}, Std = {np.std(cgp_P_test   - out_P_test):.3f}, RMSE = {rmse(cgp_P_test,   out_P_test):.4f}')
+        axes[0,1].plot(final_T[qid,:]-out_T_test[qid,:], color='blue', label=f'CGP+XGB. Mean = {np.mean(final_T   - out_T_test):.3f}, Std = {np.std(final_T   - out_T_test):.3f}, RMSE = {rmse(final_T,   out_T_test):.4f}')
+        axes[1,1].plot(final_P[qid,:]-out_P_test[qid,:], color='blue', label=f'CGP+XGB. Mean = {np.mean(final_P   - out_P_test):.3f}, Std = {np.std(final_P   - out_P_test):.3f}, RMSE = {rmse(final_P,   out_P_test):.4f}')
+    else:
+        axes[0,0].plot(cgp_T_test[qid,:]-out_T_test[qid,:], color='green')
+        axes[1,0].plot(cgp_P_test[qid,:]-out_P_test[qid,:], color='green')
+        axes[0,1].plot(final_T[qid,:]-out_T_test[qid,:], color='blue')
+        axes[1,1].plot(final_P[qid,:]-out_P_test[qid,:], color='blue')
 
-    ax.axhline(0, color='black', linestyle='--')
-    ax.set_ylabel(f'Residuals {label}')
-    ax.set_xlabel('Index')
-    ax.legend()
-    ax.grid()
+axes[0,0].set_ylabel(f'Residuals T (K)')
+axes[1,0].set_ylabel(f'Residuals P (log$_{10}$ bar)')
+axes[1,0].set_xlabel('Index')
+axes[1,1].set_xlabel('Index')
 
 plt.tight_layout()
 plt.savefig(plot_save_path + 'CGP_XGB_residuals.pdf')
