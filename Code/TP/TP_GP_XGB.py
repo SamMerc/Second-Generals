@@ -423,7 +423,7 @@ print(f"95% improvement T: {round_95_T} trees")
 print(f"95% improvement P: {round_95_P} trees")
 
 # Visualise
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 10))
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 6))
 
 ax1.plot(rounds, rmse_T_per_round, color='blue', linewidth=1.5)
 ax1.axhline(rmse(cgp_T_test, out_T_test), color='grey', linestyle=':', label='CGP only')
@@ -464,10 +464,10 @@ fig, axes = plt.subplots(2, 2, sharex=True, figsize=(12, 5))
 
 for qid in range(int(0.2 * N)):
     if qid == 0:
-        axes[0,0].plot(cgp_T_test[qid,:]-out_T_test[qid,:], color='green', label=f'CGP. Mean = {np.mean(cgp_T_test   - out_T_test):.3f}, Std = {np.std(cgp_T_test   - out_T_test):.3f}, RMSE = {rmse(cgp_T_test,   out_T_test):.4f}')
-        axes[1,0].plot(cgp_P_test[qid,:]-out_P_test[qid,:], color='green', label=f'CGP. Mean = {np.mean(cgp_P_test   - out_P_test):.3f}, Std = {np.std(cgp_P_test   - out_P_test):.3f}, RMSE = {rmse(cgp_P_test,   out_P_test):.4f}')
-        axes[0,1].plot(final_T[qid,:]-out_T_test[qid,:], color='blue', label=f'CGP+XGB. Mean = {np.mean(final_T   - out_T_test):.3f}, Std = {np.std(final_T   - out_T_test):.3f}, RMSE = {rmse(final_T,   out_T_test):.4f}')
-        axes[1,1].plot(final_P[qid,:]-out_P_test[qid,:], color='blue', label=f'CGP+XGB. Mean = {np.mean(final_P   - out_P_test):.3f}, Std = {np.std(final_P   - out_P_test):.3f}, RMSE = {rmse(final_P,   out_P_test):.4f}')
+        axes[0,0].plot(cgp_T_test[qid,:]-out_T_test[qid,:], color='green', label=f'CGP. Mean = {np.mean(cgp_T_test   - out_T_test):.4f}, Std = {np.std(cgp_T_test   - out_T_test):.4f}, RMSE = {rmse(cgp_T_test,   out_T_test):.4f}')
+        axes[1,0].plot(cgp_P_test[qid,:]-out_P_test[qid,:], color='green', label=f'CGP. Mean = {np.mean(cgp_P_test   - out_P_test):.4f}, Std = {np.std(cgp_P_test   - out_P_test):.4f}, RMSE = {rmse(cgp_P_test,   out_P_test):.4f}')
+        axes[0,1].plot(final_T[qid,:]-out_T_test[qid,:], color='blue', label=f'CGP+XGB. Mean = {np.mean(final_T   - out_T_test):.4f}, Std = {np.std(final_T   - out_T_test):.4f}, RMSE = {rmse(final_T,   out_T_test):.4f}')
+        axes[1,1].plot(final_P[qid,:]-out_P_test[qid,:], color='blue', label=f'CGP+XGB. Mean = {np.mean(final_P   - out_P_test):.4f}, Std = {np.std(final_P   - out_P_test):.4f}, RMSE = {rmse(final_P,   out_P_test):.4f}')
     else:
         axes[0,0].plot(cgp_T_test[qid,:]-out_T_test[qid,:], color='green')
         axes[1,0].plot(cgp_P_test[qid,:]-out_P_test[qid,:], color='green')
@@ -478,6 +478,10 @@ axes[0,0].set_ylabel(f'Residuals T (K)')
 axes[1,0].set_ylabel(f'Residuals P (log$_{10}$ bar)')
 axes[1,0].set_xlabel('Index')
 axes[1,1].set_xlabel('Index')
+
+for ax in axes.ravel():
+    ax.grid()
+    ax.legend()
 
 plt.tight_layout()
 plt.savefig(plot_save_path + 'CGP_XGB_residuals.pdf')
