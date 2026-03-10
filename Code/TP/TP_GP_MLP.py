@@ -17,7 +17,9 @@ from torchinfo import summary
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
 from tqdm import tqdm
-
+from jax import jit, vmap
+from functools import partial
+import jax.numpy as jnp
 
 
 ##########################################################
@@ -33,29 +35,47 @@ raw_T_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=
 #File containing pressure values
 raw_P_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/GP_TESTINGSTUFF/'
+model_save_path = base_dir+'Model_Storage/updatedensCGP_deeperMLP/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/GP_TESTINGSTUFF/'
+plot_save_path = base_dir+'Plots/updatedensCGP_deeperMLP/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
 #First 5 are the input values (H2 pressure in bar, CO2 pressure in bar, LoD in hours, Obliquity in deg, H2+Co2 pressure) but we remove the last one since it's not adding info.
 raw_inputs = raw_T_data[:, :4]
-GP_raw_inputs = raw_inputs - np.mean(raw_inputs)
 raw_outputs_T = raw_T_data[:, 5:]
-GP_raw_outputs_T = raw_outputs_T - np.mean(raw_outputs_T)
 raw_outputs_P = raw_P_data[:, 5:]
 #Convert raw outputs to log10 scale so we don't have to deal with it later
 raw_outputs_P = np.log10(raw_outputs_P/1000)
-GP_raw_outputs_P = raw_outputs_P - np.mean(raw_outputs_P)
 
 #Storing useful quantitites
 N = raw_inputs.shape[0] #Number of data points
 D = raw_inputs.shape[1] #Number of features
 O = raw_outputs_T.shape[1] #Number of outputs
 
-## HYPER-PARAMETERS ##
+# Shuffle data
+rp = np.random.permutation(N) #random permutation of the indices
+# Apply random permutation to shuffle the data
+raw_inputs = raw_inputs[rp, :]
+raw_outputs_T = raw_outputs_T[rp, :]
+raw_outputs_P = raw_outputs_P[rp, :]
+
+## HYPER-PARAMETERS for ens-CGP ##
+
+#Number of nearest neighbors to choose
+N_neighbor = 4
+
+#Distance metric to use
+distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
+
+#Convert raw inputs for H2 and CO2 pressures to log10 scale so don't have to deal with it later
+if 'logged' in distance_metric:
+    raw_inputs[:, 0] = np.log10(raw_inputs[:, 0]) #H2
+    raw_inputs[:, 1] = np.log10(raw_inputs[:, 1]) #CO2
+
+
+## HYPER-PARAMETERS for NN ##
 #Definine partitiion for splitting NN dataset
 data_partition = [0.7, 0.1, 0.2]
 
@@ -81,17 +101,11 @@ NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
 # Variable to show plots or not 
-show_plot = True
-
-#Number of nearest neighbors to choose
-N_neigbors = np.linspace(5, 200, 5, dtype=int).tolist()
-
-#Distance metric to use
-distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
+show_plot = False
 
 #Neural network width and depth
 nn_width = 102
-nn_depth = 5
+nn_depth = 10
 
 #Optimizer learning rate
 learning_rate = 1e-3
@@ -115,10 +129,6 @@ n_epochs = 10000
 #Mode for optimization
 run_mode = 'use'
 
-#Convert raw inputs for H2 and CO2 pressures to log10 scale so don't have to deal with it later
-if 'logged' in distance_metric:
-    raw_inputs[:, 0] = np.log10(raw_inputs[:, 0]) #H2
-    raw_inputs[:, 1] = np.log10(raw_inputs[:, 1]) #CO2
 
 
 
@@ -126,44 +136,118 @@ if 'logged' in distance_metric:
 
 
 
-############################
-#### Build ensemble CGP ####
-############################
-def Sai_CGP(obs_features, obs_labels, query_features):
+
+###############################################
+#### Ensemble Conditional Gaussian Process ####
+###############################################
+# ── JAX KNN ───────────────────────────────────────────────────────────────────
+@partial(jit, static_argnames=('k',))
+def _mahal_knn_single(X_train, xq, VI, k):
+    """Single query point. X_train: (D, N), xq: (D,), returns (k,)"""
+    diff = X_train - xq[:, None]                     # (D, N)
+    dists_sq = jnp.sum(diff * (VI @ diff), axis=0)   # (N,)
+    return jnp.argsort(dists_sq)[:k]
+
+@partial(jit, static_argnames=('k',))
+def _mahal_knn_batch(X_train, X_queries, VI, k):
+    """Batch of query points. X_queries: (D, Q), returns (Q, k)"""
+    def single(xq):
+        diff = X_train - xq[:, None]
+        dists_sq = jnp.sum(diff * (VI @ diff), axis=0)
+        return jnp.argsort(dists_sq)[:k]
+    return vmap(single)(X_queries.T)
+
+# ── JAX CGP step ──────────────────────────────────────────────────────────────
+@partial(jit, static_argnames=('N_neighbor',))
+def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
+    """idxs is always shape (N_neighbor,) — no dynamic shapes."""
+    Xens_NN = Xens[:, idxs]   # shape always (D, N_neighbor) ← fixed!
+    Yens_NN = Yens[:, idxs]   # shape always (M, N_neighbor) ← fixed!
+
+    Xm = Xens_NN.mean(axis=1, keepdims=True)
+    Ym = Yens_NN.mean(axis=1, keepdims=True)
+    dX = Xens_NN - Xm
+    dY = Yens_NN - Ym
+
+    Cxx = dX @ dX.T
+    Cyx = dY @ dX.T
+    Cyy = dY @ dY.T
+    Cxy = dX @ dY.T
+
+    rdgx = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cxx)))
+    rdgy = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cyy)))
+
+    Mf = Cyx @ jnp.linalg.pinv(Cxx + rdgx * jnp.eye(Cxx.shape[0]))
+    Mb = Cxy @ jnp.linalg.pinv(Cyy + rdgy * jnp.eye(Cyy.shape[0]))
+
+    YhSel = Yens_NN + Mf @ (Xq - Xens_NN)
+    XhSel = Xens_NN + Mb @ (Ym - YhSel)
+
+    # Fixed-size unique: always returns exactly N_neighbor indices
+    idxs2 = _mahal_knn_batch(Xens, XhSel, VI, 1).flatten()   # (N_neighbor,)
+    idxs_new = jnp.unique(idxs2, size=N_neighbor,
+                          fill_value=-1)                       # (N_neighbor,)
+
+    # Top-up: always pull N_neighbor candidates from Xq, use where idxs_new has fill
+    idxs_topup = _mahal_knn_single(Xens, Xq.ravel(), VI, N_neighbor)
+    idxs_final = jnp.where(idxs_new >= 0, idxs_new, idxs_topup)
+
+    Yh     = Ym + Mf @ (Xq - Xm)
+    cov_Yh = Cyy - Mf @ Cxy
+
+    return idxs_final, Mf, Cxy, Xm, Ym, Yh, cov_Yh
+
+# ── Main function ─────────────────────────────────────────────────────────────
+def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=1000):
     """
-    Conditional Gaussian Process
-    Inputs: 
-        obs_features : ndarray (D, N)
-            D-dimensional features of the N ensemble data points.
-        obs_labels : ndarray (K, N)
-            K-dimensional labels of the N ensemble data points.
-        query_features : ndarray (D, 1)
-            D-dimensional features of the query data point.
-    Outputs:
-        query_labels : ndarray (K, N)
-            K-dimensional labels of the ensemble updated from the query point.
-        query_cov_labels : ndarray (K, K)
-            K-by-K covariance of the ensemble labels.
+    Parameters:
+    Xens_j: array of input features which compose the ensemble. shape:(D, N) 
+    Yens_j: array of input labels which compose the ensemble. shape:(M, N) 
+    Xq: query point for which we want to compute a prediction. shape:(D,) or (D,1)
+    VI_j: inverse of the covariance matrix for the input ensemble. shape:(D, D)
+    N_neighbor: int, number of neighbors to use in CGP
+    tol: float, convergence threshold on average relative change in prediction (default 1%)
+    max_iter: int, safety cap on number of iterations (default 100)
     """
-    
-    # Defining relevant covariance matrices
-    ## Between feature and label of observation data
-    Cyx = (obs_labels @ obs_features.T) / (obs_features.shape[0] - 1)
-    ## Between label and feature of observation data
-    Cxy = (obs_features @ obs_labels.T) / (obs_features.shape[0] - 1)
-    ## Between feature and feature of observation data
-    Cxx = (obs_features @ obs_features.T) / (obs_features.shape[0] - 1)
-    ## Between label and label of observation data
-    Cyy = (obs_labels @ obs_labels.T) / (obs_features.shape[0] - 1)
-    ## Adding regularizer to avoid singularities
-    Cxx += 1e-6 * np.eye(Cxx.shape[0]) 
+    Xq_j = jnp.array(Xq.ravel())   # (D,)
 
-    query_labels = obs_labels + (Cyx @ scipy.linalg.pinv(Cxx) @ (query_features - obs_features))
+    idxs = _mahal_knn_single(Xens_j, Xq_j, VI_j, N_neighbor)
 
-    query_cov_labels = Cyy - Cyx @ scipy.linalg.pinv(Cxx) @ Cxy
+    # Run first iteration to get an initial prediction
+    idxs, _, _, _, _, Yh_prev, cov_Yh = _cgp_step_fixed(
+        Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
+    )
+    Yh_prev = np.array(Yh_prev.flatten())
 
-    return query_labels, query_cov_labels
+    rel_change_history = []
 
+    for i in range(max_iter - 1):
+        idxs, _, _, _, _, Yh, cov_Yh = _cgp_step_fixed(
+            Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
+        )
+        Yh = np.array(Yh.flatten())
+
+        # Average relative change between this and previous prediction
+        # Add small epsilon to denominator to avoid division by zero
+        rel_change = np.mean(
+            np.abs(Yh - Yh_prev) / (np.abs(Yh_prev) + 1e-10)
+        )
+
+        if rel_change < tol:
+            break
+
+        # Oscillation detection: count how many times the current value
+        # has appeared in the full history
+        n_repeats = np.sum(np.isclose(rel_change_history, rel_change, rtol=1e-3))
+        if n_repeats >= 5:
+            break
+
+        rel_change_history.append(rel_change)
+
+        Yh_prev = Yh
+
+    err_Yh = jnp.sqrt(jnp.maximum(0.0, jnp.diag(cov_Yh)))
+    return Yh, np.array(err_Yh), i + 2   # +2 because of the initial iteration before the loop
 
 
 
@@ -289,154 +373,82 @@ summary(model)
 #### Build training set ####
 ############################
 
-if type(N_neigbors)==int:
-    print('BUILDING GP TRAINING SET')
-    N_neighbor = N_neigbors
-    # Initialize array to store NN inputs / GP outputs
-    NN_inputs_T = np.zeros(raw_outputs_T.shape, dtype=float)
-    NN_inputs_P = np.zeros(raw_outputs_P.shape, dtype=float)
 
-    for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(GP_raw_inputs, GP_raw_outputs_T, GP_raw_outputs_P)):
+print('BUILDING GP TRAINING SET')
 
-        #Calculate proximity of query point to observations
-        distances = np.sqrt( (query_input[0] - raw_inputs[:,0])**2 + (query_input[1] - raw_inputs[:,1])**2 + (query_input[2] - raw_inputs[:,2])**2 + (query_input[3] - raw_inputs[:,3])**2 )
+# Initialize array to store NN inputs / GP outputs
+GP_outputs_T = np.zeros(raw_outputs_T.shape, dtype=float)
+GP_outputs_P = np.zeros(raw_outputs_P.shape, dtype=float)
+GP_outputs_Terr = np.zeros(raw_outputs_T.shape, dtype=float)
+GP_outputs_Perr = np.zeros(raw_outputs_P.shape, dtype=float)
 
-        #Choose the N closest points
-        # skip the first point since it corresponds to the query point itself
-        N_closest_idx = np.argsort(distances)[1:N_neighbor+1]
-        prox_train_inputs = raw_inputs[N_closest_idx, :]
-        prox_train_outputs_T = raw_outputs_T[N_closest_idx, :]
-        prox_train_outputs_P = raw_outputs_P[N_closest_idx, :]
+for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
 
-        #Find the query labels from nearest neigbours
-        mean_test_output, cov_test_output = Sai_CGP(prox_train_inputs.T, np.concat((prox_train_outputs_T, prox_train_outputs_P), axis=1).T, query_input.reshape((1, 4)).T)
-        model_test_output_T = np.mean(mean_test_output[:O],axis=1)
-        model_test_output_P = np.mean(mean_test_output[O:],axis=1)
-        model_test_output_Terr = np.sqrt(np.diag(cov_test_output))[:O]
-        model_test_output_Perr = np.sqrt(np.diag(cov_test_output))[O:]
-        NN_inputs_T[query_idx, :] = model_test_output_T
-        NN_inputs_P[query_idx, :] = model_test_output_P
-
-        #Diagnostic plot
-        if show_plot:
-
-            #Plot TP profiles
-            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12, 6))
-            
-            #ax1 : prediction, truth and the neighbors
-            for prox_idx in range(N_neighbor):
-                ax1.plot(prox_train_outputs_T[prox_idx], prox_train_outputs_P[prox_idx], '.', linestyle='-', color='red', alpha=0.1, linewidth=2, zorder=1, label='Ensemble' if prox_idx==0 else None)
-            
-            #ax2 : prediction, truth and prediction errorbars in T
-            ax2.errorbar(model_test_output_T, model_test_output_P, xerr=model_test_output_Terr, fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4)
-            ax2.fill_betweenx(model_test_output_P, model_test_output_T-model_test_output_Terr, model_test_output_T+model_test_output_Terr, color='green', zorder=2, alpha=0.2)
-            #ax3 : prediction, truth and prediction errorbars in P
-            ax3.errorbar(model_test_output_T, model_test_output_P, yerr=model_test_output_Perr, fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4)
-            ax3.fill_between(model_test_output_T, model_test_output_P-model_test_output_Perr, model_test_output_P+model_test_output_Perr, color='green', zorder=2, alpha=0.2)
-
-            for ax in [ax1, ax2, ax3]:
-                ax.plot(model_test_output_T, model_test_output_P, '.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=3, label='Prediction')
-
-                ax.plot(query_output_T, query_output_P, '.', linestyle='-', color='blue', linewidth=2, zorder=3, markersize=10, label='Truth')
-
-                ax.invert_yaxis()
-                
-                if ax == ax1 : ax.set_ylabel(r'log$_{10}$ Pressure (bar)')
-                ax.set_xlabel('Temperature (K)')
-                
-                ax.grid()
-                ax.legend()        
-
-            plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg')
-            plt.subplots_adjust(wspace=0.2)
-            plt.show()
-
-elif type(N_neigbors) == list:
-    print('DIAGNOSTIC PLOTTING')
-    #bias estimator
-    bias_estim_T = np.zeros(len(N_neigbors), dtype=float)
-    bias_estim_P = np.zeros(len(N_neigbors), dtype=float)
+    #Define ensemble without the query point
+    XTr = np.delete(
+                raw_inputs.T,
+                query_idx,
+                axis=1
+                )                           # (4, N)
     
-    #variance estimator
-    var_estim_T = np.zeros(len(N_neigbors), dtype=float)
-    var_estim_P = np.zeros(len(N_neigbors), dtype=float)
+    YTr = np.delete(
+        np.hstack([raw_outputs_T, raw_outputs_P]).T,   # shape: (M, N)
+        query_idx,
+        axis=1
+        )                                   # (O, N)
 
-    #Loop over possible N_Neighbors values
-    for n_idx, N_neighbor in enumerate(tqdm(N_neigbors)):
+    Xens_j = jnp.array(XTr)
+    Yens_j = jnp.array(YTr)
+    VI_j   = jnp.linalg.inv(jnp.cov(Xens_j))
+
+    #Call the ens-CGP
+    Yh, Yh_err, it = ens_CGP(
+                Xens_j, Yens_j,
+                query_input,
+                VI_j,
+                N_neighbor,
+            )
+    
+    #Store outputs
+    GP_outputs_T[query_idx, :] = Yh[:O]
+    GP_outputs_Terr[query_idx, :] = Yh_err[:O]
+    GP_outputs_P[query_idx, :] = Yh[O:]
+    GP_outputs_Perr[query_idx, :] = Yh_err[O:]
+
+    #Diagnostic plot
+    if show_plot:
+
+        #Plot TP profiles
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
         
-        # Initialize array to store NN inputs / GP outputs
-        NN_inputs_T = np.zeros(raw_outputs_T.shape, dtype=float)
-        NN_inputs_P = np.zeros(raw_outputs_P.shape, dtype=float)
-        NN_inputs_Terr = np.zeros(raw_outputs_T.shape, dtype=float)
-        NN_inputs_Perr = np.zeros(raw_outputs_P.shape, dtype=float)
+        #ax1 : prediction, truth and prediction errorbars in T
+        ax1.errorbar(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :], xerr=GP_outputs_Terr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4, label='Prediction')
+        ax1.fill_betweenx(GP_outputs_P[query_idx, :], GP_outputs_T[query_idx, :]-GP_outputs_Terr[query_idx, :], GP_outputs_T[query_idx, :]+GP_outputs_Terr[query_idx, :], color='green', zorder=2, alpha=0.2)
+        
+        #ax2 : prediction, truth and prediction errorbars in P
+        ax2.errorbar(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :], yerr=GP_outputs_Perr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4, label='Prediction')
+        ax2.fill_between(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :]-GP_outputs_Perr[query_idx, :], GP_outputs_P[query_idx, :]+GP_outputs_Perr[query_idx, :], color='green', zorder=2, alpha=0.2)
 
-        for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(GP_raw_inputs, GP_raw_outputs_T, GP_raw_outputs_P)):
+        for ax in [ax1, ax2]:
 
-            #Calculate proximity of query point to observations
-            distances = np.sqrt( (query_input[0] - raw_inputs[:,0])**2 + (query_input[1] - raw_inputs[:,1])**2 + (query_input[2] - raw_inputs[:,2])**2 + (query_input[3] - raw_inputs[:,3])**2 )
+            ax.plot(query_output_T, query_output_P, '.', linestyle='-', color='blue', linewidth=2, zorder=3, markersize=10, label='Truth')
 
-            #Choose the N closest points
-            # skip the first point since it corresponds to the query point itself
-            N_closest_idx = np.argsort(distances)[1:N_neighbor+1]
-            prox_train_inputs = raw_inputs[N_closest_idx, :]
-            prox_train_outputs_T = raw_outputs_T[N_closest_idx, :]
-            prox_train_outputs_P = raw_outputs_P[N_closest_idx, :]
-
-            #Find the query labels from nearest neigbours
-            mean_test_output, cov_test_output = Sai_CGP(prox_train_inputs.T, np.concat((prox_train_outputs_T, prox_train_outputs_P), axis=1).T, query_input.reshape((1, 4)).T)
+            ax.invert_yaxis()
             
-            model_test_output_T = np.mean(mean_test_output[:O],axis=1)
-            model_test_output_P = np.mean(mean_test_output[O:],axis=1)
-            model_test_output_Terr = np.sqrt(np.diag(cov_test_output))[:O]
-            model_test_output_Perr = np.sqrt(np.diag(cov_test_output))[O:]
+            if ax == ax1 : ax.set_ylabel(r'log$_{10}$ Pressure (bar)')
+            ax.set_xlabel('Temperature (K)')
             
-            NN_inputs_T[query_idx, :] = model_test_output_T
-            NN_inputs_P[query_idx, :] = model_test_output_P
-            NN_inputs_Terr[query_idx, :] = model_test_output_Terr
-            NN_inputs_Perr[query_idx, :] = model_test_output_Perr
+            ax.grid()
+            ax.legend()        
 
-        # Calculate bias estimator (for T and P separately)
-        bias_estim_T[n_idx] = np.sqrt(np.mean((NN_inputs_T - raw_outputs_T)**2))  # RMSE over all points & levels
-        bias_estim_P[n_idx] = np.sqrt(np.mean((NN_inputs_P - raw_outputs_P)**2))
+        plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Number of iterations: {it}')
+        plt.subplots_adjust(wspace=0.2)
+        plt.show()
 
-        # Calculate variance estimator (for T and P separately)
-        var_estim_T[N_neigbors.index(N_neighbor)] = np.mean(NN_inputs_Terr**2)
-        var_estim_P[n_idx] = np.mean(NN_inputs_Perr**2)
+# argets are residuals: truth - GP prediction
+residuals_T = raw_outputs_T - GP_outputs_T   # (N, O)
+residuals_P = raw_outputs_P - GP_outputs_P   # (N, O)
 
-    #Combine bias estimators to get a bias for the full prediction
-    # Normalize T and P bias estimators with the mean values to remove scales that could lead to one of the estimators biasing the total
-    bias_estim = ((bias_estim_T / np.mean(raw_outputs_T)) + (bias_estim_P / np.mean(raw_outputs_P))) / 2.
-    var_estim = (var_estim_T + var_estim_P) / 2.
-    print(bias_estim_T, bias_estim_P, bias_estim, np.mean(raw_outputs_T), np.mean(raw_outputs_P))
-    print(var_estim_T, var_estim_P, var_estim)
-    
-    #Plot the bias and variance estimators as a function of the number of neighbors 
-    fig, axes = plt.subplots(2, 3, sharex=True, figsize=(12, 8))
-    
-    axes[0,0].plot(N_neigbors, bias_estim_T, markersize=10, linestyle='-', color='blue')
-    axes[0,1].plot(N_neigbors, bias_estim_P, markersize=10, linestyle='-', color='blue')
-    axes[0,2].plot(N_neigbors, bias_estim, markersize=10, linestyle='-', color='blue')
-    
-    axes[1,0].plot(N_neigbors, var_estim_T, markersize=10, linestyle='-', color='blue')
-    axes[1,1].plot(N_neigbors, var_estim_P, markersize=10, linestyle='-', color='blue')
-    axes[1,2].plot(N_neigbors, var_estim, markersize=10, linestyle='-', color='blue')
-    
-    titles_row0 = ['Bias T', 'Bias P', 'Bias Combined']
-    titles_row1 = ['Var T', 'Var P', 'Var Combined']
-    for j in range(3):
-        axes[0,j].set_title(titles_row0[j])
-        axes[1,j].set_title(titles_row1[j])
-        axes[0,j].grid(True)
-        axes[1,j].grid(True)
-        axes[1,j].set_xlabel('N neighbors')
-    
-    plt.subplots_adjust(hspace=0.1, wspace=0.1)
-    plt.show()
-
-    raise KeyboardInterrupt('Done diagnostic plotting. Re-run with fixed N_neighbors for model training.')
-
-else:
-    raise KeyboardInterrupt('Invalid number of neighbors variable. Should be a list of int type.')
 # Split training dataset into training, validation, and testing, and format it correctly
 
 ## Retrieving indices of data partitions
@@ -444,21 +456,22 @@ train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(N), data_pa
 
 ## Generate the data partitions
 ### Training
-NN_train_inputs_T = torch.tensor(NN_inputs_T[train_idx], dtype=torch.float32)
-NN_train_inputs_P = torch.tensor(NN_inputs_P[train_idx], dtype=torch.float32)
-NN_train_outputs_T = torch.tensor(raw_outputs_T[train_idx], dtype=torch.float32)
-NN_train_outputs_P = torch.tensor(raw_outputs_P[train_idx], dtype=torch.float32)
+NN_train_inputs_T = torch.tensor(GP_outputs_T[train_idx], dtype=torch.float32)
+NN_train_inputs_P = torch.tensor(GP_outputs_P[train_idx], dtype=torch.float32)
+NN_train_outputs_T = torch.tensor(residuals_T[train_idx], dtype=torch.float32)
+NN_train_outputs_P = torch.tensor(residuals_P[train_idx], dtype=torch.float32)
 ### Validation
-NN_valid_inputs_T = torch.tensor(NN_inputs_T[valid_idx], dtype=torch.float32)
-NN_valid_inputs_P = torch.tensor(NN_inputs_P[valid_idx], dtype=torch.float32)
-NN_valid_outputs_T = torch.tensor(raw_outputs_T[valid_idx], dtype=torch.float32)
-NN_valid_outputs_P = torch.tensor(raw_outputs_P[valid_idx], dtype=torch.float32)
+NN_valid_inputs_T = torch.tensor(GP_outputs_T[valid_idx], dtype=torch.float32)
+NN_valid_inputs_P = torch.tensor(GP_outputs_P[valid_idx], dtype=torch.float32)
+NN_valid_outputs_T = torch.tensor(residuals_T[valid_idx], dtype=torch.float32)
+NN_valid_outputs_P = torch.tensor(residuals_P[valid_idx], dtype=torch.float32)
 ### Testing
-NN_test_inputs_T = torch.tensor(NN_inputs_T[test_idx], dtype=torch.float32)
-NN_test_inputs_P = torch.tensor(NN_inputs_P[test_idx], dtype=torch.float32)
-NN_test_outputs_T = torch.tensor(raw_outputs_T[test_idx], dtype=torch.float32)
-NN_test_outputs_P = torch.tensor(raw_outputs_P[test_idx], dtype=torch.float32)
-
+NN_test_inputs_T = torch.tensor(GP_outputs_T[test_idx], dtype=torch.float32)
+NN_test_inputs_P = torch.tensor(GP_outputs_P[test_idx], dtype=torch.float32)
+NN_test_outputs_T = torch.tensor(residuals_T[test_idx], dtype=torch.float32)
+NN_test_outputs_P = torch.tensor(residuals_P[test_idx], dtype=torch.float32)
+NN_test_true_T = torch.tensor(raw_outputs_T[test_idx], dtype=torch.float32)
+NN_test_true_P = torch.tensor(raw_outputs_P[test_idx], dtype=torch.float32)
 NN_test_og_inputs = torch.tensor(raw_inputs[test_idx], dtype=torch.float32) 
 
 ## Concatenating inputs and outputs
@@ -758,29 +771,39 @@ GP_res_P = np.zeros(NN_test_outputs_P.shape, dtype=float)
 NN_res_T = np.zeros(NN_test_outputs_P.shape, dtype=float)
 NN_res_P = np.zeros(NN_test_outputs_P.shape, dtype=float)
 
-for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, NN_test_output_T, NN_test_output_P) in enumerate(zip(NN_test_og_inputs, NN_test_inputs_T, NN_test_inputs_P, NN_test_outputs_T, NN_test_outputs_P)):
-
+for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, 
+                  NN_test_output_T, NN_test_output_P,
+                  true_T, true_P) in enumerate(zip(
+    NN_test_og_inputs,
+    NN_test_inputs_T, NN_test_inputs_P,
+    NN_test_outputs_T, NN_test_outputs_P,   # these are now residuals
+    NN_test_true_T, NN_test_true_P          # these are the actual profiles
+)):
     #Retrieve prediction
     scaled_GP_test_output_T = torch.tensor(in_scaler_T.transform(GP_test_output_T.reshape(1, -1)), dtype=torch.float32)
     scaled_GP_test_output_P = torch.tensor(in_scaler_P.transform(GP_test_output_P.reshape(1, -1)), dtype=torch.float32)
     scaled_input = torch.cat([scaled_GP_test_output_T, scaled_GP_test_output_P], dim=1)
 
-    NN_pred_output = model(torch.tensor(scaled_input, dtype=torch.float32)).detach().numpy()
+    NN_pred_output = model(scaled_input).detach().numpy()
     
-    #Inverse scaling
-    pred_T_scaled = NN_pred_output[:, :O]
-    pred_P_scaled = NN_pred_output[:, O:]
-    NN_pred_output_T = out_scaler_T.inverse_transform(pred_T_scaled.reshape(1, -1)).flatten()
-    NN_pred_output_P = out_scaler_P.inverse_transform(pred_P_scaled.reshape(1, -1)).flatten()
+    #Inverse scaling - NN predicts the residuals not the profile
+    pred_resid_T = out_scaler_T.inverse_transform(NN_pred_output[:, :O].reshape(1, -1)).flatten()
+    pred_resid_P = out_scaler_P.inverse_transform(NN_pred_output[:, O:].reshape(1, -1)).flatten()
+
+    # Final prediction = GP prediction + NN residual correction
+    NN_pred_output_T = GP_test_output_T.numpy() + pred_resid_T
+    NN_pred_output_P = GP_test_output_P.numpy() + pred_resid_P
 
     #Convert to numpy
+    true_T_np = true_T.cpu().numpy()
+    true_P_np = true_P.cpu().numpy()
     NN_test_input = NN_test_input.cpu().numpy()
 
     #Storing residuals 
-    GP_res_T[NN_test_idx, :] = GP_test_output_T - NN_test_output_T
-    GP_res_P[NN_test_idx, :] = GP_test_output_P - NN_test_output_P
-    NN_res_T[NN_test_idx, :] = NN_pred_output_T - NN_test_output_T
-    NN_res_P[NN_test_idx, :] = NN_pred_output_P - NN_test_output_P
+    GP_res_T[NN_test_idx, :] = GP_test_output_T.numpy() - true_T_np
+    GP_res_P[NN_test_idx, :] = GP_test_output_P.numpy() - true_P_np
+    NN_res_T[NN_test_idx, :] = NN_pred_output_T - true_T_np
+    NN_res_P[NN_test_idx, :] = NN_pred_output_P - true_P_np
 
     #Plotting
     if (NN_test_idx % substep == 0):
@@ -789,7 +812,7 @@ for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, NN_test_out
                               figsize=(8, 6),
                               width_ratios=(3, 1), height_ratios=(1, 3),
                               layout='constrained')        
-        axs['results'].plot(NN_test_output_T, NN_test_output_P, '.', linestyle='-', color='blue', linewidth=2, label='Truth')
+        axs['results'].plot(true_T_np, true_P_np, '.', linestyle='-', color='blue', linewidth=2, label='Truth')
         axs['results'].plot(NN_pred_output_T, NN_pred_output_P, color='green', linewidth=2, label='NN prediction')
         axs['results'].plot(GP_test_output_T, GP_test_output_P, color='red', linewidth=2, label='GP prediction')
         axs['results'].invert_yaxis()
@@ -798,8 +821,8 @@ for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, NN_test_out
         axs['results'].legend()
         axs['results'].grid()
 
-        axs['res_temperature'].plot(NN_res_T[NN_test_idx, :], NN_test_output_P, '.', linestyle='-', color='green', linewidth=2)
-        axs['res_temperature'].plot(GP_res_T[NN_test_idx, :], NN_test_output_P, '.', linestyle='-', color='red', linewidth=2)
+        axs['res_temperature'].plot(NN_res_T[NN_test_idx, :], true_P_np, '.', linestyle='-', color='green', linewidth=2)
+        axs['res_temperature'].plot(GP_res_T[NN_test_idx, :], true_P_np, '.', linestyle='-', color='red', linewidth=2)
         axs['res_temperature'].set_xlabel('Residuals (K)')
         axs['res_temperature'].invert_yaxis()
         axs['res_temperature'].grid()
@@ -808,8 +831,8 @@ for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, NN_test_out
         axs['res_temperature'].yaxis.set_label_position("right")
         axs['res_temperature'].sharey(axs['results'])
 
-        axs['res_pressure'].plot(NN_test_output_T, NN_res_P[NN_test_idx, :], '.', linestyle='-', color='green', linewidth=2)
-        axs['res_pressure'].plot(NN_test_output_T, GP_res_P[NN_test_idx, :], '.', linestyle='-', color='red', linewidth=2)
+        axs['res_pressure'].plot(true_T_np, NN_res_P[NN_test_idx, :], '.', linestyle='-', color='green', linewidth=2)
+        axs['res_pressure'].plot(true_T_np, GP_res_P[NN_test_idx, :], '.', linestyle='-', color='red', linewidth=2)
         axs['res_pressure'].set_ylabel('Residuals (bar)')
         axs['res_pressure'].invert_yaxis()
         axs['res_pressure'].grid()
