@@ -22,18 +22,26 @@ def check_and_make_dir(dir):
 #Base directory 
 base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing temperature values
-raw_T_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
+raw_T_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_T.csv', delimiter=',')
+raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
 #File containing pressure values
-raw_P_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
+raw_P_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_P.csv', delimiter=',')
+raw_P_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 #Path to store plots
 plot_save_path = base_dir+'Plots/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
 #First 5 are the input values (H2 pressure in bar, CO2 pressure in bar, LoD in hours, Obliquity in deg, H2+Co2 pressure) but we remove the last one since it's not adding info.
-raw_inputs = raw_T_data[:, :4]
-raw_outputs_T = raw_T_data[:, 5:]
-raw_outputs_P = raw_P_data[:, 5:]
+# Extract the 4 physical inputs and append stellar temperature as 5th column
+inputs_3000 = np.hstack([raw_T_data3000[:, :4], np.full((len(raw_T_data3000), 1), 3000.0)])
+inputs_4500 = np.hstack([raw_T_data4500[:, :4], np.full((len(raw_T_data4500), 1), 4500.0)])
+
+# Concatenate along the sample axis
+raw_inputs    = np.vstack([inputs_3000,            inputs_4500           ])  # (N_3000+N_4500, 5)
+raw_outputs_T = np.vstack([raw_T_data3000[:, 5:],  raw_T_data4500[:, 5:]])  # (N_3000+N_4500, O)
+raw_outputs_P = np.vstack([raw_P_data3000[:, 5:],  raw_P_data4500[:, 5:]])  # (N_3000+N_4500, O)
+
 #Convert raw outputs to log10 scale so we don't have to deal with it later
 raw_outputs_P = np.log10(raw_outputs_P/1000)
 
@@ -41,7 +49,6 @@ raw_outputs_P = np.log10(raw_outputs_P/1000)
 N = raw_inputs.shape[0] #Number of data points
 D = raw_inputs.shape[1] #Number of features
 O = raw_outputs_T.shape[1] #Number of outputs
-
 
 # Shuffle data
 rp = np.random.permutation(N) #random permutation of the indices
@@ -66,10 +73,11 @@ INPUT_LABELS = [
     r'CO$_2$ Pressure (bar)',
     r'LoD (days)',
     r'Obliquity (deg)',
+    r'T$_{eff}$ (K)',
 ]
 
-plot_1 = False
-plot_2 = True
+plot_1 = True
+plot_2 = False
 
 ############################################################
 #### Plot curves, covariance matrices and eigenspectrum ####
@@ -88,9 +96,9 @@ if plot_1:
     plt.show()
 
     ## Correlations with input parameters
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
 
-    for j, ax in enumerate(axes.flatten()):
+    for j, ax in zip(range(D), axes.flatten()):
         
         # Normalize based on actual input values
         norm = mcolors.Normalize(vmin=min(raw_inputs[:, j]), vmax=max(raw_inputs[:, j]))
@@ -120,9 +128,9 @@ if plot_1:
     plt.show()
 
     ## Correlations with input parameters
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
 
-    for j, ax in enumerate(axes.flatten()):
+    for j, ax in zip(range(D), axes.flatten()):
         
         # Normalize based on actual input values
         norm = mcolors.Normalize(vmin=min(raw_inputs[:, j]), vmax=max(raw_inputs[:, j]))

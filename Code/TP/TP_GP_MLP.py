@@ -31,21 +31,29 @@ def check_and_make_dir(dir):
 #Base directory 
 base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing temperature values
-raw_T_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
+raw_T_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_T.csv', delimiter=',')
+raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
 #File containing pressure values
-raw_P_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
+raw_P_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_P.csv', delimiter=',')
+raw_P_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/updatedensCGP_deeperMLP/'
+model_save_path = base_dir+'Model_Storage/newensCGP_residualMLP/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/updatedensCGP_deeperMLP/'
+plot_save_path = base_dir+'Plots/newensCGP_residualMLP/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
 #First 5 are the input values (H2 pressure in bar, CO2 pressure in bar, LoD in hours, Obliquity in deg, H2+Co2 pressure) but we remove the last one since it's not adding info.
-raw_inputs = raw_T_data[:, :4]
-raw_outputs_T = raw_T_data[:, 5:]
-raw_outputs_P = raw_P_data[:, 5:]
+# Extract the 4 physical inputs and append stellar temperature as 5th column
+inputs_3000 = np.hstack([raw_T_data3000[:, :4], np.full((len(raw_T_data3000), 1), 3000.0)])
+inputs_4500 = np.hstack([raw_T_data4500[:, :4], np.full((len(raw_T_data4500), 1), 4500.0)])
+
+# Concatenate along the sample axis
+raw_inputs    = np.vstack([inputs_3000,            inputs_4500           ])  # (N_3000+N_4500, 5)
+raw_outputs_T = np.vstack([raw_T_data3000[:, 5:],  raw_T_data4500[:, 5:]])  # (N_3000+N_4500, O)
+raw_outputs_P = np.vstack([raw_P_data3000[:, 5:],  raw_P_data4500[:, 5:]])  # (N_3000+N_4500, O)
+
 #Convert raw outputs to log10 scale so we don't have to deal with it later
 raw_outputs_P = np.log10(raw_outputs_P/1000)
 
@@ -441,7 +449,7 @@ for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tq
             ax.grid()
             ax.legend()        
 
-        plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Number of iterations: {it}')
+        plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Teff : {query_input[4]} K, Number of iterations: {it}')
         plt.subplots_adjust(wspace=0.2)
         plt.show()
 
@@ -841,7 +849,7 @@ for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P,
         axs['res_pressure'].xaxis.set_label_position("top")
         axs['res_pressure'].sharex(axs['results'])
 
-        plt.suptitle(rf'H$_2$ : {NN_test_input[0]} bar, CO$_2$ : {NN_test_input[1]} bar, LoD : {NN_test_input[2]:.0f} days, Obliquity : {NN_test_input[3]} deg')
+        plt.suptitle(rf'H$_2$ : {NN_test_input[0]} bar, CO$_2$ : {NN_test_input[1]} bar, LoD : {NN_test_input[2]:.0f} days, Obliquity : {NN_test_input[3]} deg, Teff : {NN_test_input[4]} K')
         plt.savefig(plot_save_path+f'/pred_vs_actual_n.{NN_test_idx}.pdf')  
 
 
