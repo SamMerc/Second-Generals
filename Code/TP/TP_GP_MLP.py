@@ -113,7 +113,7 @@ show_plot = False
 
 #Neural network width and depth
 nn_width = 102
-nn_depth = 10
+nn_depth = 55
 
 #Optimizer learning rate
 learning_rate = 1e-3

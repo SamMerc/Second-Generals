@@ -337,7 +337,7 @@ X_features = np.hstack([
 )
 
 # ── Single multi-output XGBoost ───────────────────────────────────────────────
-max_depth = D + 4*O
+max_depth = int(np.log2(D + 4*O))
 print(f"Using max_depth={max_depth} for {D + 4*O} input features")
 
 xgb_model = xgb.XGBRegressor(
