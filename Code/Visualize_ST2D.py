@@ -22,15 +22,21 @@ def check_and_make_dir(dir):
 #Base directory 
 base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing surface temperature map
-raw_ST_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
+raw_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_ST2D.csv', delimiter=',')
+raw_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 #Path to store plots
 plot_save_path = base_dir+'Plots/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
 #First 5 are the input values (H2 pressure in bar, CO2 pressure in bar, LoD in hours, Obliquity in deg, H2+Co2 pressure) but we remove the last one since it's not adding info.
-raw_inputs = raw_ST_data[:, :4] #has shape 46 x 72 = 3,312
-raw_outputs = raw_ST_data[:, 5:]
+# Extract the 4 physical inputs and append stellar temperature as 5th column
+inputs_3000 = np.hstack([raw_data3000[:, :4], np.full((len(raw_data3000), 1), 3000.0)])
+inputs_4500 = np.hstack([raw_data4500[:, :4], np.full((len(raw_data4500), 1), 4500.0)])
+
+# Concatenate along the sample axis
+raw_inputs    = np.vstack([inputs_3000,            inputs_4500           ])  # (N_3000+N_4500, 5)
+raw_outputs = np.vstack([raw_data3000[:, 5:],  raw_data4500[:, 5:]])  # (N_3000+N_4500, O)
 
 #Storing useful quantitites
 N = raw_inputs.shape[0] #Number of data points
@@ -61,12 +67,11 @@ INPUT_LABELS = [
     r'CO$_2$ Pressure (bar)',
     r'LoD (days)',
     r'Obliquity (deg)',
+    r'T$_{eff}$ (K)',
 ]
 
-plot_1 = False
-plot_2 = True
-
-refinement_iterations = 20
+plot_1 = True
+plot_2 = False
 
 ############################################################
 #### Plot curves, covariance matrices and eigenspectrum ####
@@ -84,9 +89,9 @@ if plot_1:
 
 
     ## Correlations with input parameters
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
 
-    for j, ax in enumerate(axes.flatten()):
+    for j, ax in zip(range(D), axes.flatten()):
         
         # Normalize based on actual input values
         norm = mcolors.Normalize(vmin=min(raw_inputs[:, j]), vmax=max(raw_inputs[:, j]))
@@ -181,7 +186,7 @@ def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
     # Fixed-size unique: always returns exactly N_neighbor indices
     idxs2 = _mahal_knn_batch(Xens, XhSel, VI, 1).flatten()   # (N_neighbor,)
     idxs_new = jnp.unique(idxs2, size=N_neighbor,
-                          fill_value=-1)                       # (N_neighbor,) ← fixed!
+                          fill_value=-1)                       # (N_neighbor,)
 
     # Top-up: always pull N_neighbor candidates from Xq, use where idxs_new has fill
     idxs_topup = _mahal_knn_single(Xens, Xq.ravel(), VI, N_neighbor)
@@ -193,28 +198,46 @@ def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
     return idxs_final, Mf, Cxy, Xm, Ym, Yh, cov_Yh
 
 # ── Main function ─────────────────────────────────────────────────────────────
-def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, refinement_iterations):
+def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=100):
     """
     Parameters:
     Xens_j: array of input features which compose the ensemble. shape:(D, N) 
     Yens_j: array of input labels which compose the ensemble. shape:(M, N) 
-    Xq: query point for which we want to compute a prediction. shape:(D, 1)
+    Xq: query point for which we want to compute a prediction. shape:(D,) or (D,1)
     VI_j: inverse of the covariance matrix for the input ensemble. shape:(D, D)
     N_neighbor: int, number of neighbors to use in CGP
-    refinement_iterations: int, number of times to refine the neighborhood
+    tol: float, convergence threshold on average relative change in prediction (default 1%)
+    max_iter: int, safety cap on number of iterations (default 100)
     """
-    # No more jnp.array() conversions — passed in pre-converted
-    Xq_j = jnp.array(Xq.ravel())   # (D,) — only Xq changes per query point
+    Xq_j = jnp.array(Xq.ravel())   # (D,)
 
-    idxs = _mahal_knn_single(Xens_j, Xq_j, VI_j, N_neighbor)  # (N_neighbor,) fixed
+    idxs = _mahal_knn_single(Xens_j, Xq_j, VI_j, N_neighbor)
 
-    for _ in range(refinement_iterations):
+    # Run first iteration to get an initial prediction
+    idxs, _, _, _, _, Yh_prev, cov_Yh = _cgp_step_fixed(
+        Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
+    )
+    Yh_prev = np.array(Yh_prev.flatten())
+
+    for i in range(max_iter - 1):
         idxs, _, _, _, _, Yh, cov_Yh = _cgp_step_fixed(
             Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
         )
+        Yh = np.array(Yh.flatten())
+
+        # Average relative change between this and previous prediction
+        # Add small epsilon to denominator to avoid division by zero
+        rel_change = np.mean(
+            np.abs(Yh - Yh_prev) / (np.abs(Yh_prev) + 1e-10)
+        )
+
+        if rel_change < tol:
+            break
+
+        Yh_prev = Yh
 
     err_Yh = jnp.sqrt(jnp.maximum(0.0, jnp.diag(cov_Yh)))
-    return np.array(Yh.flatten()), np.array(err_Yh)
+    return Yh, np.array(err_Yh), i + 2   # +2 because of the initial iteration before the loop
         
 if plot_2:
 
@@ -248,7 +271,6 @@ if plot_2:
                                 query_input, 
                                 jnp.linalg.inv(jnp.cov(XTr)),
                                 N_neighbor, 
-                                refinement_iterations
                 )
             guess_ST2D[query_idx, :] = Yh
             guess_ST2Derr[query_idx, :] = err_Yh

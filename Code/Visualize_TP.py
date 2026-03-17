@@ -308,7 +308,6 @@ def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=100):
         rel_change = np.mean(
             np.abs(Yh - Yh_prev) / (np.abs(Yh_prev) + 1e-10)
         )
-        print('0:', rel_change)
 
         if rel_change < tol:
             break
