@@ -5,14 +5,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-from torch.optim import Adam, SGD
+from torch.optim import Adam
+import torch.optim.lr_scheduler as lr_scheduler
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning import Trainer
 import pytorch_lightning as pl
 import os
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
-import scipy
 from torchinfo import summary
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
@@ -37,10 +37,10 @@ raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimi
 raw_P_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_P.csv', delimiter=',')
 raw_P_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/newensCGP_residualMLP_TEST/'
+model_save_path = base_dir+'Model_Storage/AAAAAAHHHTEST/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/newensCGP_residualMLP_TEST/'
+plot_save_path = base_dir+'Plots/AAAAAAHHHTEST/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -112,18 +112,21 @@ NN_rng.manual_seed(NN_seed)
 show_plot = False
 
 #Neural network width and depth
-nn_width = 102
-nn_depth = 10
+nn_width = 209
+nn_depth = 55
 
-#Optimizer learning rate
-learning_rate = 1e-3
+#Optimizer learning rate schedule
+lr_init = 1e-3        # initial LR — ReduceLROnPlateau will reduce from here
+lr_patience  = 10     # epochs to wait before reducing LR
+lr_factor    = 0.5    # multiply LR by this when plateauing
+lr_min       = 1e-7   # floor
 
 #Regularization coefficient
 regularization_coeff_l1 = 0.0
-regularization_coeff_l2 = 0.0
+regularization_coeff_l2 = 5e-5
 
 #Smoothness constraint coefficient
-smoothness_coeff = 0.001
+smoothness_coeff = 0.0
 
 #Weight decay 
 weight_decay = 0.0
@@ -132,7 +135,7 @@ weight_decay = 0.0
 batch_size = 200
 
 #Number of epochs 
-n_epochs = 100
+n_epochs = 300
 
 #Mode for optimization
 run_mode = 'use'
@@ -265,29 +268,43 @@ def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=1000):
 ###################
 #### Build MLP ####
 ###################
+class ResidualBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
+        self.activation = nn.GELU()
+
+    def forward(self, x):
+        return self.activation(x + self.block(x))   # ← skip connection
+
 class NeuralNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, depth, generator=None):
         super().__init__()
-        # Set seed if generator provided
         if generator is not None:
             torch.manual_seed(generator.initial_seed())
-        layers = []
-        # Input layer
-        layers.append(nn.Linear(input_dim, hidden_dim))
-        layers.append(nn.ReLU())
-        # Hidden layers
-        for _ in range(depth):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.ReLU())
-        # Output layer
-        layers.append(nn.Linear(hidden_dim, output_dim))
-        # Pack all layers into a Sequential container
-        self.linear_relu_stack = nn.Sequential(*layers)
-        
+
+        # First layer : Project input to hidden dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+        # Stack fully-connected with dimension hidden_dim
+        self.blocks = nn.Sequential(*[ResidualBlock(hidden_dim) for _ in range(depth)])
+        # Project to output
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
+
     def forward(self, x):
-        logits = self.linear_relu_stack(x)
-        return logits
-    
+        x = self.input_proj(x)
+        x = self.blocks(x)
+        return self.output_proj(x)
+
 # PyTorch Lightning DataModule
 class CustomDataModule(pl.LightningDataModule):
     def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs, test_inputs, test_outputs, batch_size, rng):
@@ -321,40 +338,46 @@ class CustomDataModule(pl.LightningDataModule):
         self.out_scaler_T = out_scaler_T
         self.out_scaler_P = out_scaler_P
         
-        # Standardize the input
-        ## Create scaler
-        in_scaler_T = StandardScaler()
-        in_scaler_P = StandardScaler()
-        
-        ## Fit scaler on training dataset (convert to numpy)
-        in_scaler_T.fit(train_inputs[:, :O].cpu().numpy())
-        in_scaler_P.fit(train_inputs[:, O:].cpu().numpy())
+        # --- Input scaling: one scaler per block ---
+        # Block indices: [phys(D) | GP_T(O) | GP_P(O) | GP_Terr(O) | GP_Perr(O)]
+        i0, i1, i2, i3, i4 = 0, D, D+O, D+2*O, D+3*O, 
 
-        ## Transform all datasets and convert back to tensors
-        train_T_scaled = torch.tensor(in_scaler_T.transform(train_inputs[:, :O].cpu().numpy()), dtype=torch.float32)
-        train_P_scaled = torch.tensor(in_scaler_P.transform(train_inputs[:, O:].cpu().numpy()), dtype=torch.float32)
+        in_scaler_phys = StandardScaler()
+        in_scaler_T    = StandardScaler()
+        in_scaler_P    = StandardScaler()
+        in_scaler_Terr = StandardScaler()
+        in_scaler_Perr = StandardScaler()
 
-        valid_T_scaled = torch.tensor(in_scaler_T.transform(valid_inputs[:, :O].cpu().numpy()), dtype=torch.float32)
-        valid_P_scaled = torch.tensor(in_scaler_P.transform(valid_inputs[:, O:].cpu().numpy()), dtype=torch.float32)
+        in_scaler_phys.fit(train_inputs[:, i0:i1].cpu().numpy())
+        in_scaler_T.fit(   train_inputs[:, i1:i2].cpu().numpy())
+        in_scaler_P.fit(   train_inputs[:, i2:i3].cpu().numpy())
+        in_scaler_Terr.fit(train_inputs[:, i3:i4].cpu().numpy())
+        in_scaler_Perr.fit(train_inputs[:, i4:  ].cpu().numpy())
 
-        test_T_scaled = torch.tensor(in_scaler_T.transform(test_inputs[:, :O].cpu().numpy()), dtype=torch.float32)
-        test_P_scaled = torch.tensor(in_scaler_P.transform(test_inputs[:, O:].cpu().numpy()), dtype=torch.float32)
-        
-        # Concatenate
-        train_inputs = torch.cat([train_T_scaled, train_P_scaled], dim=1)
-        valid_inputs = torch.cat([valid_T_scaled, valid_P_scaled], dim=1)
-        test_inputs = torch.cat([test_T_scaled, test_P_scaled], dim=1)
+        def scale_inputs(X):
+            X = X.cpu().numpy()
+            return torch.tensor(np.hstack([
+                in_scaler_phys.transform(X[:, i0:i1]),
+                in_scaler_T.transform(   X[:, i1:i2]),
+                in_scaler_P.transform(   X[:, i2:i3]),
+                in_scaler_Terr.transform(X[:, i3:i4]),
+                in_scaler_Perr.transform(X[:, i4:  ]),
+            ]), dtype=torch.float32)
 
-        # Store the scaler if you need to inverse transform later
-        self.in_scaler_T = in_scaler_T
-        self.in_scaler_P = in_scaler_P
+        self.train_inputs  = scale_inputs(train_inputs)
+        self.valid_inputs  = scale_inputs(valid_inputs)
+        self.test_inputs   = scale_inputs(test_inputs)
+
+        # Store all scalers for inference
+        self.in_scaler_phys = in_scaler_phys
+        self.in_scaler_T    = in_scaler_T
+        self.in_scaler_P    = in_scaler_P
+        self.in_scaler_Terr = in_scaler_Terr
+        self.in_scaler_Perr = in_scaler_Perr
 
         # Storing it and passing it to loaders
-        self.train_inputs = train_inputs
         self.train_outputs = train_outputs
-        self.valid_inputs = valid_inputs
         self.valid_outputs = valid_outputs
-        self.test_inputs = test_inputs
         self.test_outputs = test_outputs
         self.batch_size = batch_size
         self.rng = rng
@@ -371,7 +394,7 @@ class CustomDataModule(pl.LightningDataModule):
         dataset = TensorDataset(self.test_inputs, self.test_outputs)
         return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
 
-model = NeuralNetwork(2*O, nn_width, 2*O, nn_depth, generator=NN_rng)
+model = NeuralNetwork(D + 4*O, nn_width, 2*O, nn_depth, generator=NN_rng)
 summary(model)
 
 
@@ -397,10 +420,10 @@ for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tq
                 raw_inputs.T,
                 query_idx,
                 axis=1
-                )                           # (4, N)
+                )                           # (D, N)
     
     YTr = np.delete(
-        np.hstack([raw_outputs_T, raw_outputs_P]).T,   # shape: (M, N)
+        np.hstack([raw_outputs_T, raw_outputs_P]).T,   # shape: (2O, N)
         query_idx,
         axis=1
         )                                   # (O, N)
@@ -449,7 +472,7 @@ for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tq
             ax.grid()
             ax.legend()        
 
-        plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Number of iterations: {it}')
+        plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Teff : {query_input[4]} K, Number of iterations: {it}')
         plt.subplots_adjust(wspace=0.2)
         plt.show()
 
@@ -463,52 +486,51 @@ residuals_P = raw_outputs_P - GP_outputs_P   # (N, O)
 train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(N), data_partition, generator=partition_rng)
 
 ## Generate the data partitions
-### Training
-NN_train_inputs_T = torch.tensor(GP_outputs_T[train_idx], dtype=torch.float32)
-NN_train_inputs_P = torch.tensor(GP_outputs_P[train_idx], dtype=torch.float32)
+
+
+# --- Inputs ---
+# --- Initial inputs ---
+NN_train_inputs_phys = torch.tensor(raw_inputs[train_idx], dtype=torch.float32)
+NN_valid_inputs_phys = torch.tensor(raw_inputs[valid_idx], dtype=torch.float32)
+NN_test_inputs_phys  = torch.tensor(raw_inputs[test_idx],  dtype=torch.float32)
+
+# --- GP predictions ---
+NN_train_inputs_T = torch.tensor(GP_outputs_T[train_idx],    dtype=torch.float32)
+NN_train_inputs_P = torch.tensor(GP_outputs_P[train_idx],    dtype=torch.float32)
+NN_valid_inputs_T = torch.tensor(GP_outputs_T[valid_idx],    dtype=torch.float32)
+NN_valid_inputs_P = torch.tensor(GP_outputs_P[valid_idx],    dtype=torch.float32)
+NN_test_inputs_T  = torch.tensor(GP_outputs_T[test_idx],     dtype=torch.float32)
+NN_test_inputs_P  = torch.tensor(GP_outputs_P[test_idx],     dtype=torch.float32)
+
+# --- GP errors ---
+NN_train_inputs_Terr = torch.tensor(GP_outputs_Terr[train_idx], dtype=torch.float32)
+NN_train_inputs_Perr = torch.tensor(GP_outputs_Perr[train_idx], dtype=torch.float32)
+NN_valid_inputs_Terr = torch.tensor(GP_outputs_Terr[valid_idx], dtype=torch.float32)
+NN_valid_inputs_Perr = torch.tensor(GP_outputs_Perr[valid_idx], dtype=torch.float32)
+NN_test_inputs_Terr  = torch.tensor(GP_outputs_Terr[test_idx],  dtype=torch.float32)
+NN_test_inputs_Perr  = torch.tensor(GP_outputs_Perr[test_idx],  dtype=torch.float32)
+
+# --- Outputs ---
+# --- residuals ---
 NN_train_outputs_T = torch.tensor(residuals_T[train_idx], dtype=torch.float32)
 NN_train_outputs_P = torch.tensor(residuals_P[train_idx], dtype=torch.float32)
-### Validation
-NN_valid_inputs_T = torch.tensor(GP_outputs_T[valid_idx], dtype=torch.float32)
-NN_valid_inputs_P = torch.tensor(GP_outputs_P[valid_idx], dtype=torch.float32)
 NN_valid_outputs_T = torch.tensor(residuals_T[valid_idx], dtype=torch.float32)
 NN_valid_outputs_P = torch.tensor(residuals_P[valid_idx], dtype=torch.float32)
-### Testing
-NN_test_inputs_T = torch.tensor(GP_outputs_T[test_idx], dtype=torch.float32)
-NN_test_inputs_P = torch.tensor(GP_outputs_P[test_idx], dtype=torch.float32)
-NN_test_outputs_T = torch.tensor(residuals_T[test_idx], dtype=torch.float32)
-NN_test_outputs_P = torch.tensor(residuals_P[test_idx], dtype=torch.float32)
-NN_test_true_T = torch.tensor(raw_outputs_T[test_idx], dtype=torch.float32)
-NN_test_true_P = torch.tensor(raw_outputs_P[test_idx], dtype=torch.float32)
-NN_test_og_inputs = torch.tensor(raw_inputs[test_idx], dtype=torch.float32) 
+NN_test_outputs_T  = torch.tensor(residuals_T[test_idx],  dtype=torch.float32)
+NN_test_outputs_P  = torch.tensor(residuals_P[test_idx],  dtype=torch.float32)
 
-## Concatenating inputs and outputs
-NN_train_inputs = torch.cat([
-    NN_train_inputs_T,
-    NN_train_inputs_P
-], dim=1)
-NN_train_outputs = torch.cat([
-    NN_train_outputs_T,
-    NN_train_outputs_P
-], dim=1)
+# --- Plotting purposes: truth ---
+NN_test_true_T     = torch.tensor(raw_outputs_T[test_idx], dtype=torch.float32)
+NN_test_true_P     = torch.tensor(raw_outputs_P[test_idx], dtype=torch.float32)
 
-NN_valid_inputs = torch.cat([
-    NN_valid_inputs_T,
-    NN_valid_inputs_P
-], dim=1)
-NN_valid_outputs = torch.cat([
-    NN_valid_outputs_T,
-    NN_valid_outputs_P
-], dim=1)
+# --- Concatenate: [init | GP_T | GP_P | GP_Terr | GP_Perr] ---
+NN_train_inputs = torch.cat([NN_train_inputs_phys, NN_train_inputs_T, NN_train_inputs_P, NN_train_inputs_Terr, NN_train_inputs_Perr], dim=1)
+NN_valid_inputs = torch.cat([NN_valid_inputs_phys, NN_valid_inputs_T, NN_valid_inputs_P, NN_valid_inputs_Terr, NN_valid_inputs_Perr], dim=1)
+NN_test_inputs  = torch.cat([NN_test_inputs_phys,  NN_test_inputs_T,  NN_test_inputs_P,  NN_test_inputs_Terr,  NN_test_inputs_Perr],  dim=1)
+NN_train_outputs = torch.cat([NN_train_outputs_T, NN_train_outputs_P], dim=1)
+NN_valid_outputs = torch.cat([NN_valid_outputs_T, NN_valid_outputs_P], dim=1)
+NN_test_outputs  = torch.cat([NN_test_outputs_T,  NN_test_outputs_P],  dim=1)
 
-NN_test_inputs = torch.cat([
-    NN_test_inputs_T,
-    NN_test_inputs_P
-], dim=1)
-NN_test_outputs = torch.cat([
-    NN_test_outputs_T,
-    NN_test_outputs_P
-], dim=1)
 
 # Create DataModule
 data_module = CustomDataModule(
@@ -528,16 +550,21 @@ data_module = CustomDataModule(
 ###################################
 # PyTorch Lightning Module
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0):
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0,
+                 reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0,
+                 lr_patience=10, lr_factor=0.5, lr_min=1e-7):
         super().__init__()
-        self.model = model
-        self.learning_rate = learning_rate
-        self.reg_coeff_l1 = reg_coeff_l1
-        self.reg_coeff_l2 = reg_coeff_l2
+        self.model            = model
+        self.learning_rate    = learning_rate
+        self.reg_coeff_l1     = reg_coeff_l1
+        self.reg_coeff_l2     = reg_coeff_l2
         self.smoothness_coeff = smoothness_coeff
-        self.weight_decay = weight_decay
-        self.loss_fn = nn.MSELoss()
-        self.optimizer_class = optimizer
+        self.weight_decay     = weight_decay
+        self.loss_fn          = nn.MSELoss()
+        self.optimizer_class  = optimizer
+        self.lr_patience      = lr_patience
+        self.lr_factor        = lr_factor
+        self.lr_min           = lr_min
     
     def compute_weight_regularization(self):
         """
@@ -630,13 +657,29 @@ class RegressionModule(pl.LightningModule):
         # Log metrics
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
-    
+
     def configure_optimizers(self):
-        return self.optimizer_class(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-
-
-
-
+        optimizer = self.optimizer_class(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+        scheduler = lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=self.lr_factor,
+            patience=self.lr_patience,
+            min_lr=self.lr_min,
+        )
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'valid_loss',   # ReduceLROnPlateau needs a metric to watch
+                'interval': 'epoch',
+                'frequency': 1,
+            }
+        }
 
 
 
@@ -648,11 +691,14 @@ class RegressionModule(pl.LightningModule):
 lightning_module = RegressionModule(
     model=model,
     optimizer=Adam,
-    learning_rate=learning_rate,
+    learning_rate=lr_init,
     reg_coeff_l1=regularization_coeff_l1,
     reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay,
     smoothness_coeff=smoothness_coeff,
+    lr_patience=lr_patience,
+    lr_factor=lr_factor,
+    lr_min=lr_min,
 )
 
 # Setup logger
@@ -661,7 +707,6 @@ logger = CSVLogger(model_save_path+'logs', name='NeuralNetwork')
 # Set all seeds for complete reproducibility
 pl.seed_everything(NN_seed, workers=True)
 
-# Create Trainer and train
 trainer = Trainer(
     max_epochs=n_epochs,
     logger=logger,
@@ -673,21 +718,25 @@ if run_mode == 'use':
     trainer.fit(lightning_module, datamodule=data_module)
     
     # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt')
+    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{lr_init}LR_{batch_size}BS.ckpt')
     
     print("Done!")
     
 else:
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt',
+        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{lr_init}LR_{batch_size}BS.ckpt',
         model=model,
         optimizer=Adam,
-    learning_rate=learning_rate,
+    learning_rate=lr_init,
     reg_coeff_l1=regularization_coeff_l1,
     reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay,
     smoothness_coeff=smoothness_coeff,
+    lr_patience=lr_patience,
+    lr_factor=lr_factor,
+    lr_min=lr_min,
+
     )
     print("Model loaded!")
 
@@ -755,6 +804,7 @@ ax1.grid()
 ax2.grid()
 plt.subplots_adjust(hspace=0)
 plt.savefig(plot_save_path+'/loss.pdf')
+plt.close()
 
 #Comparing GP predicted T-P profiles vs NN predicted T-P profiles vs true T-P profiles with residuals
 substep = 100
@@ -762,8 +812,11 @@ substep = 100
 # Get the scalers from data module
 out_scaler_T = data_module.out_scaler_T
 out_scaler_P = data_module.out_scaler_P
-in_scaler_T = data_module.in_scaler_T
-in_scaler_P = data_module.in_scaler_P
+in_scaler_phys = data_module.in_scaler_phys
+in_scaler_T    = data_module.in_scaler_T
+in_scaler_P    = data_module.in_scaler_P
+in_scaler_Terr = data_module.in_scaler_Terr
+in_scaler_Perr = data_module.in_scaler_Perr
 
 # Move model to CPU for inference to avoid GPU memory issues
 model.cpu()
@@ -779,18 +832,24 @@ GP_res_P = np.zeros(NN_test_outputs_P.shape, dtype=float)
 NN_res_T = np.zeros(NN_test_outputs_P.shape, dtype=float)
 NN_res_P = np.zeros(NN_test_outputs_P.shape, dtype=float)
 
-for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P, 
+for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P,
+                  GP_test_err_T, GP_test_err_P,
                   NN_test_output_T, NN_test_output_P,
                   true_T, true_P) in enumerate(zip(
-    NN_test_og_inputs,
-    NN_test_inputs_T, NN_test_inputs_P,
-    NN_test_outputs_T, NN_test_outputs_P,   # these are now residuals
-    NN_test_true_T, NN_test_true_P          # these are the actual profiles
+    NN_test_inputs_phys,
+    NN_test_inputs_T,   NN_test_inputs_P,
+    NN_test_inputs_Terr, NN_test_inputs_Perr,
+    NN_test_outputs_T,  NN_test_outputs_P,
+    NN_test_true_T,     NN_test_true_P
 )):
-    #Retrieve prediction
-    scaled_GP_test_output_T = torch.tensor(in_scaler_T.transform(GP_test_output_T.reshape(1, -1)), dtype=torch.float32)
-    scaled_GP_test_output_P = torch.tensor(in_scaler_P.transform(GP_test_output_P.reshape(1, -1)), dtype=torch.float32)
-    scaled_input = torch.cat([scaled_GP_test_output_T, scaled_GP_test_output_P], dim=1)
+
+    scaled_input = torch.tensor(np.hstack([
+        in_scaler_phys.transform(NN_test_input.numpy().reshape(1, -1)),
+        in_scaler_T.transform(   GP_test_output_T.numpy().reshape(1, -1)),
+        in_scaler_P.transform(   GP_test_output_P.numpy().reshape(1, -1)),
+        in_scaler_Terr.transform(GP_test_err_T.numpy().reshape(1, -1)),
+        in_scaler_Perr.transform(GP_test_err_P.numpy().reshape(1, -1)),
+    ]), dtype=torch.float32)
 
     NN_pred_output = model(scaled_input).detach().numpy()
     
@@ -849,8 +908,9 @@ for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P,
         axs['res_pressure'].xaxis.set_label_position("top")
         axs['res_pressure'].sharex(axs['results'])
 
-        plt.suptitle(rf'H$_2$ : {NN_test_input[0]} bar, CO$_2$ : {NN_test_input[1]} bar, LoD : {NN_test_input[2]:.0f} days, Obliquity : {NN_test_input[3]} deg')
+        plt.suptitle(rf'H$_2$ : {NN_test_input[0]} bar, CO$_2$ : {NN_test_input[1]} bar, LoD : {NN_test_input[2]:.0f} days, Obliquity : {NN_test_input[3]} deg, Teff : {NN_test_input[4]} K')
         plt.savefig(plot_save_path+f'/pred_vs_actual_n.{NN_test_idx}.pdf')  
+        plt.close()
 
 
 #Plot residuals
@@ -885,4 +945,4 @@ fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
          verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
 plt.savefig(plot_save_path+f'/res_GP_NN.pdf', bbox_inches='tight')
-plt.show()
+plt.close()
