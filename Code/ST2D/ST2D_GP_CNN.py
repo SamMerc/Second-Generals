@@ -5,7 +5,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-from torch.optim import SGD, Adam
+from torch.optim import Adam
+import torch.optim.lr_scheduler as lr_scheduler
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning import Trainer
 import pytorch_lightning as pl
@@ -15,10 +16,12 @@ import scipy
 from torchinfo import summary
 import pandas as pd
 import os
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 import seaborn as sns
-
-
+from tqdm import tqdm
+from jax import jit, vmap
+from functools import partial
+import jax.numpy as jnp
 
 
 ##########################################################
@@ -30,7 +33,8 @@ def check_and_make_dir(dir):
 #Base directory 
 base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing surface temperature map
-raw_ST_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
+raw_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_ST2D.csv', delimiter=',')
+raw_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 #Path to store model
 model_save_path = base_dir+'Model_Storage/GP_ST_fixedstand/'
 check_and_make_dir(model_save_path)
@@ -40,20 +44,42 @@ check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
 #First 5 are the input values (H2 pressure in bar, CO2 pressure in bar, LoD in hours, Obliquity in deg, H2+Co2 pressure) but we remove the last one since it's not adding info.
-raw_inputs = raw_ST_data[:, :4] #has shape 46 x 72 = 3,312
-raw_outputs = raw_ST_data[:, 5:]
+# Extract the 4 physical inputs and append stellar temperature as 5th column
+inputs_3000 = np.hstack([raw_data3000[:, :4], np.full((len(raw_data3000), 1), 3000.0)])
+inputs_4500 = np.hstack([raw_data4500[:, :4], np.full((len(raw_data4500), 1), 4500.0)])
+
+# Concatenate along the sample axis
+raw_inputs    = np.vstack([inputs_3000,            inputs_4500           ])  # (N_3000+N_4500, 5)
+raw_outputs = np.vstack([raw_data3000[:, 5:],  raw_data4500[:, 5:]])  # (N_3000+N_4500, O)
 
 #Storing useful quantitites
 N = raw_inputs.shape[0] #Number of data points
 D = raw_inputs.shape[1] #Number of features
 O = raw_outputs.shape[1] #Number of outputs
 
-## HYPER-PARAMETERS ##
-#Defining partition of data used for 1. training and 2. testing
-data_partition = [0.8, 0.2]
+# Shuffle data
+rp = np.random.permutation(N) #random permutation of the indices
+# Apply random permutation to shuffle the data
+raw_inputs = raw_inputs[rp, :]
+raw_outputs = raw_outputs[rp, :]
 
+## HYPER-PARAMETERS for ens-CGP ##
+
+#Number of nearest neighbors to choose
+N_neighbor = 4
+
+#Distance metric to use
+distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
+
+#Convert raw inputs for H2 and CO2 pressures to log10 scale so don't have to deal with it later
+if 'logged' in distance_metric:
+    raw_inputs[:, 0] = np.log10(raw_inputs[:, 0]) #H2
+    raw_inputs[:, 1] = np.log10(raw_inputs[:, 1]) #CO2
+
+
+## HYPER-PARAMETERS for NN ##
 #Definine sub-partitiion for splitting NN dataset
-sub_data_partitions = [0.7, 0.1, 0.2]
+data_partition = [0.7, 0.1, 0.2]
 
 #Defining the device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -82,18 +108,15 @@ norm = 'batch' # can be 'batch', 'group', 'layer' or None
 # Variable to show plots or not 
 show_plot = False
 
-#Number of nearest neighbors to choose
-N_neigbors = 10
-
-#Distance metric to use
-distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
-
-#Optimizer learning rate
-learning_rate = 1e-3
+#Optimizer learning rate schedule
+lr_init = 1e-3        # initial LR — ReduceLROnPlateau will reduce from here
+lr_patience  = 10     # epochs to wait before reducing LR
+lr_factor    = 0.5    # multiply LR by this when plateauing
+lr_min       = 1e-7   # floor
 
 #Regularization coefficient
 regularization_coeff_l1 = 0.0
-regularization_coeff_l2 = 0.0
+regularization_coeff_l2 = 5e-5
 
 #Smoothness constraint coefficient
 smoothness_coeff = 0.0
@@ -105,15 +128,11 @@ weight_decay = 0.0
 batch_size = 32
 
 #Number of epochs 
-n_epochs = 10
+n_epochs = 100
 
 #Mode for optimization
 run_mode = 'use'
 
-#Convert raw inputs for H2 and CO2 pressures to log10 scale so don't have to deal with it later
-if 'logged' in distance_metric:
-    raw_inputs[:, 0] = np.log10(raw_inputs[:, 0]) #H2
-    raw_inputs[:, 1] = np.log10(raw_inputs[:, 1]) #CO2
 
 
 
@@ -121,58 +140,117 @@ if 'logged' in distance_metric:
 
 
 
-#######################################################
-#### Partition data into training and testing sets ####
-#######################################################
-## Retrieving indices of data partitions
-train_idx, test_idx = torch.utils.data.random_split(range(N), data_partition, generator=partition_rng)
-## Generate the data partitions
-### Training
-train_inputs = raw_inputs[train_idx]
-train_outputs = raw_outputs[train_idx]
+###############################################
+#### Ensemble Conditional Gaussian Process ####
+###############################################
+# ── JAX KNN ───────────────────────────────────────────────────────────────────
+@partial(jit, static_argnames=('k',))
+def _mahal_knn_single(X_train, xq, VI, k):
+    """Single query point. X_train: (D, N), xq: (D,), returns (k,)"""
+    diff = X_train - xq[:, None]                     # (D, N)
+    dists_sq = jnp.sum(diff * (VI @ diff), axis=0)   # (N,)
+    return jnp.argsort(dists_sq)[:k]
 
-### Testing
-test_inputs = raw_inputs[test_idx]
-test_outputs = raw_outputs[test_idx]
+@partial(jit, static_argnames=('k',))
+def _mahal_knn_batch(X_train, X_queries, VI, k):
+    """Batch of query points. X_queries: (D, Q), returns (Q, k)"""
+    def single(xq):
+        diff = X_train - xq[:, None]
+        dists_sq = jnp.sum(diff * (VI @ diff), axis=0)
+        return jnp.argsort(dists_sq)[:k]
+    return vmap(single)(X_queries.T)
 
+# ── JAX CGP step ──────────────────────────────────────────────────────────────
+@partial(jit, static_argnames=('N_neighbor',))
+def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
+    """idxs is always shape (N_neighbor,) — no dynamic shapes."""
+    Xens_NN = Xens[:, idxs]   # shape always (D, N_neighbor) ← fixed!
+    Yens_NN = Yens[:, idxs]   # shape always (M, N_neighbor) ← fixed!
 
-############################
-#### Build ensemble CGP ####
-############################
-def Sai_CGP(obs_features, obs_labels, query_features):
+    Xm = Xens_NN.mean(axis=1, keepdims=True)
+    Ym = Yens_NN.mean(axis=1, keepdims=True)
+    dX = Xens_NN - Xm
+    dY = Yens_NN - Ym
+
+    Cxx = dX @ dX.T
+    Cyx = dY @ dX.T
+    Cyy = dY @ dY.T
+    Cxy = dX @ dY.T
+
+    rdgx = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cxx)))
+    rdgy = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cyy)))
+
+    Mf = Cyx @ jnp.linalg.pinv(Cxx + rdgx * jnp.eye(Cxx.shape[0]))
+    Mb = Cxy @ jnp.linalg.pinv(Cyy + rdgy * jnp.eye(Cyy.shape[0]))
+
+    YhSel = Yens_NN + Mf @ (Xq - Xens_NN)
+    XhSel = Xens_NN + Mb @ (Ym - YhSel)
+
+    # Fixed-size unique: always returns exactly N_neighbor indices
+    idxs2 = _mahal_knn_batch(Xens, XhSel, VI, 1).flatten()   # (N_neighbor,)
+    idxs_new = jnp.unique(idxs2, size=N_neighbor,
+                          fill_value=-1)                       # (N_neighbor,)
+
+    # Top-up: always pull N_neighbor candidates from Xq, use where idxs_new has fill
+    idxs_topup = _mahal_knn_single(Xens, Xq.ravel(), VI, N_neighbor)
+    idxs_final = jnp.where(idxs_new >= 0, idxs_new, idxs_topup)
+
+    Yh     = Ym + Mf @ (Xq - Xm)
+    cov_Yh = Cyy - Mf @ Cxy
+
+    return idxs_final, Mf, Cxy, Xm, Ym, Yh, cov_Yh
+
+# ── Main function ─────────────────────────────────────────────────────────────
+def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=1000):
     """
-    Conditional Gaussian Process
-    Inputs: 
-        obs_features : ndarray (D, N)
-            D-dimensional features of the N ensemble data points.
-        obs_labels : ndarray (K, N)
-            K-dimensional labels of the N ensemble data points.
-        query_features : ndarray (D, 1)
-            D-dimensional features of the query data point.
-    Outputs:
-        query_labels : ndarray (K, N)
-            K-dimensional labels of the ensemble updated from the query point.
-        query_cov_labels : ndarray (K, K)
-            K-by-K covariance of the ensemble labels.
+    Parameters:
+    Xens_j: array of input features which compose the ensemble. shape:(D, N) 
+    Yens_j: array of input labels which compose the ensemble. shape:(M, N) 
+    Xq: query point for which we want to compute a prediction. shape:(D,) or (D,1)
+    VI_j: inverse of the covariance matrix for the input ensemble. shape:(D, D)
+    N_neighbor: int, number of neighbors to use in CGP
+    tol: float, convergence threshold on average relative change in prediction (default 1%)
+    max_iter: int, safety cap on number of iterations (default 100)
     """
-    
-    # Defining relevant covariance matrices
-    ## Between feature and label of observation data
-    Cyx = (obs_labels @ obs_features.T) / (obs_features.shape[0] - 1)
-    ## Between label and feature of observation data
-    Cxy = (obs_features @ obs_labels.T) / (obs_features.shape[0] - 1)
-    ## Between feature and feature of observation data
-    Cxx = (obs_features @ obs_features.T) / (obs_features.shape[0] - 1)
-    ## Between label and label of observation data
-    Cyy = (obs_labels @ obs_labels.T) / (obs_features.shape[0] - 1)
-    ## Adding regularizer to avoid singularities
-    Cxx += 1e-8 * np.eye(Cxx.shape[0]) 
+    Xq_j = jnp.array(Xq.ravel())   # (D,)
 
-    query_labels = obs_labels + (Cyx @ scipy.linalg.pinv(Cxx) @ (query_features - obs_features))
+    idxs = _mahal_knn_single(Xens_j, Xq_j, VI_j, N_neighbor)
 
-    query_cov_labels = Cyy - Cyx @ scipy.linalg.pinv(Cxx) @ Cxy
+    # Run first iteration to get an initial prediction
+    idxs, _, _, _, _, Yh_prev, cov_Yh = _cgp_step_fixed(
+        Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
+    )
+    Yh_prev = np.array(Yh_prev.flatten())
 
-    return query_labels, query_cov_labels
+    rel_change_history = []
+
+    for i in range(max_iter - 1):
+        idxs, _, _, _, _, Yh, cov_Yh = _cgp_step_fixed(
+            Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
+        )
+        Yh = np.array(Yh.flatten())
+
+        # Average relative change between this and previous prediction
+        # Add small epsilon to denominator to avoid division by zero
+        rel_change = np.mean(
+            np.abs(Yh - Yh_prev) / (np.abs(Yh_prev) + 1e-10)
+        )
+
+        if rel_change < tol:
+            break
+
+        # Oscillation detection: count how many times the current value
+        # has appeared in the full history
+        n_repeats = np.sum(np.isclose(rel_change_history, rel_change, rtol=1e-3))
+        if n_repeats >= 5:
+            break
+
+        rel_change_history.append(rel_change)
+
+        Yh_prev = Yh
+
+    err_Yh = jnp.sqrt(jnp.maximum(0.0, jnp.diag(cov_Yh)))
+    return Yh, np.array(err_Yh), i + 2   # +2 because of the initial iteration before the loop
 
 
 
@@ -226,7 +304,6 @@ class SimpleCNN(nn.Module):
             # Output: 32 x 48 x 69
             
             nn.Conv2d(32, output_channels, kernel_size=1, stride=1, padding=0),
-            nn.Sigmoid()  # Output values between 0 and 1
             # Output: output_channels x 48 x 69
         )
     
@@ -257,7 +334,7 @@ class CustomDataModule(pl.LightningDataModule):
         
         # Standardizing the output
         ## Create scaler
-        out_scaler = MinMaxScaler()
+        out_scaler = StandardScaler()
         
         ## Fit scaler on training dataset (convert to numpy)
         out_scaler.fit(train_outputs.cpu().numpy())
@@ -270,25 +347,34 @@ class CustomDataModule(pl.LightningDataModule):
         # Store the scaler if you need to inverse transform later
         self.out_scaler = out_scaler
         
-        # Normalizing the input
-        ## Create scaler
-        in_scaler = MinMaxScaler()
+        # --- Input scaling: one scaler per block ---
+        # Block indices: [phys(D) | GP_pred(O) | GP_err(O)]
+        i0, i1, i2 = 0, D, D+O
+
+        in_scaler_phys = StandardScaler()
+        in_scaler_pred = StandardScaler()
+        in_scaler_err  = StandardScaler()
         
-        ## Fit scaler on training dataset (convert to numpy)
-        in_scaler.fit(train_inputs.cpu().numpy())
+        in_scaler_phys.fit(train_inputs[:, i0:i1].cpu().numpy())
+        in_scaler_pred.fit(train_inputs[:, i1:i2].cpu().numpy())
+        in_scaler_err.fit( train_inputs[:, i2:  ].cpu().numpy())
+
+        def scale_inputs(X):
+            X = X.cpu().numpy()
+            return torch.tensor(np.hstack([
+                in_scaler_phys.transform(X[:, i0:i1]),
+                in_scaler_pred.transform(X[:, i1:i2]),
+                in_scaler_err.transform( X[:, i2:  ]),
+            ]), dtype=torch.float32)
+
+        self.train_inputs  = scale_inputs(train_inputs)
+        self.valid_inputs  = scale_inputs(valid_inputs)
+        self.test_inputs   = scale_inputs(test_inputs)
         
-        ## Transform all datasets and convert back to tensors
-        train_inputs = torch.tensor(in_scaler.transform(train_inputs.cpu().numpy()), dtype=torch.float32)
-        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.cpu().numpy()), dtype=torch.float32)
-        test_inputs = torch.tensor(in_scaler.transform(test_inputs.cpu().numpy()), dtype=torch.float32)
-        
-        # Store the scaler if you need to inverse transform later
-        self.in_scaler = in_scaler
-        
-        #Store the inputs
-        self.train_inputs = train_inputs
-        self.valid_inputs = valid_inputs
-        self.test_inputs = test_inputs
+        # Store all scalers for inference
+        self.in_scaler_phys = in_scaler_phys
+        self.in_scaler_pred = in_scaler_pred
+        self.in_scaler_err  = in_scaler_err
 
         # Reshape data if needed for CNN
         if reshape_for_cnn:
@@ -303,18 +389,15 @@ class CustomDataModule(pl.LightningDataModule):
                 self.img_height = img_size
                 self.img_width = img_size
             
-            self.train_inputs = train_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
-            self.valid_inputs = valid_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
-            self.test_inputs = test_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
+            self.train_inputs = self.train_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
+            self.valid_inputs = self.valid_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
+            self.test_inputs = self.test_inputs.reshape(-1, img_channels, self.img_height, self.img_width)
             
             self.train_outputs = train_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
             self.valid_outputs = valid_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
             self.test_outputs = test_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
 
         else:
-            self.train_inputs = train_inputs
-            self.valid_inputs = valid_inputs
-            self.test_inputs = test_inputs
             self.train_outputs = train_outputs
             self.valid_outputs = valid_outputs
             self.test_outputs = test_outputs
@@ -340,37 +423,43 @@ summary(model)
 ############################
 #### Build training set ####
 ############################
-#Initialize array to store residuals
-train_NN_inputs = np.zeros(train_outputs.shape, dtype=float)
 
-for query_idx, (query_input, query_output) in enumerate(zip(train_inputs, train_outputs)):
+print('BUILDING GP TRAINING SET')
 
-    #Calculate proximity of query point to observations
-    # Euclidian distance
-    if 'euclidean' in distance_metric:
-        distances = np.sqrt( (query_input[0] - train_inputs[:,0])**2 + (query_input[1] - train_inputs[:,1])**2 + (query_input[2] - train_inputs[:,2])**2 + (query_input[3] - train_inputs[:,3])**2 )
-    # Mahalanobis distance
-    elif 'mahalanobis' in distance_metric:
-        distances = np.sqrt( (query_input - np.mean(train_inputs, axis=0)).T @ scipy.linalg.inv((train_inputs @ train_inputs.T) / (train_inputs.shape[0] - 1)) @ (query_input - np.mean(train_inputs, axis=0)) )
-    else:raise('Invalid distance metric')
+# Initialize array to store NN inputs / GP outputs
+GP_outputs = np.zeros(raw_outputs.shape, dtype=float)
+GP_outputs_err = np.zeros(raw_outputs.shape, dtype=float)
 
-    #Choose the N closest points
-    N_closest_idx = np.argsort(distances)[:N_neigbors]
-    prox_train_inputs = train_inputs[N_closest_idx, :]
-    prox_train_outputs = train_outputs[N_closest_idx, :]
-    
-    #Find the query labels from nearest neigbours
-    mean_test_output, cov_test_output = Sai_CGP(prox_train_inputs.T, prox_train_outputs.T, query_input.reshape((1, 4)).T)
-    model_test_output = np.mean(mean_test_output,axis=1)
-    model_test_output_err = np.sqrt(np.diag(cov_test_output))
-    train_NN_inputs[query_idx, :] = model_test_output
+for query_idx, (query_input, query_output) in enumerate(zip(tqdm(raw_inputs), raw_outputs)):
+
+    # Define the training data for CGP (all data points except the query point)
+    XTr = np.delete(
+        raw_inputs.T, #shape: (4, N)
+        query_idx,
+        axis=1
+        )
+    YTr = np.delete(
+                    raw_outputs.T,   # shape: (M, N)
+                    query_idx,
+                    axis=1
+                    )
+
+    Yh, err_Yh, it = ens_CGP(
+                        jnp.array(XTr),
+                        jnp.array(YTr),
+                        query_input, 
+                        jnp.linalg.inv(jnp.cov(XTr)),
+                        N_neighbor, 
+        )
+    GP_outputs[query_idx, :] = Yh
+    GP_outputs_err[query_idx, :] = err_Yh
 
     #Diagnostic plot
     if show_plot:
 
         #Convert shape
-        plot_test_output = query_output.reshape((46, 72))
-        plot_model_test_output = model_test_output.reshape((46, 72))
+        plot_query_output = query_output.reshape((46, 72))
+        plot_model_output = Yh.reshape((46, 72))
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True, layout='constrained')        
         # Compute global vmin/vmax across all datasets
@@ -379,11 +468,11 @@ for query_idx, (query_input, query_output) in enumerate(zip(train_inputs, train_
         
         # Plot heatmaps
         ax1.set_title('Data')
-        hm1 = sns.heatmap(plot_test_output, ax=ax1)
+        hm1 = sns.heatmap(plot_query_output, ax=ax1)
         cbar = hm1.collections[0].colorbar
         cbar.set_label('Temperature (K)')
         ax2.set_title('Model')
-        hm2 = sns.heatmap(plot_model_test_output, ax=ax2)
+        hm2 = sns.heatmap(plot_model_output, ax=ax2)
         cbar = hm2.collections[0].colorbar
         cbar.set_label('Temperature (K)')
 
@@ -396,36 +485,57 @@ for query_idx, (query_input, query_output) in enumerate(zip(train_inputs, train_
             ax.set_yticks(np.linspace(0, 46, 5))
             ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
             ax.set_ylabel('Latitude (degrees)')
-        plt.suptitle(rf'H$_2$O : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg')
+        plt.suptitle(rf'H$_2$O : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Teff : {query_input[4]} K, Number of iterations: {it}')
         plt.show()
+
+# Targets are residuals: truth - GP prediction
+residuals = raw_outputs - GP_outputs   # (N, O)
 
 # Split training dataset into training, validation, and testing, and format it correctly
 
 ## Retrieving indices of data partitions
-train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(train_inputs.shape[0]), sub_data_partitions, generator=partition_rng)
+train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(N), data_partition, generator=partition_rng)
 
 ## Generate the data partitions
-### Training
-NN_train_inputs = torch.tensor(train_NN_inputs[train_idx], dtype=torch.float32)
-NN_train_outputs = torch.tensor(train_outputs[train_idx], dtype=torch.float32)
-### Validation
-NN_valid_inputs = torch.tensor(train_NN_inputs[valid_idx], dtype=torch.float32)
-NN_valid_outputs = torch.tensor(train_outputs[valid_idx], dtype=torch.float32)
-### Testing
-NN_test_og_inputs = torch.tensor(train_inputs[test_idx], dtype=torch.float32) 
-NN_test_inputs = torch.tensor(train_NN_inputs[test_idx], dtype=torch.float32)
-NN_test_outputs = torch.tensor(train_outputs[test_idx], dtype=torch.float32)
+
+# --- Inputs ---
+# --- Initial inputs ---
+NN_train_inputs_phys = torch.tensor(raw_inputs[train_idx], dtype=torch.float32)
+NN_valid_inputs_phys = torch.tensor(raw_inputs[valid_idx], dtype=torch.float32)
+NN_test_inputs_phys  = torch.tensor(raw_inputs[test_idx],  dtype=torch.float32)
+
+# --- GP predictions ---
+NN_train_inputs_pred = torch.tensor(GP_outputs[train_idx],    dtype=torch.float32)
+NN_valid_inputs_pred = torch.tensor(GP_outputs[valid_idx],    dtype=torch.float32)
+NN_test_inputs_pred  = torch.tensor(GP_outputs[test_idx],     dtype=torch.float32)
+
+# --- GP errors ---
+NN_train_inputs_err = torch.tensor(GP_outputs_err[train_idx], dtype=torch.float32)
+NN_valid_inputs_err = torch.tensor(GP_outputs_err[valid_idx], dtype=torch.float32)
+NN_test_inputs_err  = torch.tensor(GP_outputs_err[test_idx],  dtype=torch.float32)
+
+# --- Outputs ---
+# --- residuals ---
+NN_train_outputs = torch.tensor(residuals[train_idx], dtype=torch.float32)
+NN_valid_outputs = torch.tensor(residuals[valid_idx], dtype=torch.float32)
+NN_test_outputs  = torch.tensor(residuals[test_idx],  dtype=torch.float32)
+
+# --- Plotting purposes: truth ---
+NN_test_true    = torch.tensor(raw_outputs[test_idx], dtype=torch.float32)
+
+# --- Concatenate: [init | GP | GP_err] ---
+NN_train_inputs = torch.cat([NN_train_inputs_phys, NN_train_inputs_pred, NN_train_inputs_err], dim=1)
+NN_valid_inputs = torch.cat([NN_valid_inputs_phys, NN_valid_inputs_pred, NN_valid_inputs_err], dim=1)
+NN_test_inputs  = torch.cat([NN_test_inputs_phys,  NN_test_inputs_pred,  NN_test_inputs_err],  dim=1)
 
 # Create DataModule
 data_module = CustomDataModule(
     NN_train_inputs, NN_train_outputs,
     NN_valid_inputs, NN_valid_outputs,
     NN_test_inputs, NN_test_outputs,
-    batch_size, batch_rng, reshape_for_cnn=True,
+    batch_size, batch_rng,reshape_for_cnn=True,
     img_channels=1, img_height=46, img_width=72
 )
-
-
 
 
 
@@ -435,16 +545,21 @@ data_module = CustomDataModule(
 ###################################
 # PyTorch Lightning Module
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0):
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0,
+                 reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0,
+                 lr_patience=10, lr_factor=0.5, lr_min=1e-7):
         super().__init__()
-        self.model = model
-        self.learning_rate = learning_rate
-        self.reg_coeff_l1 = reg_coeff_l1
-        self.reg_coeff_l2 = reg_coeff_l2
+        self.model            = model
+        self.learning_rate    = learning_rate
+        self.reg_coeff_l1     = reg_coeff_l1
+        self.reg_coeff_l2     = reg_coeff_l2
         self.smoothness_coeff = smoothness_coeff
-        self.weight_decay = weight_decay
-        self.loss_fn = nn.MSELoss()
-        self.optimizer_class = optimizer
+        self.weight_decay     = weight_decay
+        self.loss_fn          = nn.MSELoss()
+        self.optimizer_class  = optimizer
+        self.lr_patience      = lr_patience
+        self.lr_factor        = lr_factor
+        self.lr_min           = lr_min
     
     def compute_weight_regularization(self):
         """
@@ -537,9 +652,29 @@ class RegressionModule(pl.LightningModule):
         # Log metrics
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
-    
+
     def configure_optimizers(self):
-        return self.optimizer_class(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+        optimizer = self.optimizer_class(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+        scheduler = lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=self.lr_factor,
+            patience=self.lr_patience,
+            min_lr=self.lr_min,
+        )
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'valid_loss',   # ReduceLROnPlateau needs a metric to watch
+                'interval': 'epoch',
+                'frequency': 1,
+            }
+        }
 
 
 
@@ -555,11 +690,14 @@ class RegressionModule(pl.LightningModule):
 lightning_module = RegressionModule(
     model=model,
     optimizer=Adam,
-    learning_rate=learning_rate,
+    learning_rate=lr_init,
     reg_coeff_l1=regularization_coeff_l1,
     reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay,
     smoothness_coeff=smoothness_coeff,
+    lr_patience=lr_patience,
+    lr_factor=lr_factor,
+    lr_min=lr_min,
 )
 
 # Setup logger
@@ -581,21 +719,24 @@ if run_mode == 'use':
     trainer.fit(lightning_module, datamodule=data_module)
     
     # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt')
+    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{lr_init}LR_{batch_size}BS.ckpt')
     
     print("Done!")
     
 else:
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt',
+        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{lr_init}LR_{batch_size}BS.ckpt',
         model=model,
         optimizer=Adam,
-    learning_rate=learning_rate,
+    learning_rate=lr_init,
     reg_coeff_l1=regularization_coeff_l1,
     reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay,
     smoothness_coeff=smoothness_coeff,
+    lr_patience=lr_patience,
+    lr_factor=lr_factor,
+    lr_min=lr_min,
     )
     print("Model loaded!")
 
@@ -667,8 +808,11 @@ plt.savefig(plot_save_path+'/loss.pdf')
 substep = 100
 
 # Get the scalers from data module
+# Get the scalers from data module
 out_scaler = data_module.out_scaler
-in_scaler = data_module.in_scaler
+in_scaler_phys = data_module.in_scaler_phys
+in_scaler_pred = data_module.in_scaler_pred
+in_scaler_err  = data_module.in_scaler_err
 
 # Move model to CPU for inference to avoid GPU memory issues
 model.cpu()
@@ -681,30 +825,36 @@ if (type(NN_test_outputs) != np.ndarray):
 GP_res = np.zeros(NN_test_outputs.shape, dtype=float)
 NN_res = np.zeros(NN_test_outputs.shape, dtype=float)
 
-for NN_test_idx, (NN_test_input, GP_test_output, NN_test_output) in enumerate(zip(NN_test_og_inputs, NN_test_inputs, NN_test_outputs)):
-
+for NN_test_idx, (NN_test_input, GP_test_output,
+                  GP_test_err,NN_test_output,true) in enumerate(zip(
+    NN_test_inputs_phys,NN_test_inputs_pred,
+    NN_test_inputs_err,NN_test_outputs,NN_test_true
+)):
     # Flatten to 2D for the scaler: (1 sample, 3312 features)
     GP_test_output_np = GP_test_output.cpu().numpy().reshape(1, -1)
 
     # Scale the input
-    scaled_input = in_scaler.transform(GP_test_output_np)
+    scaled_input = torch.tensor(np.hstack([
+        in_scaler_phys.transform(NN_test_input.numpy().reshape(1, -1)),
+        in_scaler_pred.transform(   GP_test_output.numpy().reshape(1, -1)),
+        in_scaler_err.transform(GP_test_err.numpy().reshape(1, -1)),
+    ]), dtype=torch.float32)
 
-    # If your model expects 4D input, reshape back
-    # Otherwise, keep it as 2D if that's what the model expects
-    model_input = torch.tensor(scaled_input, dtype=torch.float32).reshape(1, 1, 46, 72)
-
-    # Get prediction
-    NN_pred_output_scaled = model(model_input).detach().numpy().reshape(3312)
+    NN_pred_output = model(scaled_input).detach().numpy()
 
     # Inverse transform to get original scale
-    NN_pred_output = out_scaler.inverse_transform(NN_pred_output_scaled.reshape(1, -1)).flatten()
+    pred_resid = out_scaler.inverse_transform(NN_pred_output.reshape(1, -1)).flatten()
+    
+    # Final prediction = GP prediction + NN residual correction
+    NN_pred_output = GP_test_output.numpy() + pred_resid
 
     #Convert to numpy
+    true_np = true.cpu().numpy()
     NN_test_input = NN_test_input.cpu().numpy()
 
     #Storing residuals 
-    GP_res[NN_test_idx, :] = GP_test_output - NN_test_output
-    NN_res[NN_test_idx, :] = NN_pred_output - NN_test_output
+    GP_res[NN_test_idx, :] = GP_test_output.numpy() - true_np
+    NN_res[NN_test_idx, :] = NN_pred_output - true_np
 
     #Plotting
     if (NN_test_idx % substep == 0):
@@ -755,7 +905,7 @@ for NN_test_idx, (NN_test_input, GP_test_output, NN_test_output) in enumerate(zi
             ax.set_yticks(np.linspace(0, 46, 5))
             ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
             ax.set_ylabel('Latitude (degrees)')
-        plt.suptitle(rf'H$_2$ : {NN_test_input[0]} bar, CO$_2$ : {NN_test_input[1]} bar, LoD : {NN_test_input[2]:.0f} days, Obliquity : {NN_test_input[3]} deg')
+        plt.suptitle(rf'H$_2$ : {NN_test_input[0]} bar, CO$_2$ : {NN_test_input[1]} bar, LoD : {NN_test_input[2]:.0f} days, Obliquity : {NN_test_input[3]} deg, Teff : {NN_test_input[4]} K')
 
         plt.savefig(plot_save_path+f'/pred_vs_actual_n.{NN_test_idx}.pdf')
        

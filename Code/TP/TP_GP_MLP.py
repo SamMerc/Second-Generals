@@ -476,7 +476,7 @@ for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tq
         plt.subplots_adjust(wspace=0.2)
         plt.show()
 
-# argets are residuals: truth - GP prediction
+# Targets are residuals: truth - GP prediction
 residuals_T = raw_outputs_T - GP_outputs_T   # (N, O)
 residuals_P = raw_outputs_P - GP_outputs_P   # (N, O)
 
