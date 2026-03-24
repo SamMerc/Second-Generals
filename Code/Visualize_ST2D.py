@@ -127,12 +127,23 @@ if plot_1:
     # --- SVD Decomposition for ST2D ---
     _, S_ST2D, _ = np.linalg.svd(raw_outputs, full_matrices=False)
 
+    var_explained_ST2D = np.cumsum(S_ST2D**2) / np.sum(S_ST2D**2)
+
     fig, axes = plt.subplots(figsize=(8,6))
     axes.plot(S_ST2D, color='blue')
     axes.set_xlabel('Component Index')
     axes.set_ylabel('Singular Value')
     axes.set_yscale('log')
-
+    axestwin = axes.twinx()
+    axestwin.set_yscale('log')
+    axestwin.plot(var_explained_ST2D, color='red')
+    axestwin.set_ylabel('Cumulative variance explained')
+    # Find number of components needed to explain threshold % of variance
+    threshold = 0.9999
+    n_components_ST2D = np.searchsorted(var_explained_ST2D, threshold) + 1
+    axestwin.axhline(threshold, color='red', linestyle='--', label=f'{threshold*100}% threshold')
+    axestwin.axvline(n_components_ST2D-1, color='green', linestyle='--', label=f'K={n_components_ST2D}')
+    plt.legend()
     plt.savefig(plot_save_path + 'SVD_ST2D.pdf')
     plt.show()
 
