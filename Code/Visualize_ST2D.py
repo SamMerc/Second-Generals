@@ -43,6 +43,13 @@ N = raw_inputs.shape[0] #Number of data points
 D = raw_inputs.shape[1] #Number of features
 O = raw_outputs.shape[1] #Number of outputs
 
+# Shuffle data
+np.random.seed(3)
+rp = np.random.permutation(N) #random permutation of the indices
+# Apply random permutation to shuffle the data
+raw_inputs = raw_inputs[rp, :]
+raw_outputs = raw_outputs[rp, :]
+
 ## HYPER-PARAMETERS ##
 #Definine partitiion for splitting NN dataset
 data_partition = [0.7, 0.1, 0.2]
