@@ -22,6 +22,7 @@ from tqdm import tqdm
 from jax import jit, vmap
 from functools import partial
 import jax.numpy as jnp
+from time import time
 
 
 ##########################################################
@@ -715,6 +716,9 @@ trainer = Trainer(
     deterministic=True  # For reproducibility
 )
 
+#Start time 
+t0 = time()
+
 if run_mode == 'use':
     
     trainer.fit(lightning_module, datamodule=data_module)
@@ -722,7 +726,11 @@ if run_mode == 'use':
     # Save model (PyTorch Lightning style)
     trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{lr_init}LR_{batch_size}BS.ckpt')
     
-    print("Done!")
+    finish_time_s = time() - t0
+    finish_time_min = finish_time_s/60
+    finish_time_hrs = finish_time_s/3600
+    finish_time_days = finish_time_s/(3600*24)
+    print(f"Done! In {finish_time_s:.3f} s/{finish_time_min:.3f} min/{finish_time_hrs:.3f} hrs/{finish_time_days:.3f} days")
     
 else:
     # Load model
