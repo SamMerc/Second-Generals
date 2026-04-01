@@ -412,10 +412,10 @@ print('BUILDING GP TRAINING SET')
 
 # --- Define a cache path tied to the key hyperparameters ---
 gp_cache_path = (
-    model_save_path
-    + f'gp_cache_Nn{N_neighbor}_seed{shuffle_seed}.npz'
+    base_dir
+    + f'Model_Storage/gp_cache_Nn{N_neighbor}_seed{shuffle_seed}.npz'
 )
-matching_files = glob.glob(model_save_path + 'gp_cache_*.npz')
+matching_files = glob.glob(base_dir+'Model_Storage/gp_cache_*.npz')
 
 if os.path.exists(gp_cache_path):
     # ── Load from cache ───────────────────────────────────────
