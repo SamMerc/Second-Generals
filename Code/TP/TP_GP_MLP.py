@@ -21,7 +21,7 @@ from jax import jit, vmap
 from functools import partial
 import jax.numpy as jnp
 from time import time
-
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
@@ -709,10 +709,20 @@ logger = CSVLogger(model_save_path+'logs', name='NeuralNetwork')
 # Set all seeds for complete reproducibility
 pl.seed_everything(NN_seed, workers=True)
 
+# Create Trainer and train
 trainer = Trainer(
     max_epochs=n_epochs,
     logger=logger,
-    deterministic=True  # For reproducibility
+    deterministic=True,
+    enable_checkpointing=True,
+    callbacks=[
+        ModelCheckpoint(
+            dirpath=model_save_path,
+            save_top_k=1,
+            monitor='valid_loss',
+            mode='min',
+        )
+    ]
 )
 
 #Start time 
@@ -720,8 +730,13 @@ t0 = time()
 
 if run_mode == 'use':
     
-    trainer.fit(lightning_module, datamodule=data_module)
+    # Try to resume from last checkpoint if it exists
+    last_ckpt = None
+    if os.path.exists(model_save_path + 'last.ckpt'):
+        last_ckpt = model_save_path + 'last.ckpt'
     
+    trainer.fit(lightning_module, datamodule=data_module, ckpt_path=last_ckpt)
+
     # Save model (PyTorch Lightning style)
     trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{lr_init}LR_{batch_size}BS.ckpt')
     
