@@ -24,6 +24,7 @@ from functools import partial
 import jax.numpy as jnp
 from time import time
 from pytorch_lightning.callbacks import ModelCheckpoint
+import glob
 
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
@@ -59,7 +60,8 @@ D = raw_inputs.shape[1] #Number of features
 O = raw_outputs.shape[1] #Number of outputs
 
 # Shuffle data
-np.random.seed(3)
+shuffle_seed = 3
+np.random.seed(shuffle_seed)
 rp = np.random.permutation(N) #random permutation of the indices
 # Apply random permutation to shuffle the data
 raw_inputs = raw_inputs[rp, :]
@@ -422,73 +424,115 @@ summary(model)
 
 
 
-############################
-#### Build training set ####
-############################
+################################
+### Build/Load training set ####
+################################
 
 print('BUILDING GP TRAINING SET')
 
-# Initialize array to store NN inputs / GP outputs
-GP_outputs = np.zeros(raw_outputs.shape, dtype=float)
-GP_outputs_err = np.zeros(raw_outputs.shape, dtype=float)
+# --- Define a cache path tied to the key hyperparameters ---
+gp_cache_path = (
+    model_save_path
+    + f'gp_cache_Nn{N_neighbor}_seed{shuffle_seed}.npz'
+)
+matching_files = glob.glob(model_save_path + 'gp_cache_*.npz')
 
-for query_idx, (query_input, query_output) in enumerate(zip(tqdm(raw_inputs), raw_outputs)):
+if os.path.exists(gp_cache_path):
+    # ── Load from cache ───────────────────────────────────────
+    print(f'  Loading cached GP outputs from:\n  {gp_cache_path}')
+    cache = np.load(gp_cache_path)
+    GP_outputs_    = cache['GP_outputs']
+    GP_outputs_err = cache['GP_outputs_err']
 
-    # Define the training data for CGP (all data points except the query point)
-    XTr = np.delete(
-        raw_inputs.T, #shape: (4, N)
-        query_idx,
-        axis=1
-        )
-    YTr = np.delete(
-                    raw_outputs.T,   # shape: (M, N)
-                    query_idx,
-                    axis=1
-                    )
+elif matching_files:
+    # ── Cache mismatch warning ────────────────────────────────
+    raise RuntimeError(
+        f'WARNING: A GP cache with different hyperparameters was found:\n'
+        f'  {matching_files}\n'
+        f'Delete it or update your hyperparameters to match.'
+    )
+else:
+    # ── Compute and cache GP outputs ───────────────────────────
+    print(f'  No cache found. Computing GP outputs and saving to:\n  {gp_cache_path}')
 
-    Yh, err_Yh, it = ens_CGP(
-                        jnp.array(XTr),
-                        jnp.array(YTr),
-                        query_input, 
-                        jnp.linalg.inv(jnp.cov(XTr)),
-                        N_neighbor, 
-        )
-    GP_outputs[query_idx, :] = Yh
-    GP_outputs_err[query_idx, :] = err_Yh
+    # Initialize array to store NN inputs / GP outputs
+    GP_outputs = np.zeros(raw_outputs.shape, dtype=float)
+    GP_outputs_err = np.zeros(raw_outputs.shape, dtype=float)
 
-    #Diagnostic plot
-    if show_plot:
+    for query_idx, (query_input, query_output) in enumerate(zip(tqdm(raw_inputs), raw_outputs)):
 
-        #Convert shape
-        plot_query_output = query_output.reshape((46, 72))
-        plot_model_output = Yh.reshape((46, 72))
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True, layout='constrained')        
-        # Compute global vmin/vmax across all datasets
-        vmin = np.min(query_output)
-        vmax = np.max(query_output)
-        
-        # Plot heatmaps
-        ax1.set_title('Data')
-        hm1 = sns.heatmap(plot_query_output, ax=ax1)
-        cbar = hm1.collections[0].colorbar
-        cbar.set_label('Temperature (K)')
-        ax2.set_title('Model')
-        hm2 = sns.heatmap(plot_model_output, ax=ax2)
-        cbar = hm2.collections[0].colorbar
-        cbar.set_label('Temperature (K)')
+        # Define the training data for CGP (all data points except the query point)
+        XTr = np.delete(
+            raw_inputs.T, #shape: (4, N)
+            query_idx,
+            axis=1
+            )
+        YTr = np.delete(
+                        raw_outputs.T,   # shape: (M, N)
+                        query_idx,
+                        axis=1
+                        )
 
-        ax2.set_xticks(np.linspace(0, 72, 5))
-        ax2.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
-        ax2.set_xlabel('Longitude (degrees)')
-        
-        # Fix latitude ticks
-        for ax in [ax1, ax2]:
-            ax.set_yticks(np.linspace(0, 46, 5))
-            ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
-            ax.set_ylabel('Latitude (degrees)')
-        plt.suptitle(rf'H$_2$O : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Teff : {query_input[4]} K, Number of iterations: {it}')
-        plt.show()
+        Yh, err_Yh, it = ens_CGP(
+                            jnp.array(XTr),
+                            jnp.array(YTr),
+                            query_input, 
+                            jnp.linalg.inv(jnp.cov(XTr)),
+                            N_neighbor, 
+            )
+        GP_outputs[query_idx, :] = Yh
+        GP_outputs_err[query_idx, :] = err_Yh
+    
+    # Save to cache so the loop is skipped next time
+    np.savez(
+        gp_cache_path,
+        GP_outputs=GP_outputs,
+        GP_outputs_err=GP_outputs_err,
+    )
+    print(f'  GP outputs cached to:\n  {gp_cache_path}')
+
+#Diagnostic plot
+if show_plot:
+
+    #Convert shape
+    plot_query_output = query_output.reshape((46, 72))
+    plot_model_output = Yh.reshape((46, 72))
+    plot_error_output = err_Yh.reshape((46, 72))
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True, layout='constrained')        
+    # Compute global vmin/vmax across all datasets
+    vmin = np.min(query_output)
+    vmax = np.max(query_output)
+    
+    # Plot heatmaps
+    ax1.set_title('Data')
+    hm1 = sns.heatmap(plot_query_output, ax=ax1)
+    cbar = hm1.collections[0].colorbar
+    cbar.set_label('Temperature (K)')
+    ax2.set_title('Model')
+    hm2 = sns.heatmap(plot_model_output, ax=ax2)
+    cbar = hm2.collections[0].colorbar
+    cbar.set_label('Temperature (K)')
+
+    ax2.set_xticks(np.linspace(0, 72, 5))
+    ax2.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
+    ax2.set_xlabel('Longitude (degrees)')
+    
+    # Fix latitude ticks
+    for ax in [ax1, ax2]:
+        ax.set_yticks(np.linspace(0, 46, 5))
+        ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
+        ax.set_ylabel('Latitude (degrees)')
+    plt.suptitle(rf'H$_2$O : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Teff : {query_input[4]} K, Number of iterations: {it}')
+    plt.show()
+
+    # create_rotating_sphere_gif(plot_model_output, plot_error_output, rotation_axes='xyz', n_cycles=1, filename='sphere_rotation_xyz.gif')
+
+    # create_rotating_sphere_gif(plot_model_output, plot_error_output, rotation_axes='z', n_cycles=1, filename='sphere_rotation_z.gif')
+
+    # plot_2d_map_with_errors(plot_model_output, plot_error_output)
+
+
 
 # Targets are residuals: truth - GP prediction
 residuals = raw_outputs - GP_outputs   # (N, O)

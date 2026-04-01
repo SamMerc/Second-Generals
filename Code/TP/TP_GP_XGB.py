@@ -12,6 +12,7 @@ from tqdm import tqdm
 from kneed import KneeLocator
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
+import glob
 
 
 ##########################################################
@@ -62,7 +63,8 @@ D = raw_inputs.shape[1] #Number of features
 O = raw_outputs_T.shape[1] #Number of outputs
 
 # Shuffle data
-np.random.seed(3)
+shuffle_seed = 3
+np.random.seed(shuffle_seed)
 rp = np.random.permutation(N) #random permutation of the indices
 # Apply random permutation to shuffle the data
 raw_inputs = raw_inputs[rp, :]
@@ -202,54 +204,91 @@ def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=1000):
 
 
 
-############################
-#### Build training set ####
-############################
+################################
+### Build/Load training set ####
+################################
 
 print('BUILDING GP TRAINING SET')
 
-# Initialize array to store NN inputs / GP outputs
-GP_outputs_T = np.zeros(raw_outputs_T.shape, dtype=float)
-GP_outputs_P = np.zeros(raw_outputs_P.shape, dtype=float)
-GP_outputs_Terr = np.zeros(raw_outputs_T.shape, dtype=float)
-GP_outputs_Perr = np.zeros(raw_outputs_P.shape, dtype=float)
+# --- Define a cache path tied to the key hyperparameters ---
+gp_cache_path = (
+    model_save_path
+    + f'gp_cache_Nn{N_neighbor}_seed{shuffle_seed}.npz'
+)
+matching_files = glob.glob(model_save_path + 'gp_cache_*.npz')
 
-for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
+if os.path.exists(gp_cache_path):
+    # ── Load from cache ───────────────────────────────────────
+    print(f'  Loading cached GP outputs from:\n  {gp_cache_path}')
+    cache = np.load(gp_cache_path)
+    GP_outputs_T    = cache['GP_outputs_T']
+    GP_outputs_P    = cache['GP_outputs_P']
+    GP_outputs_Terr = cache['GP_outputs_Terr']
+    GP_outputs_Perr = cache['GP_outputs_Perr']
 
-    #Define ensemble without the query point
-    XTr = np.delete(
-                raw_inputs.T,
-                query_idx,
-                axis=1
-                )                           # (4, N)
+elif matching_files:
+    # ── Cache mismatch warning ────────────────────────────────
+    raise RuntimeError(
+        f'WARNING: A GP cache with different hyperparameters was found:\n'
+        f'  {matching_files}\n'
+        f'Delete it or update your hyperparameters to match.'
+    )
+else:
+    # ── Compute and cache GP outputs ───────────────────────────
+    print(f'  No cache found. Computing GP outputs and saving to:\n  {gp_cache_path}')
     
-    YTr = np.delete(
-        np.hstack([raw_outputs_T, raw_outputs_P]).T,   # shape: (M, N)
-        query_idx,
-        axis=1
-        )                                   # (O, N)
+    # Initialize array to store NN inputs / GP outputs
+    GP_outputs_T = np.zeros(raw_outputs_T.shape, dtype=float)
+    GP_outputs_P = np.zeros(raw_outputs_P.shape, dtype=float)
+    GP_outputs_Terr = np.zeros(raw_outputs_T.shape, dtype=float)
+    GP_outputs_Perr = np.zeros(raw_outputs_P.shape, dtype=float)
 
-    Xens_j = jnp.array(XTr)
-    Yens_j = jnp.array(YTr)
-    VI_j   = jnp.linalg.inv(jnp.cov(Xens_j))
+    for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
 
-    #Call the ens-CGP
-    Yh, Yh_err, it = ens_CGP(
-                Xens_j, Yens_j,
-                query_input,
-                VI_j,
-                N_neighbor,
-            )
-    
-    #Store outputs
-    GP_outputs_T[query_idx, :] = Yh[:O]
-    GP_outputs_Terr[query_idx, :] = Yh_err[:O]
-    GP_outputs_P[query_idx, :] = Yh[O:]
-    GP_outputs_Perr[query_idx, :] = Yh_err[O:]
+        #Define ensemble without the query point
+        XTr = np.delete(
+                    raw_inputs.T,
+                    query_idx,
+                    axis=1
+                    )                           # (D, N)
+        
+        YTr = np.delete(
+            np.hstack([raw_outputs_T, raw_outputs_P]).T,   # shape: (2O, N)
+            query_idx,
+            axis=1
+            )                                   # (O, N)
 
-    #Diagnostic plot
-    if show_plot:
+        Xens_j = jnp.array(XTr)
+        Yens_j = jnp.array(YTr)
+        VI_j   = jnp.linalg.inv(jnp.cov(Xens_j))
 
+        #Call the ens-CGP
+        Yh, Yh_err, it = ens_CGP(
+                    Xens_j, Yens_j,
+                    query_input,
+                    VI_j,
+                    N_neighbor,
+                )
+        
+        #Store outputs
+        GP_outputs_T[query_idx, :] = Yh[:O]
+        GP_outputs_Terr[query_idx, :] = Yh_err[:O]
+        GP_outputs_P[query_idx, :] = Yh[O:]
+        GP_outputs_Perr[query_idx, :] = Yh_err[O:]
+
+    # Save to cache so the loop is skipped next time
+    np.savez(
+        gp_cache_path,
+        GP_outputs_T=GP_outputs_T,
+        GP_outputs_P=GP_outputs_P,
+        GP_outputs_Terr=GP_outputs_Terr,
+        GP_outputs_Perr=GP_outputs_Perr,
+    )
+    print(f'  GP outputs cached to:\n  {gp_cache_path}')
+
+#Diagnostic plot
+if show_plot:
+    for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
         #Plot TP profiles
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
         
@@ -276,7 +315,6 @@ for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tq
         plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Teff : {query_input[4]} K, Number of iterations: {it}')
         plt.subplots_adjust(wspace=0.2)
         plt.show()
-
 
 #Plot the residuals
 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=[12, 8])
