@@ -17,8 +17,9 @@ import pytorch_lightning as pl
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from torchinfo import summary
-from sklearn.preprocessing import StandardScaler
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import seaborn as sns
 from tqdm import tqdm
 from jax import jit, vmap
 from functools import partial
@@ -33,6 +34,7 @@ from optuna_integration.pytorch_lightning import PyTorchLightningPruningCallback
 import warnings
 warnings.filterwarnings('ignore')
 
+
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
 ##########################################################
@@ -40,34 +42,33 @@ def check_and_make_dir(dir):
     if not os.path.isdir(dir): os.mkdir(dir)
 
 base_dir = '/home/merci228/WORK/2G_ML/'
-raw_T_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_T.csv', delimiter=',')
-raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
-raw_P_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_P.csv', delimiter=',')
-raw_P_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 
-model_save_path = base_dir+'Model_Storage/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS/'
+raw_data3000 = np.loadtxt(base_dir + 'Data/bt-3000k/training_data_ST2D.csv', delimiter=',')
+raw_data4500 = np.loadtxt(base_dir + 'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
+
+model_save_path = base_dir + 'Model_Storage/ST_Hyperparam_tuning_LRinit_CNNdepth_CNNchannels_L2_BS_SC/'
 check_and_make_dir(model_save_path)
-plot_save_path = base_dir+'Plots/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS/'
+plot_save_path = base_dir + 'Plots/ST_Hyperparam_tuning_LRinit_CNNdepth_CNNchannels_L2_BS_SC/'
 check_and_make_dir(plot_save_path)
 
-inputs_3000 = np.hstack([raw_T_data3000[:, :4], np.full((len(raw_T_data3000), 1), 3000.0)])
-inputs_4500 = np.hstack([raw_T_data4500[:, :4], np.full((len(raw_T_data4500), 1), 4500.0)])
+inputs_3000 = np.hstack([raw_data3000[:, :4], np.full((len(raw_data3000), 1), 3000.0)])
+inputs_4500 = np.hstack([raw_data4500[:, :4], np.full((len(raw_data4500), 1), 4500.0)])
 
-raw_inputs    = np.vstack([inputs_3000,           inputs_4500          ])
-raw_outputs_T = np.vstack([raw_T_data3000[:, 5:], raw_T_data4500[:, 5:]])
-raw_outputs_P = np.vstack([raw_P_data3000[:, 5:], raw_P_data4500[:, 5:]])
-raw_outputs_P = np.log10(raw_outputs_P / 1000)
+raw_inputs  = np.vstack([inputs_3000,          inputs_4500         ])
+raw_outputs = np.vstack([raw_data3000[:, 5:],  raw_data4500[:, 5:]])
 
 N = raw_inputs.shape[0]
 D = raw_inputs.shape[1]
-O = raw_outputs_T.shape[1]
+O = raw_outputs.shape[1]
+
+IMG_H, IMG_W = 46, 72
+assert O == IMG_H * IMG_W, f"Output dim {O} != {IMG_H}x{IMG_W}"
 
 shuffle_seed = 3
 np.random.seed(shuffle_seed)
 rp = np.random.permutation(N)
-raw_inputs    = raw_inputs[rp, :]
-raw_outputs_T = raw_outputs_T[rp, :]
-raw_outputs_P = raw_outputs_P[rp, :]
+raw_inputs  = raw_inputs[rp, :]
+raw_outputs = raw_outputs[rp, :]
 
 N_neighbor     = 4
 data_partition = [0.7, 0.1, 0.2]
@@ -77,20 +78,23 @@ num_threads = 96
 torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
 
+show_plot = False
+
 #############################
 #### run_mode selection  ####
 #############################
-run_mode = 'search2'   # 'search1' | 'search2' | 'train' | 'evaluate'
+run_mode = 'search1'   # 'search1' | 'search2' | 'train' | 'evaluate'
 
 ## ── Parameters for 'train' and 'evaluate' modes ──────────────────────────────
-## After the Optuna search completes, paste the best params here and switch
-## run_mode to 'train', then to 'evaluate'.
+## After Stage 2 completes, paste the best params here and switch run_mode
+## to 'train', then to 'evaluate'.
 FINAL_PARAMS = {
-    'lr_init'    : 1e-3,
-    'nn_depth'   : 32,
-    'nn_width'   : 209,
-    'reg_l2'     : 5e-5,
-    'batch_size' : 200,
+    'lr_init'          : 1e-3,
+    'cnn_depth'        : 7,
+    'cnn_channels'     : 64,
+    'reg_l2'           : 5e-5,
+    'smoothness_coeff' : 1e-1,
+    'batch_size'       : 32,
 }
 FINAL_PARTITION_SEED = 4
 FINAL_BATCH_SEED     = 5
@@ -98,8 +102,9 @@ FINAL_NN_SEED        = 6
 FINAL_LR_PATIENCE    = 50
 FINAL_LR_FACTOR      = 0.7
 FINAL_LR_MIN         = 1e-7
-FINAL_N_EPOCHS       = 5000
-FINAL_ES_PATIENCE    = 200
+FINAL_N_EPOCHS       = 1000
+FINAL_ES_PATIENCE    = 100
+
 
 ###############################################
 #### Ensemble Conditional Gaussian Process ####
@@ -168,18 +173,19 @@ def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=1000):
     err_Yh = jnp.sqrt(jnp.maximum(0.0, jnp.diag(cov_Yh)))
     return Yh, np.array(err_Yh), i + 2
 
+
 ###################
-#### Build MLP ####
+#### Build CNN ####
 ###################
-class ResidualBlock(nn.Module):
-    def __init__(self, dim):
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
             nn.GELU(),
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
         )
         self.activation = nn.GELU()
 
@@ -187,18 +193,23 @@ class ResidualBlock(nn.Module):
         return self.activation(x + self.block(x))
 
 
-class NeuralNetwork(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, depth, generator=None):
+class ResidualCNN(nn.Module):
+    def __init__(self, input_channels, hidden_channels, output_channels,
+                 depth, img_height, img_width, generator=None):
         super().__init__()
         if generator is not None:
             torch.manual_seed(generator.initial_seed())
+        self.img_height = img_height
+        self.img_width  = img_width
         self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
             nn.GELU(),
         )
-        self.blocks = nn.Sequential(*[ResidualBlock(hidden_dim) for _ in range(depth)])
-        self.output_proj = nn.Linear(hidden_dim, output_dim)
+        self.blocks = nn.Sequential(
+            *[ResidualConvBlock(hidden_channels) for _ in range(depth)]
+        )
+        self.output_proj = nn.Conv2d(hidden_channels, output_channels, kernel_size=1)
 
     def forward(self, x):
         x = self.input_proj(x)
@@ -206,65 +217,68 @@ class NeuralNetwork(nn.Module):
         return self.output_proj(x)
 
 
-class CustomDataModule(pl.LightningDataModule):
+class CNNDataModule(pl.LightningDataModule):
     def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs,
-                 test_inputs, test_outputs, batch_size, rng):
+                 test_inputs, test_outputs, batch_size, rng,
+                 n_phys, img_height, img_width):
         super().__init__()
+        self.batch_size = batch_size
+        self.rng        = rng
+        self.n_phys     = n_phys
+        self.img_height = img_height
+        self.img_width  = img_width
+        O_flat = img_height * img_width
 
-        out_scaler_T = StandardScaler()
-        out_scaler_P = StandardScaler()
-        out_scaler_T.fit(train_outputs[:, :O].cpu().numpy())
-        out_scaler_P.fit(train_outputs[:, O:].cpu().numpy())
+        i0, i1, i2 = 0, n_phys, n_phys + O_flat
+
+        # Output scaler
+        out_scaler = StandardScaler()
+        out_scaler.fit(train_outputs.cpu().numpy())
+        self.out_scaler = out_scaler
 
         def scale_outputs(t):
-            return torch.cat([
-                torch.tensor(out_scaler_T.transform(t[:, :O].cpu().numpy()), dtype=torch.float32),
-                torch.tensor(out_scaler_P.transform(t[:, O:].cpu().numpy()), dtype=torch.float32),
-            ], dim=1)
+            return torch.tensor(
+                out_scaler.transform(t.cpu().numpy()), dtype=torch.float32
+            )
 
-        self.out_scaler_T = out_scaler_T
-        self.out_scaler_P = out_scaler_P
-
-        # Input scalers — one per block
-        i0, i1, i2, i3, i4 = 0, D, D+O, D+2*O, D+3*O
-
+        # Input scalers
         in_scaler_phys = StandardScaler()
-        in_scaler_T    = StandardScaler()
-        in_scaler_P    = StandardScaler()
-        in_scaler_Terr = StandardScaler()
-        in_scaler_Perr = StandardScaler()
-
+        in_scaler_pred = StandardScaler()
+        in_scaler_err  = StandardScaler()
         in_scaler_phys.fit(train_inputs[:, i0:i1].cpu().numpy())
-        in_scaler_T.fit(   train_inputs[:, i1:i2].cpu().numpy())
-        in_scaler_P.fit(   train_inputs[:, i2:i3].cpu().numpy())
-        in_scaler_Terr.fit(train_inputs[:, i3:i4].cpu().numpy())
-        in_scaler_Perr.fit(train_inputs[:, i4:  ].cpu().numpy())
-
-        def scale_inputs(X):
-            X = X.cpu().numpy()
-            return torch.tensor(np.hstack([
-                in_scaler_phys.transform(X[:, i0:i1]),
-                in_scaler_T.transform(   X[:, i1:i2]),
-                in_scaler_P.transform(   X[:, i2:i3]),
-                in_scaler_Terr.transform(X[:, i3:i4]),
-                in_scaler_Perr.transform(X[:, i4:  ]),
-            ]), dtype=torch.float32)
-
-        self.train_inputs  = scale_inputs(train_inputs)
-        self.valid_inputs  = scale_inputs(valid_inputs)
-        self.test_inputs   = scale_inputs(test_inputs)
-        self.train_outputs = scale_outputs(train_outputs)
-        self.valid_outputs = scale_outputs(valid_outputs)
-        self.test_outputs  = scale_outputs(test_outputs)
+        in_scaler_pred.fit(train_inputs[:, i1:i2].cpu().numpy())
+        in_scaler_err.fit( train_inputs[:, i2:  ].cpu().numpy())
 
         self.in_scaler_phys = in_scaler_phys
-        self.in_scaler_T    = in_scaler_T
-        self.in_scaler_P    = in_scaler_P
-        self.in_scaler_Terr = in_scaler_Terr
-        self.in_scaler_Perr = in_scaler_Perr
+        self.in_scaler_pred = in_scaler_pred
+        self.in_scaler_err  = in_scaler_err
 
-        self.batch_size = batch_size
-        self.rng = rng
+        def scale_flat(X):
+            X_np = X.cpu().numpy()
+            return torch.tensor(np.hstack([
+                in_scaler_phys.transform(X_np[:, i0:i1]),
+                in_scaler_pred.transform(X_np[:, i1:i2]),
+                in_scaler_err.transform( X_np[:, i2:  ]),
+            ]), dtype=torch.float32)
+
+        def to_cnn_input(X_flat):
+            """(N, D+2*O) → (N, D+2, H, W)"""
+            N_s  = X_flat.shape[0]
+            phys = X_flat[:, i0:i1]
+            pred = X_flat[:, i1:i2].reshape(N_s, 1, img_height, img_width)
+            err  = X_flat[:, i2:  ].reshape(N_s, 1, img_height, img_width)
+            phys_maps = phys[:, :, None, None].expand(N_s, n_phys, img_height, img_width)
+            return torch.cat([phys_maps, pred, err], dim=1)
+
+        def to_cnn_output(Y_flat):
+            return Y_flat.reshape(-1, 1, img_height, img_width)
+
+        self.train_inputs  = to_cnn_input(scale_flat(train_inputs))
+        self.valid_inputs  = to_cnn_input(scale_flat(valid_inputs))
+        self.test_inputs   = to_cnn_input(scale_flat(test_inputs))
+        self.train_outputs = to_cnn_output(scale_outputs(train_outputs))
+        self.valid_outputs = to_cnn_output(scale_outputs(valid_outputs))
+        self.test_outputs  = to_cnn_output(scale_outputs(test_outputs))
 
     def train_dataloader(self):
         return DataLoader(TensorDataset(self.train_inputs, self.train_outputs),
@@ -273,13 +287,11 @@ class CustomDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(TensorDataset(self.valid_inputs, self.valid_outputs),
-                          batch_size=self.batch_size, generator=self.rng,
-                          pin_memory=True)
+                          batch_size=self.batch_size, generator=self.rng, pin_memory=True)
 
     def test_dataloader(self):
         return DataLoader(TensorDataset(self.test_inputs, self.test_outputs),
-                          batch_size=self.batch_size, generator=self.rng,
-                          pin_memory=True)
+                          batch_size=self.batch_size, generator=self.rng, pin_memory=True)
 
 
 ###################################
@@ -326,7 +338,7 @@ class RegressionModule(pl.LightningModule):
         l1_penalty, l2_penalty = self.compute_weight_regularization()
         loss = mse + l1_penalty + l2_penalty
         if self.smoothness_coeff > 0:
-            grad_mse = torch.autograd.grad(         # ← differentiate mse, not loss
+            grad_mse = torch.autograd.grad(
                 outputs=mse,
                 inputs=X,
                 create_graph=True,
@@ -378,16 +390,14 @@ class RegressionModule(pl.LightningModule):
 ################################
 print('BUILDING GP TRAINING SET')
 
-gp_cache_path  = base_dir + f'Model_Storage/gp_cache_Nn{N_neighbor}_seed{shuffle_seed}.npz'
-matching_files = glob.glob(base_dir + 'Model_Storage/gp_cache_*.npz')
+gp_cache_path  = base_dir + f'Model_Storage/gp_ST_cache_Nn{N_neighbor}_seed{shuffle_seed}.npz'
+matching_files = glob.glob(base_dir + 'Model_Storage/gp_ST_cache_*.npz')
 
 if os.path.exists(gp_cache_path):
     print(f'  Loading cached GP outputs from:\n  {gp_cache_path}')
     cache = np.load(gp_cache_path)
-    GP_outputs_T    = cache['GP_outputs_T']
-    GP_outputs_P    = cache['GP_outputs_P']
-    GP_outputs_Terr = cache['GP_outputs_Terr']
-    GP_outputs_Perr = cache['GP_outputs_Perr']
+    GP_outputs     = cache['GP_outputs']
+    GP_outputs_err = cache['GP_outputs_err']
 
 elif matching_files:
     raise RuntimeError(
@@ -397,39 +407,31 @@ elif matching_files:
     )
 else:
     print(f'  No cache found. Computing GP outputs and saving to:\n  {gp_cache_path}')
-    GP_outputs_T    = np.zeros(raw_outputs_T.shape, dtype=float)
-    GP_outputs_P    = np.zeros(raw_outputs_P.shape, dtype=float)
-    GP_outputs_Terr = np.zeros(raw_outputs_T.shape, dtype=float)
-    GP_outputs_Perr = np.zeros(raw_outputs_P.shape, dtype=float)
+    GP_outputs     = np.zeros(raw_outputs.shape, dtype=float)
+    GP_outputs_err = np.zeros(raw_outputs.shape, dtype=float)
 
-    for query_idx, (query_input, query_output_T, query_output_P) in enumerate(
-            zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
+    for query_idx, (query_input, query_output) in enumerate(zip(tqdm(raw_inputs), raw_outputs)):
         XTr = np.delete(raw_inputs.T, query_idx, axis=1)
-        YTr = np.delete(np.hstack([raw_outputs_T, raw_outputs_P]).T, query_idx, axis=1)
-        Xens_j = jnp.array(XTr)
-        Yens_j = jnp.array(YTr)
-        VI_j   = jnp.linalg.inv(jnp.cov(Xens_j))
-        Yh, Yh_err, it = ens_CGP(Xens_j, Yens_j, query_input, VI_j, N_neighbor)
-        GP_outputs_T[query_idx, :]    = Yh[:O]
-        GP_outputs_Terr[query_idx, :] = Yh_err[:O]
-        GP_outputs_P[query_idx, :]    = Yh[O:]
-        GP_outputs_Perr[query_idx, :] = Yh_err[O:]
+        YTr = np.delete(raw_outputs.T, query_idx, axis=1)
+        Yh, err_Yh, it = ens_CGP(
+            jnp.array(XTr), jnp.array(YTr), query_input,
+            jnp.linalg.inv(jnp.cov(XTr)), N_neighbor,
+        )
+        GP_outputs[query_idx, :]     = Yh
+        GP_outputs_err[query_idx, :] = err_Yh
 
-    np.savez(gp_cache_path,
-             GP_outputs_T=GP_outputs_T, GP_outputs_P=GP_outputs_P,
-             GP_outputs_Terr=GP_outputs_Terr, GP_outputs_Perr=GP_outputs_Perr)
+    np.savez(gp_cache_path, GP_outputs=GP_outputs, GP_outputs_err=GP_outputs_err)
     print(f'  GP outputs cached to:\n  {gp_cache_path}')
 
-# Residuals: what the NN needs to learn
-residuals_T = raw_outputs_T - GP_outputs_T
-residuals_P = raw_outputs_P - GP_outputs_P
+# Residuals: what the CNN needs to learn
+residuals = raw_outputs - GP_outputs
 
 
 ###############################
 #### Shared helper function ####
 ###############################
 def build_data_module(partition_seed, batch_size, batch_seed=5):
-    """Build a CustomDataModule for a given partition seed and batch size."""
+    """Build a CNNDataModule for a given partition seed and batch size."""
     _partition_rng = torch.Generator()
     _partition_rng.manual_seed(partition_seed)
     _batch_rng = torch.Generator()
@@ -441,27 +443,23 @@ def build_data_module(partition_seed, batch_size, batch_seed=5):
 
     def make_inputs(idx):
         return torch.cat([
-            torch.tensor(raw_inputs[idx],        dtype=torch.float32),
-            torch.tensor(GP_outputs_T[idx],      dtype=torch.float32),
-            torch.tensor(GP_outputs_P[idx],      dtype=torch.float32),
-            torch.tensor(GP_outputs_Terr[idx],   dtype=torch.float32),
-            torch.tensor(GP_outputs_Perr[idx],   dtype=torch.float32),
+            torch.tensor(raw_inputs[idx],       dtype=torch.float32),
+            torch.tensor(GP_outputs[idx],       dtype=torch.float32),
+            torch.tensor(GP_outputs_err[idx],   dtype=torch.float32),
         ], dim=1)
 
     def make_outputs(idx):
-        return torch.cat([
-            torch.tensor(residuals_T[idx], dtype=torch.float32),
-            torch.tensor(residuals_P[idx], dtype=torch.float32),
-        ], dim=1)
+        return torch.tensor(residuals[idx], dtype=torch.float32)
 
     return (
-        CustomDataModule(
+        CNNDataModule(
             make_inputs(_train_idx),  make_outputs(_train_idx),
             make_inputs(_valid_idx),  make_outputs(_valid_idx),
             make_inputs(_test_idx),   make_outputs(_test_idx),
             batch_size, _batch_rng,
+            n_phys=D, img_height=IMG_H, img_width=IMG_W,
         ),
-        _test_idx,   # returned so evaluate mode can index raw arrays
+        _test_idx,
     )
 
 
@@ -471,18 +469,19 @@ def build_data_module(partition_seed, batch_size, batch_seed=5):
 if run_mode == 'search1':
 
     PARTITION_SEEDS = [4]           # Stage 1: single seed
+    # PARTITION_SEEDS = [4, 7, 13]  # Stage 2: uncomment for multi-seed run
 
     SEARCH_BATCH_SEED  = 5
     SEARCH_NN_SEED     = 6
     SEARCH_LR_PATIENCE = 50
     SEARCH_LR_FACTOR   = 0.7
     SEARCH_LR_MIN      = 1e-7
-    SEARCH_N_EPOCHS    = 5000
-    SEARCH_ES_PATIENCE = 100   # tighter patience for faster search
+    SEARCH_N_EPOCHS    = 1000
+    SEARCH_ES_PATIENCE = 50   # tighter patience for faster search
 
     def print_trial_summary(study, trial):
         if trial.value is None:
-            return   # pruned trial — skip
+            return
         print(f'\n--- Trial {trial.number} finished ---')
         print(f'  Value (mean val loss): {trial.value:.6f}')
         print(f'  Params: {trial.params}')
@@ -490,11 +489,13 @@ if run_mode == 'search1':
         print(f'  Trials completed: {len([t for t in study.trials if t.value is not None])}')
 
     def objective(trial):
-        lr_init    = trial.suggest_float('lr_init',  1e-4, 1e-2, log=True)
-        nn_depth   = trial.suggest_categorical('nn_depth',   [4, 8, 16, 32])
-        nn_width   = trial.suggest_categorical('nn_width',   [209, 313, 418])
-        reg_l2     = trial.suggest_float('reg_l2',   1e-6, 1e-3, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [64, 128, 256, 512])
+        lr_init          = trial.suggest_float('lr_init',    1e-4, 1e-2, log=True)
+        cnn_depth        = trial.suggest_categorical('cnn_depth',    [4, 7, 10, 14])
+        cnn_channels     = trial.suggest_categorical('cnn_channels', [32, 64, 128])
+        reg_l2           = trial.suggest_float('reg_l2',     1e-6, 1e-3, log=True)
+        # 0.0 is a candidate — lets Optuna discover whether smoothness helps at all
+        smoothness_coeff = trial.suggest_categorical('smoothness_coeff', [0.0, 1e-2, 1e-1, 1.0])
+        batch_size       = trial.suggest_categorical('batch_size', [16, 32, 64])
 
         val_losses = []
 
@@ -503,7 +504,14 @@ if run_mode == 'search1':
             _data_module, _ = build_data_module(p_seed, batch_size, SEARCH_BATCH_SEED)
 
             pl.seed_everything(SEARCH_NN_SEED, workers=True)
-            _model = NeuralNetwork(D + 4*O, nn_width, 2*O, nn_depth)
+            _model = ResidualCNN(
+                input_channels=D + 2,
+                hidden_channels=cnn_channels,
+                output_channels=1,
+                depth=cnn_depth,
+                img_height=IMG_H,
+                img_width=IMG_W,
+            )
 
             _lightning_module = RegressionModule(
                 model=_model,
@@ -512,7 +520,7 @@ if run_mode == 'search1':
                 reg_coeff_l1=0.0,
                 reg_coeff_l2=reg_l2,
                 weight_decay=0.0,
-                smoothness_coeff=0.0,
+                smoothness_coeff=smoothness_coeff,
                 lr_patience=SEARCH_LR_PATIENCE,
                 lr_factor=SEARCH_LR_FACTOR,
                 lr_min=SEARCH_LR_MIN,
@@ -542,7 +550,6 @@ if run_mode == 'search1':
             best_val = checkpoint.best_model_score
             if best_val is None:
                 raise optuna.exceptions.TrialPruned()
-
             val_losses.append(best_val.item())
 
         return float(np.mean(val_losses))
@@ -550,15 +557,15 @@ if run_mode == 'search1':
     # ── Run study ────────────────────────────────────────────────────────────
     pruner = optuna.pruners.MedianPruner(
         n_startup_trials=5,
-        n_warmup_steps=50,
+        n_warmup_steps=30,   # shorter warmup than MLP — CNN epochs are heavier
         interval_steps=10,
     )
 
     study = optuna.create_study(
         direction='minimize',
         pruner=pruner,
-        storage=f'sqlite:///{model_save_path}_stage1.db',
-        study_name='tp_profile_nn_stage1',
+        storage=f'sqlite:///{model_save_path}optuna_study.db',
+        study_name='st_map_cnn_stage1',
         load_if_exists=True,
     )
 
@@ -583,13 +590,14 @@ if run_mode == 'search1':
     print(f'\nFull results saved to {model_save_path}optuna_results_stage1.csv')
 
     print('\nTop 10 trials:')
-    top10 = results_df.sort_values('value').head(10)[[
-        'number', 'value', 'params_lr_init', 'params_nn_depth',
-        'params_nn_width', 'params_reg_l2', 'params_batch_size'
+    top10 = results_df[results_df['value'].notna()].sort_values('value').head(10)[[
+        'number', 'value', 'params_lr_init', 'params_cnn_depth',
+        'params_cnn_channels', 'params_reg_l2', 'params_smoothness_coeff',
+        'params_batch_size',
     ]]
     print(top10.to_string(index=False))
 
-    # ── Clean up checkpoints from non-best trials ────────────────────────────
+    # ── Clean up checkpoints from non-best trials ─────────────────────────────
     best_trial_number = study.best_trial.number
     for trial in study.trials:
         if trial.number == best_trial_number:
@@ -600,60 +608,52 @@ if run_mode == 'search1':
                 shutil.rmtree(trial_dir)
     print(f'\nCheckpoints from non-best trials removed. Best trial ({best_trial_number}) kept.')
 
+
 ##################################
 #### run_mode: search2 ###########
 ##################################
 elif run_mode == 'search2':
 
-    STAGE2_PARTITION_SEEDS = [4, 7, 13, 42, 99]  # 5 seeds for robustness evaluation
+    STAGE2_PARTITION_SEEDS = [4, 7, 13, 42, 99]
     STAGE2_BATCH_SEED      = 5
     STAGE2_NN_SEED         = 6
     STAGE2_LR_PATIENCE     = 50
     STAGE2_LR_FACTOR       = 0.7
     STAGE2_LR_MIN          = 1e-7
-    STAGE2_N_EPOCHS        = 5000
-    STAGE2_ES_PATIENCE     = 200   # relaxed vs Stage 1 for fairer comparison
-    #Stage 1 used a tighter patience to speed up the search. 
-    #Stage 2 uses your intended final patience so the comparison is fair and reflects how the model
-    #will actually behave in train mode.
+    STAGE2_N_EPOCHS        = 1000
+    STAGE2_ES_PATIENCE     = 100   # relaxed vs Stage 1 for fairer comparison
     STAGE2_TOP_N           = 10
 
-    # ── Load Stage 1 results and extract top N configs ────────────────────────
+    # ── Load Stage 1 results ──────────────────────────────────────────────────
     stage1_csv = model_save_path + 'optuna_results_stage1.csv'
     assert os.path.exists(stage1_csv), f'Stage 1 results not found at {stage1_csv}'
 
-    results_df = pd.read_csv(stage1_csv)
-
-    # Keep only completed (non-pruned) trials
-    completed = results_df[results_df['value'].notna()].copy()
+    results_df  = pd.read_csv(stage1_csv)
+    completed   = results_df[results_df['value'].notna()].copy()
     top_configs = completed.sort_values('value').head(STAGE2_TOP_N).reset_index(drop=True)
 
     print(f'\n=== Stage 2: Robustness evaluation of top {STAGE2_TOP_N} configs ===')
     print(f'Partition seeds: {STAGE2_PARTITION_SEEDS}')
-    print(top_configs[['number', 'value', 'params_lr_init', 'params_nn_depth',
-                        'params_nn_width', 'params_reg_l2', 'params_batch_size']].to_string(index=False))
+    print(top_configs[[
+        'number', 'value', 'params_lr_init', 'params_cnn_depth',
+        'params_cnn_channels', 'params_reg_l2', 'params_smoothness_coeff',
+        'params_batch_size',
+    ]].to_string(index=False))
 
     stage2_results = []
 
-    #Optuna logging
-    stage2_study = optuna.create_study(
-        direction='minimize',
-        storage=f'sqlite:///{model_save_path}optuna_study_stage2.db',
-        study_name='tp_profile_nn_stage2',
-        load_if_exists=True,
-    )
-
     for rank, row in top_configs.iterrows():
-        trial_num  = int(row['number'])
-        lr_init    = float(row['params_lr_init'])
-        nn_depth   = int(row['params_nn_depth'])
-        nn_width   = int(row['params_nn_width'])
-        reg_l2     = float(row['params_reg_l2'])
-        batch_size = int(row['params_batch_size'])
+        trial_num        = int(row['number'])
+        lr_init          = float(row['params_lr_init'])
+        cnn_depth        = int(row['params_cnn_depth'])
+        cnn_channels     = int(row['params_cnn_channels'])
+        reg_l2           = float(row['params_reg_l2'])
+        smoothness_coeff = float(row['params_smoothness_coeff'])
+        batch_size       = int(row['params_batch_size'])
 
         print(f'\n--- Stage 2 | Rank {rank+1} | Stage-1 trial {trial_num} ---')
-        print(f'  lr={lr_init:.2e}, depth={nn_depth}, width={nn_width}, '
-              f'l2={reg_l2:.2e}, bs={batch_size}')
+        print(f'  lr={lr_init:.2e}, depth={cnn_depth}, channels={cnn_channels}, '
+              f'l2={reg_l2:.2e}, smooth={smoothness_coeff:.2e}, bs={batch_size}')
 
         seed_val_losses = []
 
@@ -662,7 +662,14 @@ elif run_mode == 'search2':
             data_module, _ = build_data_module(p_seed, batch_size, STAGE2_BATCH_SEED)
 
             pl.seed_everything(STAGE2_NN_SEED, workers=True)
-            _model = NeuralNetwork(D + 4*O, nn_width, 2*O, nn_depth)
+            _model = ResidualCNN(
+                input_channels=D + 2,
+                hidden_channels=cnn_channels,
+                output_channels=1,
+                depth=cnn_depth,
+                img_height=IMG_H,
+                img_width=IMG_W,
+            )
 
             _lightning_module = RegressionModule(
                 model=_model,
@@ -671,7 +678,7 @@ elif run_mode == 'search2':
                 reg_coeff_l1=0.0,
                 reg_coeff_l2=reg_l2,
                 weight_decay=0.0,
-                smoothness_coeff=0.0,
+                smoothness_coeff=smoothness_coeff,
                 lr_patience=STAGE2_LR_PATIENCE,
                 lr_factor=STAGE2_LR_FACTOR,
                 lr_min=STAGE2_LR_MIN,
@@ -679,8 +686,7 @@ elif run_mode == 'search2':
 
             ckpt_dir = model_save_path + f'stage2_trial{trial_num}_seed{p_seed}/'
             checkpoint_cb = ModelCheckpoint(
-                dirpath=ckpt_dir,
-                monitor='valid_loss', mode='min', save_top_k=1,
+                dirpath=ckpt_dir, monitor='valid_loss', mode='min', save_top_k=1,
             )
             early_stopping = EarlyStopping(
                 monitor='valid_loss', patience=STAGE2_ES_PATIENCE, mode='min',
@@ -702,18 +708,9 @@ elif run_mode == 'search2':
             seed_val_losses.append(val_loss)
             print(f'  seed={p_seed}  ->  val_loss={val_loss:.6f}')
 
-        mean_loss   = float(np.nanmean(seed_val_losses))
-        std_loss    = float(np.nanstd(seed_val_losses))
-        worst_loss  = float(np.nanmax(seed_val_losses))
-
-        # After the per-seed loop for each config:
-        trial = stage2_study.ask()
-        trial.suggest_float('lr_init',  lr_init,    lr_init)
-        trial.suggest_int(  'nn_depth', nn_depth,   nn_depth)
-        trial.suggest_int(  'nn_width', nn_width,   nn_width)
-        trial.suggest_float('reg_l2',   reg_l2,     reg_l2)
-        trial.suggest_int(  'batch_size', batch_size, batch_size)
-        stage2_study.tell(trial, mean_loss)
+        mean_loss  = float(np.nanmean(seed_val_losses))
+        std_loss   = float(np.nanstd(seed_val_losses))
+        worst_loss = float(np.nanmax(seed_val_losses))
 
         print(f'  => mean={mean_loss:.6f}  std={std_loss:.6f}  worst={worst_loss:.6f}')
 
@@ -724,35 +721,39 @@ elif run_mode == 'search2':
             'std_val_loss'    : std_loss,
             'worst_val_loss'  : worst_loss,
             'lr_init'         : lr_init,
-            'nn_depth'        : nn_depth,
-            'nn_width'        : nn_width,
+            'cnn_depth'       : cnn_depth,
+            'cnn_channels'    : cnn_channels,
             'reg_l2'          : reg_l2,
+            'smoothness_coeff': smoothness_coeff,
             'batch_size'      : batch_size,
             'per_seed_losses' : seed_val_losses,
         })
 
-    # ── Rank by mean val loss ─────────────────────────────────────────────────
+    # ── Rank and save ─────────────────────────────────────────────────────────
     stage2_df = pd.DataFrame(stage2_results).sort_values('mean_val_loss').reset_index(drop=True)
     stage2_df.to_csv(model_save_path + 'stage2_results.csv', index=False)
 
     print('\n=== Stage 2 Complete ===')
     print('Rankings by mean val loss across seeds:')
-    print(stage2_df[['stage1_trial', 'stage1_val_loss', 'mean_val_loss',
-                      'std_val_loss', 'worst_val_loss', 'lr_init', 'nn_depth',
-                      'nn_width', 'reg_l2', 'batch_size']].to_string(index=False))
+    print(stage2_df[[
+        'stage1_trial', 'stage1_val_loss', 'mean_val_loss', 'std_val_loss',
+        'worst_val_loss', 'lr_init', 'cnn_depth', 'cnn_channels',
+        'reg_l2', 'smoothness_coeff', 'batch_size',
+    ]].to_string(index=False))
 
     best = stage2_df.iloc[0]
     print(f'\nBest Stage-2 config (Stage-1 trial {int(best["stage1_trial"])}) :')
-    print(f'  mean_val_loss = {best["mean_val_loss"]:.6f}  (std={best["std_val_loss"]:.6f})')
-    print(f'  lr_init    : {best["lr_init"]}')
-    print(f'  nn_depth   : {int(best["nn_depth"])}')
-    print(f'  nn_width   : {int(best["nn_width"])}')
-    print(f'  reg_l2     : {best["reg_l2"]}')
-    print(f'  batch_size : {int(best["batch_size"])}')
+    print(f'  mean_val_loss    = {best["mean_val_loss"]:.6f}  (std={best["std_val_loss"]:.6f})')
+    print(f'  lr_init          : {best["lr_init"]}')
+    print(f'  cnn_depth        : {int(best["cnn_depth"])}')
+    print(f'  cnn_channels     : {int(best["cnn_channels"])}')
+    print(f'  reg_l2           : {best["reg_l2"]}')
+    print(f'  smoothness_coeff : {best["smoothness_coeff"]}')
+    print(f'  batch_size       : {int(best["batch_size"])}')
     print(f'\nPaste these into FINAL_PARAMS and set run_mode = "train"')
     print(f'Full results saved to {model_save_path}stage2_results.csv')
 
-    # ── Clean up checkpoints from non-best configs ────────────────────────────
+    # ── Clean up non-best checkpoints ────────────────────────────────────────
     best_trial_num = int(best['stage1_trial'])
     for row in stage2_results:
         if row['stage1_trial'] == best_trial_num:
@@ -762,6 +763,7 @@ elif run_mode == 'search2':
             if os.path.exists(ckpt_dir):
                 shutil.rmtree(ckpt_dir)
     print(f'Checkpoints from non-best Stage-2 configs removed.')
+
 
 ##################################
 #### run_mode: train #############
@@ -778,8 +780,16 @@ elif run_mode == 'train':
     pl.seed_everything(FINAL_NN_SEED, workers=True)
     _nn_rng = torch.Generator()
     _nn_rng.manual_seed(FINAL_NN_SEED)
-    model = NeuralNetwork(D + 4*O, p['nn_width'], 2*O, p['nn_depth'], generator=_nn_rng)
-    summary(model)
+    model = ResidualCNN(
+        input_channels=D + 2,
+        hidden_channels=p['cnn_channels'],
+        output_channels=1,
+        depth=p['cnn_depth'],
+        img_height=IMG_H,
+        img_width=IMG_W,
+        generator=_nn_rng,
+    )
+    summary(model, input_size=(1, D + 2, IMG_H, IMG_W))
 
     lightning_module = RegressionModule(
         model=model,
@@ -788,7 +798,7 @@ elif run_mode == 'train':
         reg_coeff_l1=0.0,
         reg_coeff_l2=p['reg_l2'],
         weight_decay=0.0,
-        smoothness_coeff=0.0,
+        smoothness_coeff=p['smoothness_coeff'],
         lr_patience=FINAL_LR_PATIENCE,
         lr_factor=FINAL_LR_FACTOR,
         lr_min=FINAL_LR_MIN,
@@ -801,9 +811,7 @@ elif run_mode == 'train':
     )
     checkpoint_cb = ModelCheckpoint(
         dirpath=model_save_path + 'final_model/',
-        save_top_k=1,
-        monitor='valid_loss',
-        mode='min',
+        save_top_k=1, monitor='valid_loss', mode='min',
     )
 
     trainer = Trainer(
@@ -823,7 +831,6 @@ elif run_mode == 'train':
     with open(model_save_path + 'best_ckpt_path.txt', 'w') as f:
         f.write(best_model_path)
 
-    # Also save the test indices so evaluate mode can reconstruct the test set
     np.save(model_save_path + 'test_idx.npy', np.array(test_idx))
 
     trainer.test(lightning_module, datamodule=data_module)
@@ -844,7 +851,15 @@ elif run_mode == 'evaluate':
     p = FINAL_PARAMS
     _nn_rng = torch.Generator()
     _nn_rng.manual_seed(FINAL_NN_SEED)
-    _model = NeuralNetwork(D + 4*O, p['nn_width'], 2*O, p['nn_depth'], generator=_nn_rng)
+    _model = ResidualCNN(
+        input_channels=D + 2,
+        hidden_channels=p['cnn_channels'],
+        output_channels=1,
+        depth=p['cnn_depth'],
+        img_height=IMG_H,
+        img_width=IMG_W,
+        generator=_nn_rng,
+    )
 
     lightning_module = RegressionModule.load_from_checkpoint(
         best_ckpt_path,
@@ -854,13 +869,12 @@ elif run_mode == 'evaluate':
         reg_coeff_l1=0.0,
         reg_coeff_l2=p['reg_l2'],
         weight_decay=0.0,
-        smoothness_coeff=0.0,
+        smoothness_coeff=p['smoothness_coeff'],
         lr_patience=FINAL_LR_PATIENCE,
         lr_factor=FINAL_LR_FACTOR,
         lr_min=FINAL_LR_MIN,
     )
 
-    # Sync model weights from checkpoint then move to CPU for inference
     model = lightning_module.model
     model.cpu()
     model.eval()
@@ -870,28 +884,21 @@ elif run_mode == 'evaluate':
         FINAL_PARTITION_SEED, p['batch_size'], FINAL_BATCH_SEED
     )
 
-    # Verify test indices match what was used during training
     saved_test_idx = np.load(model_save_path + 'test_idx.npy')
     assert np.array_equal(np.array(test_idx), saved_test_idx), \
         "Test indices don't match saved indices — check partition seed!"
 
-    # ── Recover scalers from data module ──────────────────────────────────────
-    out_scaler_T   = data_module.out_scaler_T
-    out_scaler_P   = data_module.out_scaler_P
+    # ── Recover scalers ───────────────────────────────────────────────────────
+    out_scaler     = data_module.out_scaler
     in_scaler_phys = data_module.in_scaler_phys
-    in_scaler_T    = data_module.in_scaler_T
-    in_scaler_P    = data_module.in_scaler_P
-    in_scaler_Terr = data_module.in_scaler_Terr
-    in_scaler_Perr = data_module.in_scaler_Perr
+    in_scaler_pred = data_module.in_scaler_pred
+    in_scaler_err  = data_module.in_scaler_err
 
-    # ── Reconstruct test tensors ──────────────────────────────────────────────
-    NN_test_inputs_phys = torch.tensor(raw_inputs[test_idx],        dtype=torch.float32)
-    NN_test_inputs_T    = torch.tensor(GP_outputs_T[test_idx],      dtype=torch.float32)
-    NN_test_inputs_P    = torch.tensor(GP_outputs_P[test_idx],      dtype=torch.float32)
-    NN_test_inputs_Terr = torch.tensor(GP_outputs_Terr[test_idx],   dtype=torch.float32)
-    NN_test_inputs_Perr = torch.tensor(GP_outputs_Perr[test_idx],   dtype=torch.float32)
-    NN_test_true_T      = torch.tensor(raw_outputs_T[test_idx],     dtype=torch.float32)
-    NN_test_true_P      = torch.tensor(raw_outputs_P[test_idx],     dtype=torch.float32)
+    # ── Reconstruct test arrays ───────────────────────────────────────────────
+    NN_test_inputs_phys = torch.tensor(raw_inputs[test_idx],       dtype=torch.float32)
+    NN_test_inputs_pred = torch.tensor(GP_outputs[test_idx],       dtype=torch.float32)
+    NN_test_inputs_err  = torch.tensor(GP_outputs_err[test_idx],   dtype=torch.float32)
+    NN_test_true        = torch.tensor(raw_outputs[test_idx],      dtype=torch.float32)
 
     # ── Loss curve plot ───────────────────────────────────────────────────────
     log_dir  = model_save_path + 'logs/NeuralNetwork'
@@ -916,133 +923,104 @@ elif run_mode == 'evaluate':
     ax1.plot(x_epoch, train_epoch,  label='Train',      color='C0', linewidth=2, marker='o')
     ax1.plot(x_epoch, eval_epoch,   label='Validation', color='C1', linewidth=2, marker='o')
     ax2.plot(x_epoch, diff_epoch,   color='C2', linewidth=2, marker='o')
-    ax1.set_yscale('log')
-    ax2.set_yscale('log')
-    ax2.set_xlabel('Epoch')
-    ax1.set_ylabel('MSE Loss')
-    ax2.set_ylabel('|Loss Diff.|')
-    ax1.legend()
-    ax1.grid()
-    ax2.grid()
+    ax1.set_yscale('log');  ax2.set_yscale('log')
+    ax2.set_xlabel('Epoch');  ax1.set_ylabel('MSE Loss');  ax2.set_ylabel('|Loss Diff.|')
+    ax1.legend();  ax1.grid();  ax2.grid()
     plt.subplots_adjust(hspace=0)
     plt.savefig(plot_save_path + '/loss.pdf')
     plt.close()
 
     # ── Prediction loop ───────────────────────────────────────────────────────
-    substep  = 100
-    n_test   = len(test_idx)
-    GP_res_T = np.zeros((n_test, O), dtype=float)
-    GP_res_P = np.zeros((n_test, O), dtype=float)
-    NN_res_T = np.zeros((n_test, O), dtype=float)
-    NN_res_P = np.zeros((n_test, O), dtype=float)
+    substep = 100
+    n_test  = len(test_idx)
+    GP_res  = np.zeros((n_test, O), dtype=float)
+    NN_res  = np.zeros((n_test, O), dtype=float)
 
-    for NN_test_idx, (test_input_phys, gp_T, gp_P, gp_Terr, gp_Perr,
-                      true_T, true_P) in enumerate(zip(
-            NN_test_inputs_phys, NN_test_inputs_T, NN_test_inputs_P,
-            NN_test_inputs_Terr, NN_test_inputs_Perr,
-            NN_test_true_T, NN_test_true_P)):
+    for NN_test_idx, (test_input_phys, gp_pred, gp_err, true) in enumerate(zip(
+            NN_test_inputs_phys, NN_test_inputs_pred, NN_test_inputs_err, NN_test_true)):
 
-        scaled_input = torch.tensor(np.hstack([
-            in_scaler_phys.transform(test_input_phys.numpy().reshape(1, -1)),
-            in_scaler_T.transform(   gp_T.numpy().reshape(1, -1)),
-            in_scaler_P.transform(   gp_P.numpy().reshape(1, -1)),
-            in_scaler_Terr.transform(gp_Terr.numpy().reshape(1, -1)),
-            in_scaler_Perr.transform(gp_Perr.numpy().reshape(1, -1)),
-        ]), dtype=torch.float32)
+        phys_scaled = in_scaler_phys.transform(test_input_phys.numpy().reshape(1, -1))
+        pred_scaled = in_scaler_pred.transform(gp_pred.numpy().reshape(1, -1))
+        err_scaled  = in_scaler_err.transform( gp_err.numpy().reshape(1, -1))
+
+        phys_maps = torch.tensor(phys_scaled, dtype=torch.float32
+                    )[:, :, None, None].expand(1, D, IMG_H, IMG_W)
+        pred_map  = torch.tensor(pred_scaled.reshape(1, 1, IMG_H, IMG_W), dtype=torch.float32)
+        err_map   = torch.tensor(err_scaled.reshape( 1, 1, IMG_H, IMG_W), dtype=torch.float32)
+        cnn_input = torch.cat([phys_maps, pred_map, err_map], dim=1)
 
         with torch.no_grad():
-            nn_pred = model(scaled_input).numpy()
+            cnn_pred = model(cnn_input)
 
-        pred_resid_T = out_scaler_T.inverse_transform(nn_pred[:, :O].reshape(1, -1)).flatten()
-        pred_resid_P = out_scaler_P.inverse_transform(nn_pred[:, O:].reshape(1, -1)).flatten()
+        pred_resid    = out_scaler.inverse_transform(cnn_pred.numpy().reshape(1, -1)).flatten()
+        cnn_pred_full = gp_pred.numpy() + pred_resid
 
-        nn_pred_T = gp_T.numpy() + pred_resid_T
-        nn_pred_P = gp_P.numpy() + pred_resid_P
+        true_np  = true.numpy()
+        phys_np  = test_input_phys.numpy()
 
-        true_T_np = true_T.numpy()
-        true_P_np = true_P.numpy()
-        phys_np   = test_input_phys.numpy()
-
-        GP_res_T[NN_test_idx] = gp_T.numpy()  - true_T_np
-        GP_res_P[NN_test_idx] = gp_P.numpy()  - true_P_np
-        NN_res_T[NN_test_idx] = nn_pred_T      - true_T_np
-        NN_res_P[NN_test_idx] = nn_pred_P      - true_P_np
+        GP_res[NN_test_idx, :] = gp_pred.numpy() - true_np
+        NN_res[NN_test_idx, :] = cnn_pred_full    - true_np
 
         if NN_test_idx % substep == 0:
-            fig, axs = plt.subplot_mosaic(
-                [['res_pressure', '.'], ['results', 'res_temperature']],
-                figsize=(8, 6), width_ratios=(3, 1), height_ratios=(1, 3),
-                layout='constrained',
-            )
-            axs['results'].plot(true_T_np,    true_P_np,    '.', linestyle='-', color='blue',  linewidth=2, label='Truth')
-            axs['results'].plot(nn_pred_T,    nn_pred_P,         color='green', linewidth=2, label='NN prediction')
-            axs['results'].plot(gp_T.numpy(), gp_P.numpy(),      color='red',   linewidth=2, label='GP prediction')
-            axs['results'].invert_yaxis()
-            axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
-            axs['results'].set_xlabel('Temperature (K)')
-            axs['results'].legend()
-            axs['results'].grid()
+            plot_true     = true_np.reshape((IMG_H, IMG_W))
+            plot_gp_pred  = gp_pred.numpy().reshape((IMG_H, IMG_W))
+            plot_cnn_pred = cnn_pred_full.reshape((IMG_H, IMG_W))
+            plot_res_GP   = GP_res[NN_test_idx].reshape((IMG_H, IMG_W))
+            plot_res_CNN  = NN_res[NN_test_idx].reshape((IMG_H, IMG_W))
 
-            axs['res_temperature'].plot(NN_res_T[NN_test_idx], true_P_np, '.', linestyle='-', color='green', linewidth=2)
-            axs['res_temperature'].plot(GP_res_T[NN_test_idx], true_P_np, '.', linestyle='-', color='red',   linewidth=2)
-            axs['res_temperature'].set_xlabel('Residuals (K)')
-            axs['res_temperature'].invert_yaxis()
-            axs['res_temperature'].grid()
-            axs['res_temperature'].axvline(0, color='black', linestyle='dashed', zorder=2)
-            axs['res_temperature'].yaxis.tick_right()
-            axs['res_temperature'].yaxis.set_label_position('right')
-            axs['res_temperature'].sharey(axs['results'])
+            fig, axs = plt.subplots(5, 1, figsize=(8, 12), sharex=True, layout='constrained')
+            for ax, data, title, label in zip(
+                axs,
+                [plot_true, plot_gp_pred, plot_cnn_pred, plot_res_GP, plot_res_CNN],
+                ['Data', 'GP Model', 'CNN Model', 'GP Residuals', 'CNN Residuals'],
+                ['Temperature (K)'] * 3 + ['Residual (K)'] * 2,
+            ):
+                ax.set_title(title)
+                hm = sns.heatmap(data, ax=ax)
+                hm.collections[0].colorbar.set_label(label)
+                ax.set_yticks(np.linspace(0, IMG_H, 5))
+                ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
+                ax.set_ylabel('Latitude (deg)')
 
-            axs['res_pressure'].plot(true_T_np, NN_res_P[NN_test_idx], '.', linestyle='-', color='green', linewidth=2)
-            axs['res_pressure'].plot(true_T_np, GP_res_P[NN_test_idx], '.', linestyle='-', color='red',   linewidth=2)
-            axs['res_pressure'].set_ylabel('Residuals (bar)')
-            axs['res_pressure'].invert_yaxis()
-            axs['res_pressure'].grid()
-            axs['res_pressure'].axhline(0, color='black', linestyle='dashed', zorder=2)
-            axs['res_pressure'].xaxis.tick_top()
-            axs['res_pressure'].xaxis.set_label_position('top')
-            axs['res_pressure'].sharex(axs['results'])
+            axs[-1].set_xticks(np.linspace(0, IMG_W, 5))
+            axs[-1].set_xticklabels(np.linspace(-180, 180, 5).astype(int))
+            axs[-1].set_xlabel('Longitude (deg)')
 
             plt.suptitle(
-                rf'H$_2$: {phys_np[0]} bar, CO$_2$: {phys_np[1]} bar, '
-                rf'LoD: {phys_np[2]:.0f} days, Obliquity: {phys_np[3]} deg, '
-                rf'Teff: {phys_np[4]} K'
+                rf'H$_2$ : {phys_np[0]} bar, CO$_2$ : {phys_np[1]} bar, '
+                rf'LoD : {phys_np[2]:.0f} days, Obliquity : {phys_np[3]} deg, '
+                rf'Teff : {phys_np[4]} K'
             )
             plt.savefig(plot_save_path + f'/pred_vs_actual_n.{NN_test_idx}.pdf')
             plt.close()
 
     # ── Residuals summary plot ────────────────────────────────────────────────
-    fig, ((ax1, ax3), (ax2, ax4)) = plt.subplots(2, 2, sharex=True, figsize=[12, 8])
-    ax1.plot(GP_res_T.T, alpha=0.1, color='green')
-    ax2.plot(GP_res_P.T, alpha=0.1, color='green')
-    ax3.plot(NN_res_T.T, alpha=0.1, color='blue')
-    ax4.plot(NN_res_P.T, alpha=0.1, color='blue')
-    for ax in [ax1, ax2, ax3, ax4]:
+    fig, (ax1, ax2) = plt.subplots(1, 2, sharey=True, figsize=[12, 8])
+    for qid in range(n_test):
+        ax1.plot(GP_res[qid, :], alpha=0.1, color='green')
+        ax2.plot(NN_res[qid, :], alpha=0.1, color='blue')
+    for ax in [ax1, ax2]:
         ax.axhline(0, color='black', linestyle='dashed')
         ax.grid()
-    ax2.set_xlabel('Index')
-    ax4.set_xlabel('Index')
-    ax1.set_ylabel('Temperature (K)')
-    ax2.set_ylabel(r'log$_{10}$ Pressure (bar)')
-    ax3.set_ylabel('Temperature (K)')
-    ax4.set_ylabel(r'log$_{10}$ Pressure (bar)')
-    ax1.set_title('GP residuals')
-    ax3.set_title('NN residuals')
-    plt.subplots_adjust(hspace=0.1, bottom=0.25)
+    ax1.set_xlabel('Pixel Index');  ax2.set_xlabel('Pixel Index')
+    ax1.set_ylabel('Temperature Residual (K)')
+    ax1.set_title('GP Residuals');  ax2.set_title('CNN Residuals')
 
+    plt.subplots_adjust(hspace=0.1, bottom=0.25)
     stats_text = (
         f"--- GP Residuals ---\n"
-        f"Temperature : Median = {np.median(GP_res_T):.2f} K,          Std = {np.std(GP_res_T):.2f} K\n"
-        f"Pressure    : Median = {np.median(GP_res_P):.4f} log10 bar,  Std = {np.std(GP_res_P):.4f} log10 bar\n"
-        f"\n"
-        f"--- NN Residuals ---\n"
-        f"Temperature : Median = {np.median(NN_res_T):.2f} K,          Std = {np.std(NN_res_T):.2f} K\n"
-        f"Pressure    : Median = {np.median(NN_res_P):.4f} log10 bar,  Std = {np.std(NN_res_P):.4f} log10 bar"
+        f"Median = {np.median(GP_res):.2f} K,  "
+        f"Std = {np.std(GP_res):.2f} K,  "
+        f"RMSE = {np.sqrt(np.mean(GP_res**2)):.2f} K\n\n"
+        f"--- CNN Residuals ---\n"
+        f"Median = {np.median(NN_res):.2f} K,  "
+        f"Std = {np.std(NN_res):.2f} K,  "
+        f"RMSE = {np.sqrt(np.mean(NN_res**2)):.2f} K"
     )
     fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
              verticalalignment='bottom',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    plt.savefig(plot_save_path + '/res_GP_NN.pdf', bbox_inches='tight')
+    plt.savefig(plot_save_path + '/res_GP_CNN.pdf', bbox_inches='tight')
     plt.close()
 
     print('Evaluation complete. Plots saved to:', plot_save_path)

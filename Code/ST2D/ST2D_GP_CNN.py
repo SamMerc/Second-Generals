@@ -38,7 +38,7 @@ def check_and_make_dir(dir):
     if not os.path.isdir(dir): os.mkdir(dir)
 
 # Base directory
-base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
+base_dir = '/home/merci228/WORK/2G_ML/'
 
 # File containing surface temperature map
 raw_data3000 = np.loadtxt(base_dir + 'Data/bt-3000k/training_data_ST2D.csv', delimiter=',')
@@ -112,7 +112,7 @@ show_plot = False
 
 # CNN architecture
 cnn_hidden_channels = 64   # number of feature maps in residual blocks
-cnn_depth = 32             # number of residual conv blocks
+cnn_depth = 7             # number of residual conv blocks
 
 # Optimizer learning rate schedule - ReduceLROnPlateau
 lr_init      = 1e-3   # initial LR — ReduceLROnPlateau will reduce from here
@@ -128,8 +128,8 @@ weight_decay = 0.0
 
 # Training
 batch_size = 32
-n_epochs = 100
-early_stopping_patience = 10
+n_epochs = 1000
+early_stopping_patience = 50
 run_mode = 'use'
 
 

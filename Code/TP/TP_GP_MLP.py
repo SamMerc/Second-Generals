@@ -35,7 +35,7 @@ torch.set_float32_matmul_precision('high')
 def check_and_make_dir(dir):
     if not os.path.isdir(dir):os.mkdir(dir)
 #Base directory 
-base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
+base_dir = '/home/merci228/WORK/2G_ML/'
 #File containing temperature values
 raw_T_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_T.csv', delimiter=',')
 raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
