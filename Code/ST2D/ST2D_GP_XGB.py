@@ -20,6 +20,7 @@ from matplotlib.colors import Normalize
 from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.collections import LineCollection
 import glob
+from sklearn.decomposition import PCA
 
 
 ##########################################################
@@ -516,7 +517,7 @@ ax.set_ylabel('Temperature')
 ax.legend()
 
 # plt.savefig(plot_save_path+f'/res_GP_NN.pdf', bbox_inches='tight')
-plt.show()
+plt.close()
 
 
 
@@ -528,8 +529,43 @@ plt.show()
 
 print('TRAINING XGBOOST RESIDUAL CORRECTOR')
 
-# ── Residuals ─────────────────────────────────────────────────────────────────
-residuals = raw_outputs - GP_outputs   # (N, O)
+# ══════════════════════════════════════════════════════════════════════════════
+# ── STEP 1: PCA on outputs ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+n_components = 2
+
+# Fit PCA on the GP outputs (or raw_outputs - both should give similar PCs)
+pca_outputs = PCA(n_components=n_components)
+pca_outputs.fit(raw_outputs)
+
+print(f"\nPCA on outputs (O={O} → {n_components} PCs):")
+print(f"  Explained variance: {pca_outputs.explained_variance_ratio_}")
+print(f"  Cumulative:         {np.cumsum(pca_outputs.explained_variance_ratio_)}")
+
+# Transform outputs to PC space
+raw_outputs_pc = pca_outputs.transform(raw_outputs)          # (N, n_components)
+GP_outputs_pc = pca_outputs.transform(GP_outputs)            # (N, n_components)
+
+# ── Optional: PCA on GP uncertainties (or just keep them as-is) ──────────────
+# Since uncertainties are always positive and may not follow same PC structure,
+# you have two options:
+
+# Option A: Also apply PCA to uncertainties
+GP_outputs_err_pc = pca_outputs.transform(GP_outputs_err)    # (N, n_components)
+
+# Option B: Keep full uncertainties (if memory allows) or use their norm/mean
+# GP_outputs_err_summary = np.mean(GP_outputs_err, axis=1, keepdims=True)  # (N, 1)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── STEP 2: Build feature matrix in PC space ─────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+X_features_pc = np.hstack([
+    raw_inputs,           # (N, D=5)
+    GP_outputs_pc,        # (N, n_components=2)
+    GP_outputs_err_pc,    # (N, n_components=2)
+])  # Final shape: (N, 5 + 2 + 2) = (N, 9)
 
 # ── Feature matrix ────────────────────────────────────────────────────────────
 X_features = np.hstack([
@@ -538,18 +574,31 @@ X_features = np.hstack([
     GP_outputs_err,    # (N, O)
 ]) #final : (N, D + 4*O)
 
+print(f"\nFeature matrix size reduction:")
+print(f"  Original: {X_features.shape} = {X_features.nbytes/1e6:.1f} MB")
+print(f"  PC space: {X_features_pc.shape} = {X_features_pc.nbytes/1e6:.1f} MB")
+print(f"  Reduction factor: {X_features.shape[1] / X_features_pc.shape[1]:.1f}x")
+
+# ── Residuals in PC space ─────────────────────────────────────────────────────
+residuals_pc = raw_outputs_pc - GP_outputs_pc   # (N, n_components)
+
 # ── Train/test split ──────────────────────────────────────────────────────────
-(X_train, X_test,
- resid_train, resid_test,
- _,   out_test) = train_test_split(
-    X_features, residuals,
-    raw_outputs,
+(X_train_pc, X_test_pc,
+ resid_train_pc, resid_test_pc,
+ out_train_pc, out_test_pc) = train_test_split(
+    X_features_pc, residuals_pc,
+    raw_outputs_pc,
     test_size=0.2, random_state=42
 )
 
+# Also split the full-dimensional outputs for final evaluation
+_, out_test_full = train_test_split(
+    raw_outputs, test_size=0.2, random_state=42
+)
+
 # ── Single multi-output XGBoost ───────────────────────────────────────────────
-max_depth = int(np.log2(D + 2*O))
-print(f"Using max_depth={max_depth} for {D + 2*O} input features")
+max_depth = int(np.log2(X_features_pc.shape[1]))
+print(f"\nUsing max_depth={max_depth} for {X_features_pc.shape[1]} input features")
 
 xgb_model = xgb.XGBRegressor(
     n_estimators=1000,
@@ -565,8 +614,8 @@ xgb_model = xgb.XGBRegressor(
 )
 
 xgb_model.fit(
-    X_train, resid_train,
-    eval_set=[(X_test, resid_test)],
+    X_train_pc, resid_train_pc,
+    eval_set=[(X_test_pc, resid_test_pc)],
     verbose=False,
 )
 
@@ -574,7 +623,8 @@ n_trees = xgb_model.best_iteration + 1
 print(f"Trees used: {n_trees}")
 
 # ── Extract CGP predictions from feature matrix ───────────────────────────────
-cgp_test = X_test
+# Extract CGP predictions in PC space from feature matrix
+cgp_test_pc = X_test_pc[:, raw_inputs.shape[1]:raw_inputs.shape[1]+n_components]
 
 # ── Compute RMSE at each round ────────────────────────────────────────────────
 rounds = np.arange(1, n_trees + 1)
@@ -583,9 +633,17 @@ rmse = lambda pred, truth: np.sqrt(np.mean((pred - truth)**2))
 rmse_per_round = np.zeros(len(rounds))
 
 for r in tqdm(rounds, desc='Computing per-round RMSE'):
-    pred_resid = xgb_model.predict(X_test, iteration_range=(0, r))  # (N_test, 2*O)
-    pred = X_test + pred_resid
-    rmse_per_round[r-1] = rmse(pred, out_test)
+    # Predict residuals in PC space
+    pred_resid_pc = xgb_model.predict(X_test_pc, iteration_range=(0, r))
+    
+    # Corrected prediction in PC space
+    pred_pc = cgp_test_pc + pred_resid_pc
+    
+    # Transform back to original space
+    pred_full = pca_outputs.inverse_transform(pred_pc)
+    
+    # Compute RMSE in original space
+    rmse_per_round[r-1] = rmse(pred_full, out_test_full)
 
 # ── Knee points ───────────────────────────────────────────────────────────────
 knee = KneeLocator(rounds, rmse_per_round, curve='convex', direction='decreasing')
@@ -599,45 +657,50 @@ print(f"1-sigma rule: {conservative} trees")
 
 # ── 95% threshold ─────────────────────────────────────────────────────────────
 round_95 = find_threshold_round(rmse_per_round, pct=0.95)
+round_99 = find_threshold_round(rmse_per_round, pct=0.99)
 print(f"95% improvement: {round_95} trees")
+print(f"99% improvement: {round_99} trees")
 
 # ── RMSE plot ─────────────────────────────────────────────────────────────────
-fig, ax1 = plt.subplots(1, 1, figsize=(10, 6))
+cgp_test_full = pca_outputs.inverse_transform(cgp_test_pc)
 
+fig, ax1 = plt.subplots(1, 1, figsize=(10, 6))
 ax1.plot(rounds, rmse_per_round, color='blue', linewidth=1.5)
-ax1.axhline(rmse(cgp_test, out_test), color='grey', linestyle=':', label='CGP only')
+ax1.axhline(rmse(cgp_test_full, out_test_full), color='grey', linestyle=':', label='CGP only')
 ax1.axvline(knee.knee,  color='green', linewidth=2, linestyle='--', label=f'Knee @ {knee.knee}')
 ax1.axvline(round_95,   color='black', linewidth=2, linestyle='--', label=f'95% thresh. @ {round_95}')
+ax1.axvline(round_99,   color='red', linewidth=2, linestyle='--', label=f'99% thresh. @ {round_99}')
 ax1.set_xlabel('Number of trees')
-ax1.set_ylabel('RMSE T (K)')
-ax1.set_title('T RMSE vs boosting round')
+ax1.set_ylabel('RMSE ST2D (K)')
+ax1.set_title('ST2D RMSE vs boosting round')
 ax1.legend(); ax1.grid()
 
 plt.tight_layout()
 plt.savefig(plot_save_path + 'RMS_vs_XGBit.pdf')
 
 # ── NN depth guidance ─────────────────────────────────────────────────────────
-max_trees = knee.knee
+max_trees = round_99
 print(f"\nXGBoost converged in {max_trees} trees of depth {max_depth}")
 print(f"Suggested NN hidden layers : ~{max_trees // 10}")
 print(f"Suggested neurons per layer: ~{O}")
 
-# ── Corrected predictions at knee point ──────────────────────────────────────
-pred_resid_knee = xgb_model.predict(X_test, iteration_range=(0, knee.knee))
-final = cgp_test + pred_resid_knee
+# ── Final predictions at knee point ──────────────────────────────────────
+pred_resid_knee_pc = xgb_model.predict(X_test_pc, iteration_range=(0, knee.knee))
+final_pc = cgp_test_pc + pred_resid_knee_pc
+final_full = pca_outputs.inverse_transform(final_pc)
 
 # ── Residual plot ─────────────────────────────────────────────────────────────
 fig, (ax1, ax2) = plt.subplots(1, 2, sharex=True, figsize=(12, 5))
 
 for qid in range(int(0.2 * N)):
-    ax1.plot(cgp_test[qid,:] - out_test[qid,:], color='green', alpha=0.3)
-    ax2.plot(final[qid,:]    - out_test[qid,:], color='blue',  alpha=0.3)
+    ax1.plot(cgp_test_full[qid,:] - out_test_full[qid,:], color='green', alpha=0.3)
+    ax2.plot(final_full[qid,:]    - out_test_full[qid,:], color='blue',  alpha=0.3)
 
 # Add labelled line for legend stats
-ax1.plot([], [], color='green', label=f'CGP.     Mean={np.mean(cgp_test-out_test):.4f}, Std={np.std(cgp_test-out_test):.4f}, RMSE={rmse(cgp_test,out_test):.4f}')
-ax2.plot([], [], color='blue',  label=f'CGP+XGB. Mean={np.mean(final-out_test):.4f}, Std={np.std(final-out_test):.4f}, RMSE={rmse(final,out_test):.4f}')
+ax1.plot([], [], color='green', label=f'CGP.     Mean={np.mean(cgp_test_full-out_test_full):.4f}, Std={np.std(cgp_test_full-out_test_full):.4f}, RMSE={rmse(cgp_test_full,out_test_full):.4f}')
+ax2.plot([], [], color='blue',  label=f'CGP+XGB. Mean={np.mean(final_full-out_test_full):.4f}, Std={np.std(final_full-out_test_full):.4f}, RMSE={rmse(final_full,out_test_full):.4f}')
 
-ax1.set_ylabel('Residuals T (K)')
+ax1.set_ylabel('Residuals ST2D (K)')
 ax2.set_xlabel('Index')
 
 for ax in [ax1, ax2]:
