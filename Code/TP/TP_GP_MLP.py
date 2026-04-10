@@ -1,6 +1,10 @@
 #############################
 #### Importing libraries ####
 #############################
+import os
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,7 +14,6 @@ import torch.optim.lr_scheduler as lr_scheduler
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning import Trainer
 import pytorch_lightning as pl
-import os
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from torchinfo import summary
@@ -21,8 +24,9 @@ from jax import jit, vmap
 from functools import partial
 import jax.numpy as jnp
 from time import time
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 import glob
+torch.set_float32_matmul_precision('high')
 
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
@@ -31,7 +35,7 @@ import glob
 def check_and_make_dir(dir):
     if not os.path.isdir(dir):os.mkdir(dir)
 #Base directory 
-base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
+base_dir = '/home/merci228/WORK/2G_ML/'
 #File containing temperature values
 raw_T_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_T.csv', delimiter=',')
 raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
@@ -39,10 +43,10 @@ raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimi
 raw_P_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_P.csv', delimiter=',')
 raw_P_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/AAAAAAHHHTEST/'
+model_save_path = base_dir+'Model_Storage/debugging2/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/AAAAAAHHHTEST/'
+plot_save_path = base_dir+'Plots/debugging2/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -117,12 +121,12 @@ show_plot = False
 
 #Neural network width and depth
 nn_width = 209
-nn_depth = 55
+nn_depth = 32
 
-#Optimizer learning rate schedule
-lr_init = 1e-3        # initial LR — ReduceLROnPlateau will reduce from here
-lr_patience  = 10     # epochs to wait before reducing LR
-lr_factor    = 0.5    # multiply LR by this when plateauing
+# Optimizer learning rate schedule - ReduceLROnPlateau
+lr_init      = 1e-3   # initial LR — ReduceLROnPlateau will reduce from here
+lr_patience  = 50     # epochs to wait before reducing LR
+lr_factor    = 0.7    # multiply LR by this when plateauing
 lr_min       = 1e-7   # floor
 
 #Regularization coefficient
@@ -130,7 +134,7 @@ regularization_coeff_l1 = 0.0
 regularization_coeff_l2 = 5e-5
 
 #Smoothness constraint coefficient
-smoothness_coeff = 0.0
+smoothness_coeff = 1e-1
 
 #Weight decay 
 weight_decay = 0.0
@@ -139,7 +143,10 @@ weight_decay = 0.0
 batch_size = 200
 
 #Number of epochs 
-n_epochs = 300
+n_epochs = 50
+
+#Early stopping patience (in epochs)
+early_stopping_patience = 200
 
 #Mode for optimization
 run_mode = 'use'
@@ -344,7 +351,7 @@ class CustomDataModule(pl.LightningDataModule):
         
         # --- Input scaling: one scaler per block ---
         # Block indices: [phys(D) | GP_T(O) | GP_P(O) | GP_Terr(O) | GP_Perr(O)]
-        i0, i1, i2, i3, i4 = 0, D, D+O, D+2*O, D+3*O, 
+        i0, i1, i2, i3, i4 = 0, D, D+O, D+2*O, D+3*O
 
         in_scaler_phys = StandardScaler()
         in_scaler_T    = StandardScaler()
@@ -388,15 +395,34 @@ class CustomDataModule(pl.LightningDataModule):
     
     def train_dataloader(self):
         dataset = TensorDataset(self.train_inputs, self.train_outputs)
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, generator=self.rng)
+        return DataLoader(
+         dataset,
+         batch_size=self.batch_size, 
+         shuffle=True, 
+         generator=self.rng,
+         pin_memory=True,
+        #  persistent_workers=True,
+         )
     
     def val_dataloader(self):
         dataset = TensorDataset(self.valid_inputs, self.valid_outputs)
-        return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
+        return DataLoader(
+         dataset,
+         batch_size=self.batch_size, 
+         generator=self.rng,
+         pin_memory=True,
+        #  persistent_workers=True,
+         )
 
     def test_dataloader(self):
         dataset = TensorDataset(self.test_inputs, self.test_outputs)
-        return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
+        return DataLoader(
+         dataset,
+         batch_size=self.batch_size, 
+         generator=self.rng,
+         pin_memory=True,
+        #  persistent_workers=True,
+         )
 
 model = NeuralNetwork(D + 4*O, nn_width, 2*O, nn_depth, generator=NN_rng)
 summary(model)
@@ -624,60 +650,39 @@ class RegressionModule(pl.LightningModule):
                 l2_penalty += torch.sum(param ** 2)
         
         return self.reg_coeff_l1 * l1_penalty, self.reg_coeff_l2 * l2_penalty
-    
-    def compute_smoothness_constraint(self, X, output):
-        """
-        Compute smoothness constraint: ||∇s|| where s is the model output.
-        This penalizes rapid changes in output with respect to input.
-        """
-        if self.smoothness_coeff == 0:
-            return torch.tensor(0., device=self.device)
-        
-        # Clone and enable gradient computation for inputs
-        X_grad = X.clone().detach().requires_grad_(True)
-
-        # Temporarily enable gradients
-        with torch.enable_grad():
-            # Recompute output with gradient tracking
-            output_grad = self.model(X_grad)
-            
-            # Compute gradients of output with respect to input: ∂s/∂x
-            grad_outputs = torch.ones_like(output_grad)
-            gradients = torch.autograd.grad(
-                outputs=output_grad,
-                inputs=X_grad,
-                grad_outputs=grad_outputs,
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True
-            )[0]
-            
-            # Smoothness: ||∇s|| = L2 norm of gradient vector for each sample
-            # Shape: gradients is (batch_size, input_dim)
-            # We want: mean over batch of ||∇s|| for each sample
-            smoothness_penalty = torch.mean(torch.norm(gradients, p=2, dim=1))
-        
-        return self.smoothness_coeff * smoothness_penalty
 
     def forward(self, x):
         return self.model(x)
     
     def training_step(self, batch):
         X, y = batch
+        if self.smoothness_coeff > 0:
+            X.requires_grad_(True)
         pred = self(X)
         
         # Base loss: ||y - s||
-        loss = self.loss_fn(pred, y)
+        mse = self.loss_fn(pred, y)
         
         # Add weight regularization (L1/L2 on network parameters)
         l1_penalty, l2_penalty = self.compute_weight_regularization()
-        loss += l1_penalty + l2_penalty
-        
-        # Add smoothness constraint (gradient of output w.r.t. input)
-        smoothness_penalty = self.compute_smoothness_constraint(X, pred)
-        loss += smoothness_penalty
+        loss = mse + l1_penalty + l2_penalty
+
+        # Compute gradients for smoothness penalty
+        if self.smoothness_coeff > 0:
+            # Compute gradient of loss w.r.t. inputs
+            grad_loss = torch.autograd.grad(
+                outputs=mse,
+                inputs=X,
+                create_graph=True,
+                retain_graph=True,
+            )[0]
+            
+            # Penalize large input gradients (smoother decision boundaries)
+            smoothness_penalty = self.smoothness_coeff * torch.mean(grad_loss ** 2)
+            loss += smoothness_penalty
 
         # Log metrics
+        self.log('train_mse', mse, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
     
@@ -711,7 +716,7 @@ class RegressionModule(pl.LightningModule):
             factor=self.lr_factor,
             patience=self.lr_patience,
             min_lr=self.lr_min,
-        )
+        ) 
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
@@ -721,9 +726,6 @@ class RegressionModule(pl.LightningModule):
                 'frequency': 1,
             }
         }
-
-
-
 
 ######################
 #### Run training ####
@@ -748,6 +750,14 @@ logger = CSVLogger(model_save_path+'logs', name='NeuralNetwork')
 # Set all seeds for complete reproducibility
 pl.seed_everything(NN_seed, workers=True)
 
+#Define early stopping callback
+early_stopping = EarlyStopping(
+    monitor='valid_loss',
+    patience=early_stopping_patience,
+    mode='min',
+    verbose=True,
+)
+
 # Create Trainer and train
 trainer = Trainer(
     max_epochs=n_epochs,
@@ -760,8 +770,10 @@ trainer = Trainer(
             save_top_k=1,
             monitor='valid_loss',
             mode='min',
-        )
-    ]
+        ),
+        early_stopping,
+    ],
+    enable_progress_bar=True,
 )
 
 #Start time 
@@ -776,9 +788,14 @@ if run_mode == 'use':
     
     trainer.fit(lightning_module, datamodule=data_module, ckpt_path=last_ckpt)
 
-    # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{lr_init}LR_{batch_size}BS.ckpt')
-    
+    # Get the best checkpoint path from ModelCheckpoint callback
+    best_model_path = trainer.checkpoint_callback.best_model_path
+    print(f"Best model path: {best_model_path}")
+
+    # Save best path for later loading
+    with open(model_save_path + 'best_ckpt_path.txt', 'w') as f:
+        f.write(best_model_path)
+
     finish_time_s = time() - t0
     finish_time_min = finish_time_s/60
     finish_time_hrs = finish_time_s/3600
@@ -786,23 +803,29 @@ if run_mode == 'use':
     print(f"Done! In {finish_time_s:.3f} s/{finish_time_min:.3f} min/{finish_time_hrs:.3f} hrs/{finish_time_days:.3f} days")
     
 else:
+    with open(model_save_path + 'best_ckpt_path.txt', 'r') as f:
+        best_ckpt_path = f.read().strip()
+
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{lr_init}LR_{batch_size}BS.ckpt',
+        best_ckpt_path,
         model=model,
         optimizer=Adam,
-    learning_rate=lr_init,
-    reg_coeff_l1=regularization_coeff_l1,
-    reg_coeff_l2=regularization_coeff_l2,
-    weight_decay=weight_decay,
-    smoothness_coeff=smoothness_coeff,
-    lr_patience=lr_patience,
-    lr_factor=lr_factor,
-    lr_min=lr_min,
+        learning_rate=lr_init,
+        reg_coeff_l1=regularization_coeff_l1,
+        reg_coeff_l2=regularization_coeff_l2,
+        weight_decay=weight_decay,
+        smoothness_coeff=smoothness_coeff,
+        lr_patience=lr_patience,
+        lr_factor=lr_factor,
+        lr_min=lr_min,
 
     )
     print("Model loaded!")
 
+model = lightning_module.model
+model.cpu()
+model.eval()
 
 #Testing model on test dataset
 if run_mode == 'use':trainer.test(lightning_module, datamodule=data_module)
@@ -818,7 +841,7 @@ csv_path = os.path.join(log_dir, latest_version, 'metrics.csv')
 metrics_df = pd.read_csv(csv_path)
 
 # Extract losses per epoch
-train_losses = metrics_df[metrics_df['train_loss_epoch'].notna()]['train_loss_epoch'].tolist()
+train_losses = metrics_df[metrics_df['train_mse_epoch'].notna()]['train_mse_epoch'].tolist()
 eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
 
 
@@ -834,27 +857,26 @@ eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist(
 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios':[3, 1]}, figsize=(10, 6))
 
 # Calculate number of batches per epoch
-n_batches = len(train_losses) // n_epochs
+actual_epochs = len(eval_losses)  # one entry per epoch
+n_batches = len(train_losses) // actual_epochs  # batches per epoch
+n_batches = max(1, n_batches)     # safety guard
 
 # Create x-axis in terms of epochs (0 to n_epochs)
-x_all = np.linspace(0, n_epochs, len(train_losses))
-x_epoch = np.arange(n_epochs+1)
+x_all = np.linspace(0, actual_epochs, len(train_losses))
+x_epoch = np.arange(actual_epochs + 1)
 
 # Plot transparent background showing all batch losses
 ax1.plot(x_all, train_losses, alpha=0.3, color='C0', linewidth=0.5)
 ax1.plot(x_all, eval_losses, alpha=0.3, color='C1', linewidth=0.5)
 
 # Plot solid lines showing epoch-level losses (every n_batches steps)
-train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]  # Last batch of each epoch
-eval_epoch = [eval_losses[0]] + eval_losses[n_batches-1::n_batches]
+train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]
+eval_epoch  = [eval_losses[0]]  + eval_losses[n_batches-1::n_batches]
 ax1.plot(x_epoch, train_epoch, label="Train", color='C0', linewidth=2, marker='o')
 ax1.plot(x_epoch, eval_epoch, label="Validation", color='C1', linewidth=2, marker='o')
 
 # Same for difference plot
-diff_all = np.array(train_losses) - np.array(eval_losses)
-diff_epoch = np.array(train_epoch) - np.array(eval_epoch)
-
-ax2.plot(x_all, diff_all, alpha=0.3, color='C2', linewidth=0.5)
+diff_epoch  = np.abs(np.array(train_epoch) - np.array(eval_epoch))
 ax2.plot(x_epoch, diff_epoch, color='C2', linewidth=2, marker='o')
 
 ax1.set_yscale('log')
@@ -880,10 +902,6 @@ in_scaler_T    = data_module.in_scaler_T
 in_scaler_P    = data_module.in_scaler_P
 in_scaler_Terr = data_module.in_scaler_Terr
 in_scaler_Perr = data_module.in_scaler_Perr
-
-# Move model to CPU for inference to avoid GPU memory issues
-model.cpu()
-model.eval()
 
 #Converting tensors to numpy arrays if this isn't already done
 if (type(NN_test_outputs_T) != np.ndarray):

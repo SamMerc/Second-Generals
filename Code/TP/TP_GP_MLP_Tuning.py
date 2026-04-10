@@ -29,7 +29,7 @@ import glob
 import shutil
 torch.set_float32_matmul_precision('high')
 import optuna
-from optuna.integration import PyTorchLightningPruningCallback
+from optuna_integration.pytorch_lightning import PyTorchLightningPruningCallback
 import warnings
 warnings.filterwarnings('ignore')
 
