@@ -58,17 +58,6 @@ raw_inputs = raw_inputs[rp, :]
 raw_outputs_T = raw_outputs_T[rp, :]
 raw_outputs_P = raw_outputs_P[rp, :]
 
-## HYPER-PARAMETERS ##
-
-#Distance metric to use
-distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
-
-#Convert raw inputs for H2 and CO2 pressures to log10 scale so don't have to deal with it later
-if 'logged' in distance_metric:
-    raw_inputs[:, 0] = np.log10(raw_inputs[:, 0]) #H2
-    raw_inputs[:, 1] = np.log10(raw_inputs[:, 1]) #CO2
-
-
 INPUT_LABELS = [
     r'H$_2$ Pressure (bar)',
     r'CO$_2$ Pressure (bar)',

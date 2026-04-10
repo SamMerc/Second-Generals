@@ -35,7 +35,7 @@ torch.set_float32_matmul_precision('high')
 def check_and_make_dir(dir):
     if not os.path.isdir(dir):os.mkdir(dir)
 #Base directory 
-base_dir = '/home/merci228/WORK/2G_ML/'
+base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing temperature values
 raw_T_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_T.csv', delimiter=',')
 raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
@@ -81,15 +81,6 @@ raw_outputs_P = raw_outputs_P[rp, :]
 
 #Number of nearest neighbors to choose
 N_neighbor = 4
-
-#Distance metric to use
-distance_metric = 'euclidean' #options: 'euclidean', 'mahalanobis', 'logged_euclidean', 'logged_mahalanobis'
-
-#Convert raw inputs for H2 and CO2 pressures to log10 scale so don't have to deal with it later
-if 'logged' in distance_metric:
-    raw_inputs[:, 0] = np.log10(raw_inputs[:, 0]) #H2
-    raw_inputs[:, 1] = np.log10(raw_inputs[:, 1]) #CO2
-
 
 ## HYPER-PARAMETERS for NN ##
 #Definine partitiion for splitting NN dataset
