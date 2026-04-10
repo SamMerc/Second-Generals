@@ -41,10 +41,10 @@ base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 raw_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_ST2D.csv', delimiter=',')
 raw_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/GP_XGB/'
+model_save_path = base_dir+'Model_Storage/GP_ST_XGB/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/GP_XGB/'
+plot_save_path = base_dir+'Plots/GP_ST_XGB/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -86,6 +86,14 @@ if 'logged' in distance_metric:
     raw_inputs[:, 0] = np.log10(raw_inputs[:, 0]) #H2
     raw_inputs[:, 1] = np.log10(raw_inputs[:, 1]) #CO2
 
+
+import psutil, os
+print(f"N={N}, O={O}, D={D}")
+n_xgb_features = D + 2 * O
+X_features_bytes = N * n_xgb_features * 8  # float64
+print(f"XGBoost feature matrix: {X_features_bytes / 1e6:.1f} MB raw")
+print(f"Estimated XGBoost peak (~7x): {7 * X_features_bytes / 1e9:.2f} GB")
+print(f"Available RAM: {psutil.virtual_memory().available / 1e9:.1f} GB")
 
 ############################
 #### Plotting functions ####
@@ -398,7 +406,7 @@ if os.path.exists(gp_cache_path):
     # ── Load from cache ───────────────────────────────────────
     print(f'  Loading cached GP outputs from:\n  {gp_cache_path}')
     cache = np.load(gp_cache_path)
-    GP_outputs_    = cache['GP_outputs']
+    GP_outputs    = cache['GP_outputs']
     GP_outputs_err = cache['GP_outputs_err']
 
 elif matching_files:
@@ -493,24 +501,19 @@ if show_plot:
 
 
 #Plot the residuals
-fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=[12, 8])
+fig, ax = plt.subplots(1, 1, figsize=[12, 8])
 
 for queryidx in range(N):
-    if queryidx == 0:ax1.plot(GP_outputs[queryidx, :] - raw_outputs[queryidx, :], alpha=0.1, color='green', label=f'Mean : {np.mean(GP_outputs - raw_outputs):.3f} K, Std : {np.std(GP_outputs - raw_outputs):.3f} K')
-    else:ax1.plot(GP_outputs[queryidx, :] - raw_outputs[queryidx, :], alpha=0.1, color='green')
+    if queryidx == 0:ax.plot(GP_outputs[queryidx, :] - raw_outputs[queryidx, :], alpha=0.1, color='green', label=f'Mean : {np.mean(GP_outputs - raw_outputs):.3f} K, Std : {np.std(GP_outputs - raw_outputs):.3f} K')
+    else:ax.plot(GP_outputs[queryidx, :] - raw_outputs[queryidx, :], alpha=0.1, color='green')
 
-for ax in [ax1, ax2]:
-    ax.axhline(0, color='black', linestyle='dashed')
-    ax.grid()
+ax.axhline(0, color='black', linestyle='dashed')
+ax.grid()
 
-ax2.set_xlabel('Index')
+ax.set_xlabel('Index')
+ax.set_ylabel('Temperature')
 
-ax1.set_ylabel('Temperature')
-ax2.set_ylabel('log$_{10}$ Pressure (bar)')
-
-ax1.legend()
-ax2.legend()
-plt.subplots_adjust(hspace=0.1, bottom=0.25)
+ax.legend()
 
 # plt.savefig(plot_save_path+f'/res_GP_NN.pdf', bbox_inches='tight')
 plt.show()
