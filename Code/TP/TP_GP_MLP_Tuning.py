@@ -80,17 +80,17 @@ print(f"Using {device} device with {num_threads} threads")
 #############################
 #### run_mode selection  ####
 #############################
-run_mode = 'search2'   # 'search1' | 'search2' | 'train' | 'evaluate'
+run_mode = 'evaluate'   # 'search1' | 'search2' | 'train' | 'evaluate'
 
 ## ── Parameters for 'train' and 'evaluate' modes ──────────────────────────────
 ## After the Optuna search completes, paste the best params here and switch
 ## run_mode to 'train', then to 'evaluate'.
 FINAL_PARAMS = {
-    'lr_init'    : 1e-3,
-    'nn_depth'   : 32,
-    'nn_width'   : 209,
-    'reg_l2'     : 5e-5,
-    'batch_size' : 200,
+    'lr_init'    : 0.0001881473773986,
+    'nn_depth'   : 8,
+    'nn_width'   : 313,
+    'reg_l2'     : 2.175134924658512e-06,
+    'batch_size' : 128,
 }
 FINAL_PARTITION_SEED = 4
 FINAL_BATCH_SEED     = 5
@@ -1045,4 +1045,90 @@ elif run_mode == 'evaluate':
     plt.savefig(plot_save_path + '/res_GP_NN.pdf', bbox_inches='tight')
     plt.close()
 
+# ── Figure 1: RMSE histograms ─────────────────────────────────────────────
+    # Per-sample RMSE across the profile axis (axis=1)
+    GP_rmse_T = np.sqrt(np.mean(GP_res_T**2, axis=1))
+    GP_rmse_P = np.sqrt(np.mean(GP_res_P**2, axis=1))
+    NN_rmse_T = np.sqrt(np.mean(NN_res_T**2, axis=1))
+    NN_rmse_P = np.sqrt(np.mean(NN_res_P**2, axis=1))
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    hist_configs = [
+        (axes[0, 0], GP_rmse_T, 'GP',     'Temperature',      'RMSE (K)',             'C2'),
+        (axes[0, 1], NN_rmse_T, 'GP + NN','Temperature',      'RMSE (K)',             'C0'),
+        (axes[1, 0], GP_rmse_P, 'GP',     'Pressure',         r'RMSE (log$_{10}$ bar)','C2'),
+        (axes[1, 1], NN_rmse_P, 'GP + NN','Pressure',         r'RMSE (log$_{10}$ bar)','C0'),
+    ]
+    for ax, data, model_label, var_label, xlabel, color in hist_configs:
+        median = np.median(data)
+        std    = np.std(data)
+        ax.hist(data, bins=40, color=color, alpha=0.7, edgecolor='white', density=True, linewidth=0.5)
+        ax.axvline(median, color='black',  linestyle='--', linewidth=2,
+                   label=f'Median = {median:.3f}')
+        ax.axvline(median + std, color='grey', linestyle=':', linewidth=1.5,
+                   label=f'Std = {std:.3f}')
+        ax.axvline(median - std, color='grey', linestyle=':', linewidth=1.5)
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_ylabel('Log Density', fontsize=11)
+        ax.set_title(f'{model_label} — {var_label}', fontsize=12)
+        ax.set_yscale('log')
+        ax.legend(fontsize=10)
+        ax.grid(alpha=0.4)
+
+    plt.suptitle('Per-sample RMSE distributions across test set', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(plot_save_path + '/rmse_histograms.pdf', bbox_inches='tight')
+    plt.close()
+
+
+    # ── Figure 2: RMSE vs input variables ────────────────────────────────────
+    # Input variable names and indices into raw_inputs
+    input_var_names = [
+        r'H$_2$ (bar)',
+        r'CO$_2$ (bar)',
+        r'LoD (days)',
+        r'Obliquity (deg)',
+        r'T$_{\rm eff}$ (K)',
+    ]
+    test_inputs_np = raw_inputs[test_idx]   # shape (n_test, D)
+
+    rmse_sets = [
+        ('GP',      'Temperature',  GP_rmse_T, 'C2'),
+        ('GP + NN', 'Temperature',  NN_rmse_T, 'C0'),
+        ('GP',      'Pressure',     GP_rmse_P, 'C2'),
+        ('GP + NN', 'Pressure',     NN_rmse_P, 'C0'),
+    ]
+
+    fig, axes = plt.subplots(4, D, figsize=(4 * D, 14), sharey='row')
+
+    for row_idx, (model_label, var_label, rmse_vals, color) in enumerate(rmse_sets):
+        for col_idx, var_name in enumerate(input_var_names):
+            ax  = axes[row_idx, col_idx]
+            x   = test_inputs_np[:, col_idx]
+            corr = np.corrcoef(x, rmse_vals)[0, 1]
+
+            ax.scatter(x, rmse_vals, s=8, alpha=0.4, color=color, linewidths=0)
+
+            # Trend line in log or linear space depending on variable range
+            x_sort  = np.sort(x)
+            z       = np.polyfit(x, rmse_vals, 1)
+            ax.plot(x_sort, np.polyval(z, x_sort),
+                    color='black', linewidth=1.5, linestyle='--', alpha=0.8)
+
+            ax.set_xlabel(var_name, fontsize=10)
+            ax.set_title(f'r = {corr:.2f}', fontsize=10, color='black')
+            ax.grid(alpha=0.3)
+
+            if col_idx == 0:
+                units = 'K' if 'Temp' in var_label else r'log$_{10}$ bar'
+                ax.set_ylabel(
+                    f'{model_label}\n{var_label}\nRMSE ({units})',
+                    fontsize=9
+                )
+
+    plt.suptitle('RMSE vs input variables (Pearson r shown per panel)', fontsize=13, y=1.01)
+    plt.tight_layout()
+    plt.savefig(plot_save_path + '/rmse_vs_inputs.pdf', bbox_inches='tight')
+    plt.close()
+    
     print('Evaluation complete. Plots saved to:', plot_save_path)
