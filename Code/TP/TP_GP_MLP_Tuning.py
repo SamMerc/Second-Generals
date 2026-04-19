@@ -45,9 +45,9 @@ raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimi
 raw_P_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_P.csv', delimiter=',')
 raw_P_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 
-model_save_path = base_dir+'Model_Storage/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS/'
+model_save_path = base_dir+'Model_Storage/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS_SC/'
 check_and_make_dir(model_save_path)
-plot_save_path = base_dir+'Plots/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS/'
+plot_save_path = base_dir+'Plots/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS_SC/'
 check_and_make_dir(plot_save_path)
 
 inputs_3000 = np.hstack([raw_T_data3000[:, :4], np.full((len(raw_T_data3000), 1), 3000.0)])
@@ -80,16 +80,17 @@ print(f"Using {device} device with {num_threads} threads")
 #############################
 #### run_mode selection  ####
 #############################
-run_mode = 'evaluate'   # 'search1' | 'search2' | 'train' | 'evaluate'
+run_mode = 'search1'   # 'search1' | 'search2' | 'train' | 'evaluate'
 
 ## ── Parameters for 'train' and 'evaluate' modes ──────────────────────────────
 ## After the Optuna search completes, paste the best params here and switch
 ## run_mode to 'train', then to 'evaluate'.
 FINAL_PARAMS = {
-    'lr_init'    : 0.0001881473773986,
+    'lr_init'    : 0.0001,
     'nn_depth'   : 8,
     'nn_width'   : 313,
-    'reg_l2'     : 2.175134924658512e-06,
+    'reg_l2'     : 1e-06,
+    'smoothness_coeff' : 0.01,
     'batch_size' : 128,
 }
 FINAL_PARTITION_SEED = 4
@@ -490,11 +491,12 @@ if run_mode == 'search1':
         print(f'  Trials completed: {len([t for t in study.trials if t.value is not None])}')
 
     def objective(trial):
-        lr_init    = trial.suggest_float('lr_init',  1e-4, 1e-2, log=True)
-        nn_depth   = trial.suggest_categorical('nn_depth',   [4, 8, 16, 32])
-        nn_width   = trial.suggest_categorical('nn_width',   [209, 313, 418])
-        reg_l2     = trial.suggest_float('reg_l2',   1e-6, 1e-3, log=True)
-        batch_size = trial.suggest_categorical('batch_size', [64, 128, 256, 512])
+        lr_init          = trial.suggest_float('lr_init',  1e-4, 1e-2, log=True)
+        nn_depth         = trial.suggest_categorical('nn_depth',   [4, 8, 16, 32])
+        nn_width         = trial.suggest_categorical('nn_width',   [209, 313, 418])
+        reg_l2           = trial.suggest_float('reg_l2',   1e-6, 1e-3, log=True)
+        smoothness_coeff = trial.suggest_categorical('smoothness_coeff', [0.0, 1e-2, 1e-1, 1.0])
+        batch_size       = trial.suggest_categorical('batch_size', [64, 128, 256, 512])
 
         val_losses = []
 
@@ -512,7 +514,7 @@ if run_mode == 'search1':
                 reg_coeff_l1=0.0,
                 reg_coeff_l2=reg_l2,
                 weight_decay=0.0,
-                smoothness_coeff=0.0,
+                smoothness_coeff=smoothness_coeff,
                 lr_patience=SEARCH_LR_PATIENCE,
                 lr_factor=SEARCH_LR_FACTOR,
                 lr_min=SEARCH_LR_MIN,
@@ -557,7 +559,7 @@ if run_mode == 'search1':
     study = optuna.create_study(
         direction='minimize',
         pruner=pruner,
-        storage=f'sqlite:///{model_save_path}_stage1.db',
+        storage=f'sqlite:///{model_save_path}optuna_study_stage1.db',
         study_name='tp_profile_nn_stage1',
         load_if_exists=True,
     )
@@ -585,7 +587,7 @@ if run_mode == 'search1':
     print('\nTop 10 trials:')
     top10 = results_df.sort_values('value').head(10)[[
         'number', 'value', 'params_lr_init', 'params_nn_depth',
-        'params_nn_width', 'params_reg_l2', 'params_batch_size'
+        'params_nn_width', 'params_reg_l2', 'params_smoothness_coeff', 'params_batch_size'
     ]]
     print(top10.to_string(index=False))
 
@@ -631,7 +633,7 @@ elif run_mode == 'search2':
     print(f'\n=== Stage 2: Robustness evaluation of top {STAGE2_TOP_N} configs ===')
     print(f'Partition seeds: {STAGE2_PARTITION_SEEDS}')
     print(top_configs[['number', 'value', 'params_lr_init', 'params_nn_depth',
-                        'params_nn_width', 'params_reg_l2', 'params_batch_size']].to_string(index=False))
+                        'params_nn_width', 'params_reg_l2', 'params_smoothness_coeff', 'params_batch_size']].to_string(index=False))
 
     stage2_results = []
 
@@ -644,16 +646,17 @@ elif run_mode == 'search2':
     )
 
     for rank, row in top_configs.iterrows():
-        trial_num  = int(row['number'])
-        lr_init    = float(row['params_lr_init'])
-        nn_depth   = int(row['params_nn_depth'])
-        nn_width   = int(row['params_nn_width'])
-        reg_l2     = float(row['params_reg_l2'])
-        batch_size = int(row['params_batch_size'])
+        trial_num        = int(row['number'])
+        lr_init          = float(row['params_lr_init'])
+        nn_depth         = int(row['params_nn_depth'])
+        nn_width         = int(row['params_nn_width'])
+        reg_l2           = float(row['params_reg_l2'])
+        smoothness_coeff = float(row['params_smoothness_coeff'])
+        batch_size       = int(row['params_batch_size'])
 
         print(f'\n--- Stage 2 | Rank {rank+1} | Stage-1 trial {trial_num} ---')
         print(f'  lr={lr_init:.2e}, depth={nn_depth}, width={nn_width}, '
-              f'l2={reg_l2:.2e}, bs={batch_size}')
+              f'l2={reg_l2:.2e}, smooth={smoothness_coeff:.2e}, bs={batch_size}')
 
         seed_val_losses = []
 
@@ -671,7 +674,7 @@ elif run_mode == 'search2':
                 reg_coeff_l1=0.0,
                 reg_coeff_l2=reg_l2,
                 weight_decay=0.0,
-                smoothness_coeff=0.0,
+                smoothness_coeff=smoothness_coeff,
                 lr_patience=STAGE2_LR_PATIENCE,
                 lr_factor=STAGE2_LR_FACTOR,
                 lr_min=STAGE2_LR_MIN,
@@ -712,6 +715,7 @@ elif run_mode == 'search2':
         trial.suggest_int(  'nn_depth', nn_depth,   nn_depth)
         trial.suggest_int(  'nn_width', nn_width,   nn_width)
         trial.suggest_float('reg_l2',   reg_l2,     reg_l2)
+        trial.suggest_float('smoothness_coeff',   smoothness_coeff,     smoothness_coeff)
         trial.suggest_int(  'batch_size', batch_size, batch_size)
         stage2_study.tell(trial, mean_loss)
 
@@ -727,6 +731,7 @@ elif run_mode == 'search2':
             'nn_depth'        : nn_depth,
             'nn_width'        : nn_width,
             'reg_l2'          : reg_l2,
+            'smoothness_coeff': smoothness_coeff,
             'batch_size'      : batch_size,
             'per_seed_losses' : seed_val_losses,
         })
@@ -739,16 +744,17 @@ elif run_mode == 'search2':
     print('Rankings by mean val loss across seeds:')
     print(stage2_df[['stage1_trial', 'stage1_val_loss', 'mean_val_loss',
                       'std_val_loss', 'worst_val_loss', 'lr_init', 'nn_depth',
-                      'nn_width', 'reg_l2', 'batch_size']].to_string(index=False))
+                      'nn_width', 'reg_l2', 'smoothness_coeff', 'batch_size']].to_string(index=False))
 
     best = stage2_df.iloc[0]
     print(f'\nBest Stage-2 config (Stage-1 trial {int(best["stage1_trial"])}) :')
     print(f'  mean_val_loss = {best["mean_val_loss"]:.6f}  (std={best["std_val_loss"]:.6f})')
-    print(f'  lr_init    : {best["lr_init"]}')
-    print(f'  nn_depth   : {int(best["nn_depth"])}')
-    print(f'  nn_width   : {int(best["nn_width"])}')
-    print(f'  reg_l2     : {best["reg_l2"]}')
-    print(f'  batch_size : {int(best["batch_size"])}')
+    print(f'  lr_init          : {best["lr_init"]}')
+    print(f'  nn_depth         : {int(best["nn_depth"])}')
+    print(f'  nn_width         : {int(best["nn_width"])}')
+    print(f'  reg_l2           : {best["reg_l2"]}')
+    print(f'  smoothness_coeff : {best["smoothness_coeff"]}')
+    print(f'  batch_size       : {int(best["batch_size"])}')
     print(f'\nPaste these into FINAL_PARAMS and set run_mode = "train"')
     print(f'Full results saved to {model_save_path}stage2_results.csv')
 
@@ -788,7 +794,7 @@ elif run_mode == 'train':
         reg_coeff_l1=0.0,
         reg_coeff_l2=p['reg_l2'],
         weight_decay=0.0,
-        smoothness_coeff=0.0,
+        smoothness_coeff=p['smoothness_coeff'],
         lr_patience=FINAL_LR_PATIENCE,
         lr_factor=FINAL_LR_FACTOR,
         lr_min=FINAL_LR_MIN,
@@ -854,7 +860,7 @@ elif run_mode == 'evaluate':
         reg_coeff_l1=0.0,
         reg_coeff_l2=p['reg_l2'],
         weight_decay=0.0,
-        smoothness_coeff=0.0,
+        smoothness_coeff=p['smoothness_coeff'],
         lr_patience=FINAL_LR_PATIENCE,
         lr_factor=FINAL_LR_FACTOR,
         lr_min=FINAL_LR_MIN,
