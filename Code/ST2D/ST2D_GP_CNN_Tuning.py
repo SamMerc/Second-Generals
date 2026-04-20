@@ -33,7 +33,7 @@ import optuna
 from optuna_integration.pytorch_lightning import PyTorchLightningPruningCallback
 import warnings
 warnings.filterwarnings('ignore')
-
+from sklearn.metrics import r2_score
 
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
@@ -79,22 +79,23 @@ torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
 
 show_plot = False
+plot_pred = False
 
 #############################
 #### run_mode selection  ####
 #############################
-run_mode = 'search1'   # 'search1' | 'search2' | 'train' | 'evaluate'
+run_mode = 'evaluate'   # 'search1' | 'search2' | 'train' | 'evaluate'
 
 ## ── Parameters for 'train' and 'evaluate' modes ──────────────────────────────
 ## After Stage 2 completes, paste the best params here and switch run_mode
 ## to 'train', then to 'evaluate'.
 FINAL_PARAMS = {
-    'lr_init'          : 1e-3,
-    'cnn_depth'        : 7,
-    'cnn_channels'     : 64,
-    'reg_l2'           : 5e-5,
-    'smoothness_coeff' : 1e-1,
-    'batch_size'       : 32,
+    'lr_init'          : 0.00010175170875090105,
+    'cnn_depth'        : 10,
+    'cnn_channels'     : 128,
+    'reg_l2'           : 4.231195487398746e-06,
+    'smoothness_coeff' : 0.01,
+    'batch_size'       : 64,
 }
 FINAL_PARTITION_SEED = 4
 FINAL_BATCH_SEED     = 5
@@ -935,6 +936,7 @@ elif run_mode == 'evaluate':
     n_test  = len(test_idx)
     GP_res  = np.zeros((n_test, O), dtype=float)
     NN_res  = np.zeros((n_test, O), dtype=float)
+    NN_pred = np.zeros((n_test, O), dtype=float)
 
     for NN_test_idx, (test_input_phys, gp_pred, gp_err, true) in enumerate(zip(
             NN_test_inputs_phys, NN_test_inputs_pred, NN_test_inputs_err, NN_test_true)):
@@ -960,8 +962,9 @@ elif run_mode == 'evaluate':
 
         GP_res[NN_test_idx, :] = gp_pred.numpy() - true_np
         NN_res[NN_test_idx, :] = cnn_pred_full    - true_np
+        NN_pred[NN_test_idx, :] = cnn_pred_full
 
-        if NN_test_idx % substep == 0:
+        if plot_pred and (NN_test_idx % substep == 0):
             plot_true     = true_np.reshape((IMG_H, IMG_W))
             plot_gp_pred  = gp_pred.numpy().reshape((IMG_H, IMG_W))
             plot_cnn_pred = cnn_pred_full.reshape((IMG_H, IMG_W))
@@ -1021,6 +1024,56 @@ elif run_mode == 'evaluate':
              verticalalignment='bottom',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     plt.savefig(plot_save_path + '/res_GP_CNN.pdf', bbox_inches='tight')
+    plt.close()
+
+    # ── Figure 3: truth vs predicted scatter plot ────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(8,4), sharey='row')
+    GP_plot_color = 'sandybrown'
+    GPNN_plot_color = 'skyblue'
+    FS=12
+    plot_alpha=0.15
+
+    def compute_stats(y_true, y_pred):
+        y_true_flat = y_true.flatten()
+        y_pred_flat = y_pred.flatten()
+        r2   = r2_score(y_true_flat, y_pred_flat)
+        rmse = np.sqrt(np.mean((y_true_flat - y_pred_flat)**2))
+        me   = np.mean(y_pred_flat - y_true_flat)
+        return r2, rmse, me
+
+    for test_elem in range(0, n_test, 1000):
+        #GP
+        r2, rmse, me = compute_stats(NN_test_true.numpy(), NN_test_inputs_pred.numpy())
+        axes[0].errorbar(NN_test_inputs_pred[test_elem], NN_test_true[test_elem],
+                            yerr= NN_test_inputs_err[test_elem], fmt='o', alpha=plot_alpha,
+                           color='orange', zorder=2, label=f"R$^2$={r2:.4f}\nRMSE={rmse:.4f}\nME={me:.4f}" if test_elem == 0 else None)
+
+        #GP+NN 
+        r2, rmse, me = compute_stats(NN_test_true.numpy(), NN_pred)
+        axes[1].plot(NN_pred[test_elem], NN_test_true[test_elem],
+                        'o', alpha=plot_alpha, 
+                        color='skyblue', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == 0 else None)
+
+
+    axes[0].plot(np.linspace(-3000, 3000, 100), np.linspace(-3000, 3000, 100), 'k--', zorder=3)
+    axes[0].set_xlim(min(NN_test_inputs_pred.flatten()), max(NN_test_inputs_pred.flatten()))
+    axes[0].set_ylim(min(NN_test_true.flatten()), max(NN_test_true.flatten()))
+    axes[0].set_ylabel('True Temperature (K)', fontsize=FS)
+    axes[0].set_xlabel('Predicted Temperature (K)', fontsize=FS)
+    axes[0].tick_params(axis='both', labelsize=FS)
+    axes[0].legend(fontsize=10, loc='upper left')
+
+
+    axes[1].plot(np.linspace(-3000, 3000, 100), np.linspace(-3000, 3000, 100), 'k--', zorder=3)
+    axes[1].set_xlim(min(NN_pred.flatten()), max(NN_pred.flatten()))
+    axes[1].set_ylim(min(NN_test_true.flatten()), max(NN_test_true.flatten()))
+    axes[1].set_xlabel('Predicted Temperature (K)', fontsize=FS)
+    axes[1].tick_params(axis='both', labelsize=FS)
+    axes[1].legend(fontsize=10, loc='upper left')
+
+
+    plt.tight_layout()
+    plt.savefig(plot_save_path + '/truthvspred_scatter.png', bbox_inches='tight')
     plt.close()
 
     print('Evaluation complete. Plots saved to:', plot_save_path)
