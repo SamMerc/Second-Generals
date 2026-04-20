@@ -470,7 +470,6 @@ def build_data_module(partition_seed, batch_size, batch_seed=5):
 if run_mode == 'search1':
 
     PARTITION_SEEDS = [4]           # Stage 1: single seed
-    # PARTITION_SEEDS = [4, 7, 13]  # Stage 2: uncomment for multi-seed run
 
     SEARCH_BATCH_SEED  = 5
     SEARCH_NN_SEED     = 6
@@ -494,7 +493,6 @@ if run_mode == 'search1':
         cnn_depth        = trial.suggest_categorical('cnn_depth',    [4, 7, 10, 14])
         cnn_channels     = trial.suggest_categorical('cnn_channels', [32, 64, 128])
         reg_l2           = trial.suggest_float('reg_l2',     1e-6, 1e-3, log=True)
-        # 0.0 is a candidate — lets Optuna discover whether smoothness helps at all
         smoothness_coeff = trial.suggest_categorical('smoothness_coeff', [0.0, 1e-2, 1e-1, 1.0])
         batch_size       = trial.suggest_categorical('batch_size', [16, 32, 64])
 
@@ -551,6 +549,7 @@ if run_mode == 'search1':
             best_val = checkpoint.best_model_score
             if best_val is None:
                 raise optuna.exceptions.TrialPruned()
+
             val_losses.append(best_val.item())
 
         return float(np.mean(val_losses))
@@ -565,7 +564,7 @@ if run_mode == 'search1':
     study = optuna.create_study(
         direction='minimize',
         pruner=pruner,
-        storage=f'sqlite:///{model_save_path}optuna_study.db',
+        storage=f'sqlite:///{model_save_path}optuna_study_stage1.db',
         study_name='st_map_cnn_stage1',
         load_if_exists=True,
     )
@@ -629,8 +628,10 @@ elif run_mode == 'search2':
     stage1_csv = model_save_path + 'optuna_results_stage1.csv'
     assert os.path.exists(stage1_csv), f'Stage 1 results not found at {stage1_csv}'
 
-    results_df  = pd.read_csv(stage1_csv)
-    completed   = results_df[results_df['value'].notna()].copy()
+    results_df = pd.read_csv(stage1_csv)
+
+    # Keep only completed (non-pruned) trials
+    completed = results_df[results_df['value'].notna()].copy()
     top_configs = completed.sort_values('value').head(STAGE2_TOP_N).reset_index(drop=True)
 
     print(f'\n=== Stage 2: Robustness evaluation of top {STAGE2_TOP_N} configs ===')
@@ -642,6 +643,14 @@ elif run_mode == 'search2':
     ]].to_string(index=False))
 
     stage2_results = []
+
+    #Optuna logging
+    stage2_study = optuna.create_study(
+        direction='minimize',
+        storage=f'sqlite:///{model_save_path}optuna_study_stage2.db',
+        study_name='st_map_cnn_stage2',
+        load_if_exists=True,
+    )
 
     for rank, row in top_configs.iterrows():
         trial_num        = int(row['number'])
@@ -713,6 +722,16 @@ elif run_mode == 'search2':
         std_loss   = float(np.nanstd(seed_val_losses))
         worst_loss = float(np.nanmax(seed_val_losses))
 
+        # After the per-seed loop for each config:
+        trial = stage2_study.ask()
+        trial.suggest_float('lr_init',  lr_init,    lr_init)
+        trial.suggest_int(  'nn_depth', nn_depth,   nn_depth)
+        trial.suggest_int(  'nn_width', nn_width,   nn_width)
+        trial.suggest_float('reg_l2',   reg_l2,     reg_l2)
+        trial.suggest_float('smoothness_coeff',   smoothness_coeff,     smoothness_coeff)
+        trial.suggest_int(  'batch_size', batch_size, batch_size)
+        stage2_study.tell(trial, mean_loss)
+        
         print(f'  => mean={mean_loss:.6f}  std={std_loss:.6f}  worst={worst_loss:.6f}')
 
         stage2_results.append({
