@@ -83,7 +83,7 @@ show_plot = False
 #############################
 #### run_mode selection  ####
 #############################
-run_mode = 'train'   # 'search1' | 'search2' | 'train' | 'evaluate'
+run_mode = 'evaluate'   # 'search1' | 'search2' | 'train' | 'evaluate'
 
 ## ── Parameters for 'train' and 'evaluate' modes ──────────────────────────────
 ## After Stage 2 completes, paste the best params here and switch run_mode
