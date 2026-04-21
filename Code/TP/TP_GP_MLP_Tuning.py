@@ -36,6 +36,8 @@ import matplotlib.colors as mcolors
 from matplotlib import ticker
 from sklearn.metrics import r2_score
 import matplotlib.gridspec as gridspec
+from scipy.interpolate import RectBivariateSpline
+from scipy.ndimage import gaussian_filter
 
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
@@ -43,15 +45,15 @@ import matplotlib.gridspec as gridspec
 def check_and_make_dir(dir):
     if not os.path.isdir(dir): os.mkdir(dir)
 
-base_dir = '/home/merci228/WORK/2G_ML/'
+base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 raw_T_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_T.csv', delimiter=',')
 raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
 raw_P_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_P.csv', delimiter=',')
 raw_P_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
 
-model_save_path = base_dir+'Model_Storage/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS_SC/'
+model_save_path = base_dir+'Model_Storage/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS/'
 check_and_make_dir(model_save_path)
-plot_save_path = base_dir+'Plots/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS_SC/'
+plot_save_path = base_dir+'Plots/Hyperparam_tuning_LRinit_NNdepth_NNwidth_L2_BS/'
 check_and_make_dir(plot_save_path)
 
 inputs_3000 = np.hstack([raw_T_data3000[:, :4], np.full((len(raw_T_data3000), 1), 3000.0)])
@@ -81,20 +83,22 @@ num_threads = 96
 torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
 
+plot_fig3 = False
+
 #############################
 #### run_mode selection  ####
 #############################
-run_mode = 'search1'   # 'search1' | 'search2' | 'train' | 'evaluate'
+run_mode = 'evaluate'   # 'search1' | 'search2' | 'train' | 'evaluate'
 
 ## ── Parameters for 'train' and 'evaluate' modes ──────────────────────────────
 ## After the Optuna search completes, paste the best params here and switch
 ## run_mode to 'train', then to 'evaluate'.
 FINAL_PARAMS = {
-    'lr_init'    : 0.0001,
+    'lr_init'    : 0.0001881473773986,
     'nn_depth'   : 8,
     'nn_width'   : 313,
-    'reg_l2'     : 1e-06,
-    'smoothness_coeff' : 0.01,
+    'reg_l2'     : 2.175134924658512e-06,
+    'smoothness_coeff' : 0.0,
     'batch_size' : 128,
 }
 FINAL_PARTITION_SEED = 4
@@ -1154,85 +1158,128 @@ elif run_mode == 'evaluate':
     plt.close()
 
     # ── Figure 3: truth vs predicted scatter plot ────────────────────────────────────
-    fig, axes = plt.subplots(2, 2, figsize=(8,8), sharey='row')
     GP_plot_color = 'sandybrown'
     GPNN_plot_color = 'skyblue'
-    FS=12
-    plot_alpha=0.15
+    if plot_fig3:
+        # Load the ST data
+        data_ST = np.load('/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/Plots/ST_Hyperparam_tuning_LRinit_CNNdepth_CNNchannels_L2_BS_SC/pred_vs_actual.npz')
+        NN_test_true_ST = data_ST['true']
+        NN_test_inputs_ST = data_ST['gp_pred']
+        NN_test_inputs_STerr = data_ST['gp_err']
+        NN_pred_ST = data_ST['nn_pred']
 
-    def compute_stats(y_true, y_pred):
-        y_true_flat = y_true.flatten()
-        y_pred_flat = y_pred.flatten()
-        r2   = r2_score(y_true_flat, y_pred_flat)
-        rmse = np.sqrt(np.mean((y_true_flat - y_pred_flat)**2))
-        me   = np.mean(y_pred_flat - y_true_flat)
-        return r2, rmse, me
+        fig, axes = plt.subplots(3, 2, figsize=(8,8), sharey='row')
+        FS=12
+        plot_alpha=0.15
+        plot_alpha_ST=0.01
 
-    for test_elem in range(n_test):
-        #GP T
-        r2, rmse, me = compute_stats(NN_test_true_T.numpy(), NN_test_inputs_T.numpy())
-        axes[0, 0].errorbar(NN_test_inputs_T[test_elem], NN_test_true_T[test_elem],
-                            yerr= NN_test_inputs_Terr[test_elem], fmt='o', alpha=plot_alpha,
-                           color='orange', zorder=2, label=f"R$^2$={r2:.4f}\nRMSE={rmse:.4f}\nME={me:.4f}" if test_elem == 0 else None)
+        def compute_stats(y_true, y_pred):
+            y_true_flat = y_true.flatten()
+            y_pred_flat = y_pred.flatten()
+            r2   = r2_score(y_true_flat, y_pred_flat)
+            rmse = np.sqrt(np.mean((y_true_flat - y_pred_flat)**2))
+            me   = np.mean(y_pred_flat - y_true_flat)
+            return r2, rmse, me
 
-        #GP P
-        r2, rmse, me = compute_stats(NN_test_true_P.numpy(), NN_test_inputs_P.numpy())
-        axes[1, 0].errorbar(NN_test_inputs_P[test_elem], NN_test_true_P[test_elem],
-                            yerr= NN_test_inputs_Perr[test_elem], fmt='o', alpha=plot_alpha, 
-                            color='darkorange', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == 0 else None)
+        shufflefig3_seed = 45
+        np.random.seed(shufflefig3_seed)
+        rp = np.random.permutation(n_test)
+        for test_elem in rp[::10]:
+            #GP T
+            r2, rmse, me = compute_stats(NN_test_true_T.numpy(), NN_test_inputs_T.numpy())
+            axes[0, 0].errorbar(NN_test_inputs_T[test_elem], NN_test_true_T[test_elem],
+                                yerr= NN_test_inputs_Terr[test_elem], fmt='o', alpha=plot_alpha,
+                            color='orange', zorder=2, label=f"R$^2$={r2:.4f}\nRMSE={rmse:.4f}\nME={me:.4f}" if test_elem == rp[0] else None)
 
-        #GP+NN T
-        r2, rmse, me = compute_stats(NN_test_true_T.numpy(), NN_pred_T)
-        axes[0, 1].plot(NN_pred_T[test_elem], NN_test_true_T[test_elem],
-                        'o', alpha=plot_alpha, 
-                        color='skyblue', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == 0 else None)
+            #GP P
+            r2, rmse, me = compute_stats(NN_test_true_P.numpy(), NN_test_inputs_P.numpy())
+            axes[1, 0].errorbar(NN_test_inputs_P[test_elem], NN_test_true_P[test_elem],
+                                yerr= NN_test_inputs_Perr[test_elem], fmt='o', alpha=plot_alpha, 
+                                color='darkorange', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
+            
+            #GP ST
+            r2, rmse, me = compute_stats(NN_test_true_ST, NN_test_inputs_ST)
+            axes[2, 0].errorbar(NN_test_inputs_ST[test_elem], NN_test_true_ST[test_elem],
+                                yerr= NN_test_inputs_STerr[test_elem], fmt='o', alpha=plot_alpha_ST, 
+                                color='orangered', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
 
-        #GP+NN P
-        r2, rmse, me = compute_stats(NN_test_true_P.numpy(), NN_pred_P)
-        axes[1, 1].plot(NN_pred_P[test_elem], NN_test_true_P[test_elem], 
-                        'o', alpha=plot_alpha, 
-                        color='deepskyblue', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == 0 else None)
+            #GP+NN T
+            r2, rmse, me = compute_stats(NN_test_true_T.numpy(), NN_pred_T)
+            axes[0, 1].plot(NN_pred_T[test_elem], NN_test_true_T[test_elem],
+                            'o', alpha=plot_alpha, 
+                            color='skyblue', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
 
-    axes[0,0].plot(np.linspace(-3000, 3000, 100), np.linspace(-3000, 3000, 100), 'k--', zorder=3)
-    axes[0,0].set_xlim(min(NN_test_inputs_T.flatten()), max(NN_test_inputs_T.flatten()))
-    axes[0,0].set_ylim(min(NN_test_true_T.flatten()), max(NN_test_true_T.flatten()))
-    axes[0,0].set_ylabel('True Temperature (K)', fontsize=FS)
-    axes[0,0].set_xlabel('Predicted Temperature (K)', fontsize=FS)
-    axes[0,0].set_title('Ens-CGP', fontsize=FS)
-    axes[0,0].tick_params(axis='both', labelsize=FS)
-    axes[0,0].legend(fontsize=10, loc='upper left')
-
-
-    axes[1,0].plot(np.linspace(-10, 10, 100), np.linspace(-10, 10, 100), 'k--', zorder=3)
-    axes[1,0].set_xlim(min(NN_test_inputs_P.flatten()), max(NN_test_inputs_P.flatten()))
-    axes[1,0].set_ylim(min(NN_test_true_P.flatten()), max(NN_test_true_P.flatten()))
-    axes[1,0].set_ylabel(r'True Pressure ($\log_{10}$ bar)', fontsize=FS)
-    axes[1,0].set_xlabel(r'Predicted Pressure ($\log_{10}$ bar)', fontsize=FS)
-    axes[1,0].tick_params(axis='both', labelsize=FS)
-    axes[1,0].legend(fontsize=10, loc='lower right')
-
-
-    axes[0,1].plot(np.linspace(-3000, 3000, 100), np.linspace(-3000, 3000, 100), 'k--', zorder=3)
-    axes[0,1].set_xlim(min(NN_pred_T.flatten()), max(NN_pred_T.flatten()))
-    axes[0,1].set_ylim(min(NN_test_true_T.flatten()), max(NN_test_true_T.flatten()))
-    axes[0,1].set_title('Ens-CGP + NN', fontsize=FS)
-    axes[0,1].set_xlabel('Predicted Temperature (K)', fontsize=FS)
-    axes[0,1].tick_params(axis='both', labelsize=FS)
-    axes[0,1].legend(fontsize=10, loc='upper left')
+            #GP+NN P
+            r2, rmse, me = compute_stats(NN_test_true_P.numpy(), NN_pred_P)
+            axes[1, 1].plot(NN_pred_P[test_elem], NN_test_true_P[test_elem], 
+                            'o', alpha=plot_alpha, 
+                            color='deepskyblue', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
+            
+            #GP+NN ST
+            r2, rmse, me = compute_stats(NN_test_true_ST, NN_pred_ST)
+            axes[2, 1].plot(NN_pred_ST[test_elem], NN_test_true_ST[test_elem],
+                            'o', alpha=plot_alpha_ST,
+                            color='dodgerblue', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
 
 
-    axes[1,1].plot(np.linspace(-10, 10, 100), np.linspace(-10, 10, 100), 'k--', zorder=3)
-    axes[1,1].set_xlim(min(NN_pred_P.flatten()), max(NN_pred_P.flatten()))
-    axes[1,1].set_ylim(min(NN_test_true_P.flatten()), max(NN_test_true_P.flatten()))
-    axes[1,1].set_xlabel(r'Predicted Pressure ($\log_{10}$ bar)', fontsize=FS)
-    axes[1,1].tick_params(axis='both', labelsize=FS)
-    axes[1,1].legend(fontsize=10, loc='lower right')
+        axes[0,0].plot(np.linspace(-3000, 3000, 100), np.linspace(-3000, 3000, 100), 'k--', zorder=3)
+        axes[0,0].set_xlim(min(NN_test_inputs_T[rp[::10]].flatten()), max(NN_test_inputs_T[rp[::10]].flatten()))
+        axes[0,0].set_ylim(min(NN_test_true_T[rp[::10]].flatten()), max(NN_test_true_T[rp[::10]].flatten()))
+        axes[0,0].set_ylabel('True Temperature (K)', fontsize=FS)
+        axes[0,0].set_xlabel('Predicted Temperature (K)', fontsize=FS)
+        axes[0,0].set_title('Ens-CGP', fontsize=FS)
+        axes[0,0].tick_params(axis='both', labelsize=FS)
+        axes[0,0].legend(fontsize=10, loc='upper left')
 
-    plt.tight_layout()
-    plt.savefig(plot_save_path + '/truthvspred_scatter.pdf', bbox_inches='tight')
-    plt.close()
+        axes[1,0].plot(np.linspace(-10, 10, 100), np.linspace(-10, 10, 100), 'k--', zorder=3)
+        axes[1,0].set_xlim(min(NN_test_inputs_P[rp[::10]].flatten()), max(NN_test_inputs_P[rp[::10]].flatten()))
+        axes[1,0].set_ylim(min(NN_test_true_P[rp[::10]].flatten()), max(NN_test_true_P[rp[::10]].flatten()))
+        axes[1,0].set_ylabel(r'True Pressure ($\log_{10}$ bar)', fontsize=FS)
+        axes[1,0].set_xlabel(r'Predicted Pressure ($\log_{10}$ bar)', fontsize=FS)
+        axes[1,0].tick_params(axis='both', labelsize=FS)
+        axes[1,0].legend(fontsize=10, loc='lower right')
+
+        axes[2,0].plot(np.linspace(-1000, 1000, 100), np.linspace(-1000, 1000, 100), 'k--', zorder=3)
+        axes[2,0].set_xlim(min(NN_test_inputs_ST[rp[::10]].flatten()), max(NN_test_inputs_ST[rp[::10]].flatten()))
+        axes[2,0].set_ylim(min(NN_test_true_ST[rp[::10]].flatten()), max(NN_test_true_ST[rp[::10]].flatten()))
+        axes[2,0].set_ylabel(r'True Temperature (K)', fontsize=FS)
+        axes[2,0].set_xlabel(r'Predicted Temperature (K)', fontsize=FS)
+        axes[2,0].tick_params(axis='both', labelsize=FS)
+        axes[2,0].legend(fontsize=10, loc='lower left')
+
+        axes[0,1].plot(np.linspace(-3000, 3000, 100), np.linspace(-3000, 3000, 100), 'k--', zorder=3)
+        axes[0,1].set_xlim(min(NN_pred_T[rp[::10]].flatten()), max(NN_pred_T[rp[::10]].flatten()))
+        axes[0,1].set_ylim(min(NN_test_true_T[rp[::10]].flatten()), max(NN_test_true_T[rp[::10]].flatten()))
+        axes[0,1].set_title('Ens-CGP + NN', fontsize=FS)
+        axes[0,1].set_xlabel('Predicted Temperature (K)', fontsize=FS)
+        axes[0,1].tick_params(axis='both', labelsize=FS)
+        axes[0,1].legend(fontsize=10, loc='upper left')
+
+        axes[1,1].plot(np.linspace(-10, 10, 100), np.linspace(-10, 10, 100), 'k--', zorder=3)
+        axes[1,1].set_xlim(min(NN_pred_P[rp[::10]].flatten()), max(NN_pred_P[rp[::10]].flatten()))
+        axes[1,1].set_ylim(min(NN_test_true_P[rp[::10]].flatten()), max(NN_test_true_P[rp[::10]].flatten()))
+        axes[1,1].set_xlabel(r'Predicted Pressure ($\log_{10}$ bar)', fontsize=FS)
+        axes[1,1].tick_params(axis='both', labelsize=FS)
+        axes[1,1].legend(fontsize=10, loc='lower right')
+
+        axes[2,1].plot(np.linspace(-1000, 1000, 100), np.linspace(-1000, 1000, 100), 'k--', zorder=3)
+        axes[2,1].set_xlim(min(NN_pred_ST[rp[::10]].flatten()), max(NN_pred_ST[rp[::10]].flatten()))
+        axes[2,1].set_ylim(min(NN_test_true_ST[rp[::10]].flatten()), max(NN_test_true_ST[rp[::10]].flatten()))
+        axes[2,1].set_xlabel(r'Predicted Temperature (K)', fontsize=FS)
+        axes[2,1].tick_params(axis='both', labelsize=FS)
+        axes[2,1].legend(fontsize=10, loc='lower right') 
+
+        plt.tight_layout()
+        plt.savefig(plot_save_path + '/truthvspred_scatter.png', bbox_inches='tight', dpi=1000)
+        plt.close()
+
+
+
 
     # ── Figure 4: corner plot of median RMSE across parameter space ────────────────────────────────────
+    test_inputs_np = raw_inputs[test_idx]   # shape (n_test, D)
+    NN_rmse = np.sqrt(np.mean(NN_res_T**2, axis=1))
+
     param_names = [
         r'H$_2$ (bar)',
         r'CO$_2$ (bar)',
@@ -1243,9 +1290,8 @@ elif run_mode == 'evaluate':
 
     log_params  = {0, 1, 2}
     N_PARAMS    = 5
-    FS=12
+    FS          = 12
 
-    # Per-parameter bin count — Teff only has 2 unique values
     param_nbins = {
         0: 10,   # H2
         1: 10,   # CO2
@@ -1254,12 +1300,17 @@ elif run_mode == 'evaluate':
         4: 2,    # Teff
     }
 
+    show_x_tick_labels: set = {
+        (4, 0), (4, 1), (4, 2), (4, 3),
+    }
+    show_y_tick_labels: set = {
+        (1, 0), (2, 0), (3, 0), (4, 0),
+    }
+
     # ── Helper: bin edges ─────────────────────────────────────────────────────────
     def make_edges(vals, n_bins, log=False):
         unique_vals = np.unique(vals)
         if len(unique_vals) <= n_bins:
-            # Fewer unique values than bins — use exact unique values as bin edges
-            # Add a small padding on each side so all values fall inside
             edges = np.concatenate([
                 [unique_vals[0] * 0.99],
                 0.5 * (unique_vals[:-1] + unique_vals[1:]),
@@ -1271,46 +1322,52 @@ elif run_mode == 'evaluate':
             return np.geomspace(v_min, vals.max(), n_bins + 1)
         return np.linspace(vals.min(), vals.max(), n_bins + 1)
 
-    # ── Precompute all grids ──────────────────────────────────────────────────────
+    # ── Precompute lower-triangle grids ───────────────────────────────────────────
     grids_T = {}
-    grids_P = {}
 
     for i in range(N_PARAMS):
-        for j in range(N_PARAMS):
-            if i == j:
-                continue
-
+        for j in range(i):
             x = test_inputs_np[:, j]
             y = test_inputs_np[:, i]
 
-            n_bins_x = param_nbins[j]
-            n_bins_y = param_nbins[i]
-
-            x_edges = make_edges(x, n_bins_x, log=(j in log_params))
-            y_edges = make_edges(y, n_bins_y, log=(i in log_params))
-
-            n_x = len(x_edges) - 1
-            n_y = len(y_edges) - 1
+            x_edges = make_edges(x, param_nbins[j], log=(j in log_params))
+            y_edges = make_edges(y, param_nbins[i], log=(i in log_params))
+            n_x, n_y = len(x_edges) - 1, len(y_edges) - 1
 
             x_bin = np.clip(np.digitize(x, x_edges) - 1, 0, n_x - 1)
             y_bin = np.clip(np.digitize(y, y_edges) - 1, 0, n_y - 1)
 
             gt     = np.full((n_y, n_x), np.nan)
-            gp     = np.full((n_y, n_x), np.nan)
             counts = np.zeros((n_y, n_x), dtype=int)
 
             for xi in range(n_x):
                 for yi in range(n_y):
                     mask = (x_bin == xi) & (y_bin == yi)
                     if mask.any():
-                        gt[yi, xi]     = np.median(NN_rmse_T[mask])
-                        gp[yi, xi]     = np.median(NN_rmse_P[mask])
+                        gt[yi, xi]     = np.median(NN_rmse[mask])
                         counts[yi, xi] = mask.sum()
 
             grids_T[(i, j)] = (gt, x_edges, y_edges, counts)
-            grids_P[(i, j)] = (gp, x_edges, y_edges, counts)
 
-    # ── Global normalisations ─────────────────────────────────────────────────────
+    # ── Precompute diagonal histograms ────────────────────────────────────────────
+    # For each parameter p, bin along that axis and compute median RMSE
+    # marginalised over all other parameters.
+    diag_hists = {}   # p -> (bin_centers, median_rmse_per_bin, edges)
+
+    for p in range(N_PARAMS):
+        vals   = test_inputs_np[:, p]
+        edges  = make_edges(vals, param_nbins[p], log=(p in log_params))
+        n_bins = len(edges) - 1
+        centers = 0.5 * (edges[:-1] + edges[1:])
+
+        bin_idx   = np.clip(np.digitize(vals, edges) - 1, 0, n_bins - 1)
+        med_rmse  = np.array([
+            np.median(NN_rmse[bin_idx == b]) if (bin_idx == b).any() else np.nan
+            for b in range(n_bins)
+        ])
+        diag_hists[p] = (centers, med_rmse, edges)
+
+    # ── Global normalisation ──────────────────────────────────────────────────────
     def get_norm_range(grid_dict, log=False):
         all_vals = np.concatenate([v[0][~np.isnan(v[0])] for v in grid_dict.values()])
         if log:
@@ -1318,93 +1375,97 @@ elif run_mode == 'evaluate':
         return mcolors.Normalize(vmin=all_vals.min(), vmax=all_vals.max())
 
     norm_T = get_norm_range(grids_T, log=True)
-    norm_P = get_norm_range(grids_P, log=True)
 
     # ── Build figure ──────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(N_PARAMS, N_PARAMS - 1,
-                            figsize=(2.5 * (N_PARAMS - 1), 2 * N_PARAMS))
+    fig, axes = plt.subplots(N_PARAMS, N_PARAMS,
+                            figsize=(2.5 * N_PARAMS, 2 * N_PARAMS))
 
     for i in range(N_PARAMS):
-        for k in range(N_PARAMS - 1):
-            ax = axes[i, k]
+        for j in range(N_PARAMS):
+            ax = axes[i, j]
 
-            # Recover actual parameter index j from column index k,
-            # skipping the diagonal
-            is_lower = (k < i)
-            j = k if is_lower else k + 1
+            # ── Upper triangle: hide ───────────────────────────────────────────────
+            if j > i:
+                ax.set_visible(False)
+                continue
 
-            if is_lower:
-                grid, x_edges, y_edges, counts = grids_T[(i, j)]
-                cmap_used, norm_used = 'spring_r', norm_T
-            else:
-                grid, x_edges, y_edges, counts = grids_P[(i, j)]
-                cmap_used, norm_used = 'winter_r', norm_P
+            # ── Diagonal: marginal RMSE histogram ─────────────────────────────────
+            if i == j:
+                centers, med_rmse, edges = diag_hists[p := i]
+                widths = np.diff(edges)
 
-            im = ax.pcolormesh(x_edges, y_edges, grid,
-                            cmap=cmap_used, norm=norm_used,
-                            shading='flat', edgecolors='black', linewidth=0.2)
+                # Colour each bar by its RMSE value using the same norm/cmap
+                bar_colors = plt.cm.spring_r(norm_T(med_rmse))
 
-            from scipy.interpolate import RectBivariateSpline
-            from scipy.ndimage import gaussian_filter
+                ax.bar(centers, med_rmse,
+                    width=widths * 0.85,          # slight gap between bars
+                    color=bar_colors,
+                    edgecolor='black', linewidth=0.5,
+                    align='center')
 
-            # ── Smooth interpolation and contours on top ──────────────────────────────
+                if p in log_params:
+                    ax.set_xscale('log')
+                    ax.xaxis.set_major_locator(ticker.LogLocator(numticks=3))
+                    ax.xaxis.set_major_formatter(ticker.LogFormatterSciNotation(labelOnlyBase=True))
+                else:
+                    ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=3, prune=None))
+
+                # Teff: force exact tick positions
+                if p == 4:
+                    ax.set_xticks(centers)
+                    ax.set_xticklabels(['3000', '4500'])
+
+                ax.tick_params(axis='both', labelsize=0, length=2)
+                ax.yaxis.set_visible(False)
+                ax.set_title(param_names[p], fontsize=FS, fontstyle='italic', pad=3)
+
+                for spine in ax.spines.values():
+                    spine.set_linewidth(0.8)
+
+                continue
+
+            # ── Lower triangle: 2-D RMSE heatmap + contours ───────────────────────
+            grid, x_edges, y_edges, counts = grids_T[(i, j)]
+
+            ax.pcolormesh(x_edges, y_edges, grid,
+                        cmap='spring_r', norm=norm_T,
+                        shading='flat', edgecolors='black', linewidth=0.2)
+
             x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
             y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
 
-            # Work in log space for log-scaled axes so interpolation is uniform
-            x_eval = np.log10(x_centers) if j in log_params else x_centers
-            y_eval = np.log10(y_centers) if i in log_params else y_centers
-
-            # compute full edge extent in the same space as x_eval/y_eval
+            x_eval    = np.log10(x_centers) if j in log_params else x_centers
+            y_eval    = np.log10(y_centers) if i in log_params else y_centers
             x_edge_lo = np.log10(x_edges[0])  if j in log_params else x_edges[0]
             x_edge_hi = np.log10(x_edges[-1]) if j in log_params else x_edges[-1]
             y_edge_lo = np.log10(y_edges[0])  if i in log_params else y_edges[0]
             y_edge_hi = np.log10(y_edges[-1]) if i in log_params else y_edges[-1]
 
-            # Replace NaNs with local mean so the spline doesn't blow up
             grid_filled = grid.copy()
             nan_mask = np.isnan(grid_filled)
             if nan_mask.any():
                 grid_filled[nan_mask] = np.nanmean(grid_filled)
 
-            # Fit a bivariate spline on the bin-center grid
-            # RectBivariateSpline expects (x, y) where x is the row axis — so pass
-            # y_eval as the first argument (rows) and x_eval as second (columns)
-            spline = RectBivariateSpline(y_eval, x_eval, grid_filled, kx=min(3, len(y_eval)-1), ky=min(3, len(x_eval)-1))
+            spline    = RectBivariateSpline(y_eval, x_eval, grid_filled,
+                                            kx=min(3, len(y_eval) - 1),
+                                            ky=min(3, len(x_eval) - 1))
+            N_FINE    = 100
+            x_fine    = np.linspace(x_edge_lo, x_edge_hi, N_FINE)
+            y_fine    = np.linspace(y_edge_lo, y_edge_hi, N_FINE)
+            grid_fine = gaussian_filter(spline(y_fine, x_fine), sigma=1.5)
 
-            # Evaluate on a fine grid
-            N_FINE = 100
-            x_fine = np.linspace(x_edge_lo, x_edge_hi, N_FINE)
-            y_fine = np.linspace(y_edge_lo, y_edge_hi, N_FINE)
-            grid_fine = spline(y_fine, x_fine)
-
-            # Optional light Gaussian smoothing on top of the spline
-            grid_fine = gaussian_filter(grid_fine, sigma=1.5)
-
-            # Convert back from log space for plotting
             x_plot = 10**x_fine if j in log_params else x_fine
             y_plot = 10**y_fine if i in log_params else y_fine
 
-            # Draw contour lines — choose ~5 levels spanning the data range
             finite_vals = grid_filled[~np.isnan(grid)]
-            n_levels = 5
             levels = np.linspace(np.nanpercentile(finite_vals, 5),
-                                np.nanpercentile(finite_vals, 95),
-                                n_levels)
-
+                                np.nanpercentile(finite_vals, 95), 5)
             ax.contour(x_plot, y_plot, grid_fine,
-                    levels=levels,
-                    colors='black',
-                    linewidths=0.8,
-                    alpha=0.5)
-
+                    levels=levels, colors='black', linewidths=0.8, alpha=0.5)
             ax.contourf(x_plot, y_plot, grid_fine,
-                        levels=levels,
-                        cmap=cmap_used,
-                        norm=norm_used,
-                        alpha=0.4)
+                        levels=levels, cmap='spring_r', norm=norm_T, alpha=0.4)
 
-            # ── Log scales ────────────────────────────────────────────────────────
+            # ── Axis scales ───────────────────────────────────────────────────────
             if j in log_params:
                 ax.set_xscale('log')
                 ax.xaxis.set_major_locator(ticker.LogLocator(numticks=3))
@@ -1421,7 +1482,6 @@ elif run_mode == 'evaluate':
                 ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=3, prune=None))
                 ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
 
-            # ── Teff: force exact tick positions ──────────────────────────────────
             if j == 4:
                 x_cents = 0.5 * (x_edges[:-1] + x_edges[1:])
                 ax.set_xticks(x_cents)
@@ -1431,35 +1491,287 @@ elif run_mode == 'evaluate':
                 ax.set_yticks(y_cents)
                 ax.set_yticklabels(['3000', '4500'])
 
-            # ── Hide tick labels on non-edge axes ─────────────────────────────────
-            if i != N_PARAMS - 1:
+            # ── Tick label visibility ─────────────────────────────────────────────
+            if (i, j) in show_x_tick_labels:
+                ax.tick_params(axis='x', labelsize=FS - 2, rotation=45)
+            else:
                 ax.set_xticklabels([])
-            else:
-                ax.set_xlabel(param_names[j], fontsize=FS)
-                ax.tick_params(axis='x', labelsize=FS-2, rotation=45)
+                ax.tick_params(axis='x', length=2)
 
-            if k != 0:
+            if (i, j) in show_y_tick_labels:
+                ax.tick_params(axis='y', labelsize=FS - 2)
+            else:
                 ax.set_yticklabels([])
-            else:
-                ax.set_ylabel(param_names[i], fontsize=FS)
-                ax.tick_params(axis='y', labelsize=FS-2)
+                ax.tick_params(axis='y', length=2)
 
-    # ── Global colorbars ──────────────────────────────────────────────────────────
-    cbar_ax_T = fig.add_axes([0.89, 0.11, 0.02, 0.35])
+            # if i == N_PARAMS - 1:
+            #     ax.set_xlabel(param_names[j], fontsize=FS)
+            # if j == 0:
+            #     ax.set_ylabel(param_names[i], fontsize=FS)
+
+    # ── Single colorbar ───────────────────────────────────────────────────────────
+    cbar_ax_T = fig.add_axes([0.92, 0.11, 0.02, 0.77])
     fig.colorbar(plt.cm.ScalarMappable(norm=norm_T, cmap='spring_r'),
                 cax=cbar_ax_T, orientation='vertical')
     cbar_ax_T.set_ylabel('Temp. RMSE (K)', fontsize=FS)
-    cbar_ax_T.tick_params(labelsize=FS-2)
+    cbar_ax_T.tick_params(labelsize=FS - 2)
 
-    cbar_ax_P = fig.add_axes([0.89, 0.53, 0.02, 0.35])
-    fig.colorbar(plt.cm.ScalarMappable(norm=norm_P, cmap='winter_r'),
-                cax=cbar_ax_P, orientation='vertical')
-    cbar_ax_P.set_ylabel(r'Pressure RMSE ($\log_{10}$ bar)', fontsize=FS)
-    cbar_ax_P.tick_params(labelsize=FS-2)
-
-    plt.subplots_adjust(right=0.88, hspace=0.087, wspace=0.063)
-    plt.savefig(plot_save_path + '/compact_rmse_corner.pdf', bbox_inches='tight')
+    plt.subplots_adjust(right=0.91, hspace=0.15, wspace=0.10)
+    plt.savefig(plot_save_path + '/compact_rmse_corner_T.pdf', bbox_inches='tight')
     plt.close()
+
+
+
+
+
+
+        # ── Figure 4: corner plot of median RMSE across parameter space ────────────────────────────────────
+    test_inputs_np = raw_inputs[test_idx]   # shape (n_test, D)
+    NN_rmse = np.sqrt(np.mean(NN_res_P**2, axis=1))
+
+    param_names = [
+        r'H$_2$ (bar)',
+        r'CO$_2$ (bar)',
+        r'LoD (days)',
+        r'Obliquity ($\circ$)',
+        r'$T_{\rm eff}$ (K)',
+    ]
+
+    log_params  = {0, 1, 2}
+    N_PARAMS    = 5
+    FS          = 12
+
+    param_nbins = {
+        0: 10,   # H2
+        1: 10,   # CO2
+        2: 10,   # LoD
+        3: 10,   # Obliquity
+        4: 2,    # Teff
+    }
+
+    show_x_tick_labels: set = {
+        (4, 0), (4, 1), (4, 2), (4, 3),
+    }
+    show_y_tick_labels: set = {
+        (1, 0), (2, 0), (3, 0), (4, 0),
+    }
+
+    # ── Helper: bin edges ─────────────────────────────────────────────────────────
+    def make_edges(vals, n_bins, log=False):
+        unique_vals = np.unique(vals)
+        if len(unique_vals) <= n_bins:
+            edges = np.concatenate([
+                [unique_vals[0] * 0.99],
+                0.5 * (unique_vals[:-1] + unique_vals[1:]),
+                [unique_vals[-1] * 1.01],
+            ])
+            return edges
+        if log:
+            v_min = vals.min() if vals.min() > 0 else 1e-10
+            return np.geomspace(v_min, vals.max(), n_bins + 1)
+        return np.linspace(vals.min(), vals.max(), n_bins + 1)
+
+    # ── Precompute lower-triangle grids ───────────────────────────────────────────
+    grids_T = {}
+
+    for i in range(N_PARAMS):
+        for j in range(i):
+            x = test_inputs_np[:, j]
+            y = test_inputs_np[:, i]
+
+            x_edges = make_edges(x, param_nbins[j], log=(j in log_params))
+            y_edges = make_edges(y, param_nbins[i], log=(i in log_params))
+            n_x, n_y = len(x_edges) - 1, len(y_edges) - 1
+
+            x_bin = np.clip(np.digitize(x, x_edges) - 1, 0, n_x - 1)
+            y_bin = np.clip(np.digitize(y, y_edges) - 1, 0, n_y - 1)
+
+            gt     = np.full((n_y, n_x), np.nan)
+            counts = np.zeros((n_y, n_x), dtype=int)
+
+            for xi in range(n_x):
+                for yi in range(n_y):
+                    mask = (x_bin == xi) & (y_bin == yi)
+                    if mask.any():
+                        gt[yi, xi]     = np.median(NN_rmse[mask])
+                        counts[yi, xi] = mask.sum()
+
+            grids_T[(i, j)] = (gt, x_edges, y_edges, counts)
+
+    # ── Precompute diagonal histograms ────────────────────────────────────────────
+    # For each parameter p, bin along that axis and compute median RMSE
+    # marginalised over all other parameters.
+    diag_hists = {}   # p -> (bin_centers, median_rmse_per_bin, edges)
+
+    for p in range(N_PARAMS):
+        vals   = test_inputs_np[:, p]
+        edges  = make_edges(vals, param_nbins[p], log=(p in log_params))
+        n_bins = len(edges) - 1
+        centers = 0.5 * (edges[:-1] + edges[1:])
+
+        bin_idx   = np.clip(np.digitize(vals, edges) - 1, 0, n_bins - 1)
+        med_rmse  = np.array([
+            np.median(NN_rmse[bin_idx == b]) if (bin_idx == b).any() else np.nan
+            for b in range(n_bins)
+        ])
+        diag_hists[p] = (centers, med_rmse, edges)
+
+    # ── Global normalisation ──────────────────────────────────────────────────────
+    def get_norm_range(grid_dict, log=False):
+        all_vals = np.concatenate([v[0][~np.isnan(v[0])] for v in grid_dict.values()])
+        if log:
+            return mcolors.LogNorm(vmin=max(all_vals.min(), 1e-6), vmax=all_vals.max())
+        return mcolors.Normalize(vmin=all_vals.min(), vmax=all_vals.max())
+
+    norm_T = get_norm_range(grids_T, log=True)
+
+    # ── Build figure ──────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(N_PARAMS, N_PARAMS,
+                            figsize=(2.5 * N_PARAMS, 2 * N_PARAMS))
+
+    for i in range(N_PARAMS):
+        for j in range(N_PARAMS):
+            ax = axes[i, j]
+
+            # ── Upper triangle: hide ───────────────────────────────────────────────
+            if j > i:
+                ax.set_visible(False)
+                continue
+
+            # ── Diagonal: marginal RMSE histogram ─────────────────────────────────
+            if i == j:
+                centers, med_rmse, edges = diag_hists[p := i]
+                widths = np.diff(edges)
+
+                # Colour each bar by its RMSE value using the same norm/cmap
+                bar_colors = plt.cm.winter_r(norm_T(med_rmse))
+
+                ax.bar(centers, med_rmse,
+                    width=widths * 0.85,          # slight gap between bars
+                    color=bar_colors,
+                    edgecolor='black', linewidth=0.5,
+                    align='center')
+
+                if p in log_params:
+                    ax.set_xscale('log')
+                    ax.xaxis.set_major_locator(ticker.LogLocator(numticks=3))
+                    ax.xaxis.set_major_formatter(ticker.LogFormatterSciNotation(labelOnlyBase=True))
+                else:
+                    ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=3, prune=None))
+
+                # Teff: force exact tick positions
+                if p == 4:
+                    ax.set_xticks(centers)
+                    ax.set_xticklabels(['3000', '4500'])
+
+                ax.tick_params(axis='both', labelsize=0, length=2)
+                ax.yaxis.set_visible(False)
+                ax.set_title(param_names[p], fontsize=FS, fontstyle='italic', pad=3)
+
+                for spine in ax.spines.values():
+                    spine.set_linewidth(0.8)
+
+                continue
+
+            # ── Lower triangle: 2-D RMSE heatmap + contours ───────────────────────
+            grid, x_edges, y_edges, counts = grids_T[(i, j)]
+
+            ax.pcolormesh(x_edges, y_edges, grid,
+                        cmap='winter_r', norm=norm_T,
+                        shading='flat', edgecolors='black', linewidth=0.2)
+
+            x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+            y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+
+            x_eval    = np.log10(x_centers) if j in log_params else x_centers
+            y_eval    = np.log10(y_centers) if i in log_params else y_centers
+            x_edge_lo = np.log10(x_edges[0])  if j in log_params else x_edges[0]
+            x_edge_hi = np.log10(x_edges[-1]) if j in log_params else x_edges[-1]
+            y_edge_lo = np.log10(y_edges[0])  if i in log_params else y_edges[0]
+            y_edge_hi = np.log10(y_edges[-1]) if i in log_params else y_edges[-1]
+
+            grid_filled = grid.copy()
+            nan_mask = np.isnan(grid_filled)
+            if nan_mask.any():
+                grid_filled[nan_mask] = np.nanmean(grid_filled)
+
+            spline    = RectBivariateSpline(y_eval, x_eval, grid_filled,
+                                            kx=min(3, len(y_eval) - 1),
+                                            ky=min(3, len(x_eval) - 1))
+            N_FINE    = 100
+            x_fine    = np.linspace(x_edge_lo, x_edge_hi, N_FINE)
+            y_fine    = np.linspace(y_edge_lo, y_edge_hi, N_FINE)
+            grid_fine = gaussian_filter(spline(y_fine, x_fine), sigma=1.5)
+
+            x_plot = 10**x_fine if j in log_params else x_fine
+            y_plot = 10**y_fine if i in log_params else y_fine
+
+            finite_vals = grid_filled[~np.isnan(grid)]
+            levels = np.linspace(np.nanpercentile(finite_vals, 5),
+                                np.nanpercentile(finite_vals, 95), 5)
+            ax.contour(x_plot, y_plot, grid_fine,
+                    levels=levels, colors='black', linewidths=0.8, alpha=0.5)
+            ax.contourf(x_plot, y_plot, grid_fine,
+                        levels=levels, cmap='winter_r', norm=norm_T, alpha=0.4)
+
+            # ── Axis scales ───────────────────────────────────────────────────────
+            if j in log_params:
+                ax.set_xscale('log')
+                ax.xaxis.set_major_locator(ticker.LogLocator(numticks=3))
+                ax.xaxis.set_major_formatter(ticker.LogFormatterSciNotation(labelOnlyBase=True))
+            else:
+                ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=3, prune=None))
+                ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
+
+            if i in log_params:
+                ax.set_yscale('log')
+                ax.yaxis.set_major_locator(ticker.LogLocator(numticks=3))
+                ax.yaxis.set_major_formatter(ticker.LogFormatterSciNotation(labelOnlyBase=True))
+            else:
+                ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=3, prune=None))
+                ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
+
+            if j == 4:
+                x_cents = 0.5 * (x_edges[:-1] + x_edges[1:])
+                ax.set_xticks(x_cents)
+                ax.set_xticklabels(['3000', '4500'])
+            if i == 4:
+                y_cents = 0.5 * (y_edges[:-1] + y_edges[1:])
+                ax.set_yticks(y_cents)
+                ax.set_yticklabels(['3000', '4500'])
+
+            # ── Tick label visibility ─────────────────────────────────────────────
+            if (i, j) in show_x_tick_labels:
+                ax.tick_params(axis='x', labelsize=FS - 2, rotation=45)
+            else:
+                ax.set_xticklabels([])
+                ax.tick_params(axis='x', length=2)
+
+            if (i, j) in show_y_tick_labels:
+                ax.tick_params(axis='y', labelsize=FS - 2)
+            else:
+                ax.set_yticklabels([])
+                ax.tick_params(axis='y', length=2)
+
+            # if i == N_PARAMS - 1:
+            #     ax.set_xlabel(param_names[j], fontsize=FS)
+            # if j == 0:
+            #     ax.set_ylabel(param_names[i], fontsize=FS)
+
+    # ── Single colorbar ───────────────────────────────────────────────────────────
+    cbar_ax_T = fig.add_axes([0.92, 0.11, 0.02, 0.77])
+    fig.colorbar(plt.cm.ScalarMappable(norm=norm_T, cmap='winter_r'),
+                cax=cbar_ax_T, orientation='vertical')
+    cbar_ax_T.set_ylabel(r'Pressure RMSE ($\log_{10}$ bar)', fontsize=FS)
+    cbar_ax_T.tick_params(labelsize=FS - 2)
+
+    plt.subplots_adjust(right=0.91, hspace=0.15, wspace=0.10)
+    plt.savefig(plot_save_path + '/compact_rmse_corner_P.pdf', bbox_inches='tight')
+    plt.close()
+
+
+
+
 
     # ── Figure 5: Plot of the best, worst, and median predictions ───────────────────
     # Get indices that would sort the RMSE list
@@ -1478,7 +1790,7 @@ elif run_mode == 'evaluate':
     fig = plt.figure(figsize=(16, 6))
 
     # Outer GridSpec: 3 groups, with wspace between them
-    outer_gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.3,
+    outer_gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.2,
                                 left=0.06, right=0.98, top=0.82, bottom=0.1)
 
     group_axes = {}
