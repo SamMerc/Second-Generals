@@ -83,8 +83,6 @@ num_threads = 96
 torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
 
-plot_fig3 = False
-
 #############################
 #### run_mode selection  ####
 #############################
@@ -1157,126 +1155,233 @@ elif run_mode == 'evaluate':
     plt.savefig(plot_save_path + '/rmse_vs_inputs.pdf', bbox_inches='tight')
     plt.close()
 
-    # ── Figure 3: truth vs predicted scatter plot ────────────────────────────────────
+    # ── Figure 3 & 4 combined: Figure 4 on top, Figure 3 on bottom ───────────────
     GP_plot_color = 'sandybrown'
     GPNN_plot_color = 'skyblue'
-    if plot_fig3:
-        # Load the ST data
-        data_ST = np.load('/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/Plots/ST_Hyperparam_tuning_LRinit_CNNdepth_CNNchannels_L2_BS_SC/pred_vs_actual.npz')
-        NN_test_true_ST = data_ST['true']
-        NN_test_inputs_ST = data_ST['gp_pred']
-        NN_test_inputs_STerr = data_ST['gp_err']
-        NN_pred_ST = data_ST['nn_pred']
 
-        fig, axes = plt.subplots(3, 2, figsize=(8,8), sharey='row')
-        FS=12
-        plot_alpha=0.15
-        plot_alpha_ST=0.01
+    FS = 12
+    plot_alpha = 0.15
 
-        def compute_stats(y_true, y_pred):
-            y_true_flat = y_true.flatten()
-            y_pred_flat = y_pred.flatten()
-            r2   = r2_score(y_true_flat, y_pred_flat)
-            rmse = np.sqrt(np.mean((y_true_flat - y_pred_flat)**2))
-            me   = np.mean(y_pred_flat - y_true_flat)
-            return r2, rmse, me
+    def compute_stats(y_true, y_pred):
+        y_true_flat = y_true.flatten()
+        y_pred_flat = y_pred.flatten()
+        r2   = r2_score(y_true_flat, y_pred_flat)
+        rmse = np.sqrt(np.mean((y_true_flat - y_pred_flat)**2))
+        me   = np.mean(y_pred_flat - y_true_flat)
+        return r2, rmse, me
 
-        shufflefig3_seed = 45
-        np.random.seed(shufflefig3_seed)
-        rp = np.random.permutation(n_test)
-        for test_elem in rp[::10]:
-            #GP T
-            r2, rmse, me = compute_stats(NN_test_true_T.numpy(), NN_test_inputs_T.numpy())
-            axes[0, 0].errorbar(NN_test_inputs_T[test_elem], NN_test_true_T[test_elem],
-                                yerr= NN_test_inputs_Terr[test_elem], fmt='o', alpha=plot_alpha,
-                            color='orange', zorder=2, label=f"R$^2$={r2:.4f}\nRMSE={rmse:.4f}\nME={me:.4f}" if test_elem == rp[0] else None)
+    # ── Get indices for Figure 4 ──────────────────────────────────────────────────
+    sorted_indices = np.argsort(NN_rmse_T)
+    median_idx = sorted_indices[len(sorted_indices) // 2]
+    median_minus_1sigma = np.median(NN_rmse_T) - np.std(NN_rmse_T)
+    median_minus_1sigma_idx = np.argmin(np.abs(NN_rmse_T - median_minus_1sigma))
 
-            #GP P
-            r2, rmse, me = compute_stats(NN_test_true_P.numpy(), NN_test_inputs_P.numpy())
-            axes[1, 0].errorbar(NN_test_inputs_P[test_elem], NN_test_true_P[test_elem],
-                                yerr= NN_test_inputs_Perr[test_elem], fmt='o', alpha=plot_alpha, 
-                                color='darkorange', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
+    # ── Perpendicular selection ───────────────────────────────────────────────────
+    # The median residual vector defines the "along-trend" direction in profile space.
+    # We want the case whose residual is most orthogonal to this — i.e. a different
+    # *shape* of error rather than just a smaller magnitude of the same error.
+
+    # res_median = NN_res_T[median_idx, :]                          # shape: (n_pressure_levels,)
+    # res_median_unit = res_median / (np.linalg.norm(res_median) + 1e-12)   # unit vector, avoid div/0
+
+    # # For every test case, subtract the component aligned with the median residual
+    # perp_magnitudes = np.zeros(n_test)
+    # for i in range(n_test):
+    #     res_i        = NN_res_T[i, :]
+    #     proj_along   = np.dot(res_i, res_median_unit) * res_median_unit   # component along median
+    #     res_perp     = res_i - proj_along                                  # orthogonal remainder
+    #     perp_magnitudes[i] = np.linalg.norm(res_perp)
+
+    # # Pick the case closest to median + 1σ in the perpendicular magnitude distribution
+    # # (use + here so it selects a case that is genuinely offset, not just a quieter version)
+    # target_perp = np.median(perp_magnitudes) + np.std(perp_magnitudes)
+    # median_minus_1sigma_idx = np.argmin(np.abs(perp_magnitudes - target_perp))
+
+    # ── Master figure ─────────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(14, 16))
+
+    # Two rows: top = Figure 4, bottom = Figure 3
+    master_gs = gridspec.GridSpec(
+        2, 1, figure=fig,
+        height_ratios=(6, 8),   # Fig4 is wider/shorter, Fig3 is squarish
+        hspace=0.1,
+        left=0.06, right=0.98, top=0.93, bottom=0.05
+    )
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # TOP SECTION — Figure 4
+    # ─────────────────────────────────────────────────────────────────────────────
+    top_gs = gridspec.GridSpecFromSubplotSpec(
+        1, 2,
+        subplot_spec=master_gs[0],
+        wspace=0.2
+    )
+
+    group_axes = {}
+    for g, col in enumerate(['median', 'sigma']):
+        inner_gs = gridspec.GridSpecFromSubplotSpec(
+            2, 2,
+            subplot_spec=top_gs[g],
+            width_ratios=(3, 1),
+            height_ratios=(3, 1),
+            wspace=0.0,
+            hspace=0.0,
+        )
+        group_axes[f'{col}_results']         = fig.add_subplot(inner_gs[0, 0])
+        group_axes[f'{col}_res_temperature'] = fig.add_subplot(inner_gs[0, 1])
+        group_axes[f'{col}_res_pressure']    = fig.add_subplot(inner_gs[1, 0])
+
+    axs = group_axes
+
+    for col in ['median', 'sigma']:
+        idx = {'median': median_idx, 'sigma': median_minus_1sigma_idx}[col]
+
+        results_ax  = axs[f'{col}_results']
+        res_temp_ax = axs[f'{col}_res_temperature']
+        res_pres_ax = axs[f'{col}_res_pressure']
+
+        results_ax.plot(NN_test_true_T[idx,:],  NN_test_true_P[idx,:],  '.', linestyle='-', color='darkseagreen',  linewidth=2, label='Truth')
+        results_ax.errorbar(NN_test_inputs_T[idx,:], NN_test_inputs_P[idx,:], xerr=NN_test_inputs_Terr[idx,:], yerr=NN_test_inputs_Perr[idx,:], alpha=0.4, fmt='-', color=GP_plot_color, linewidth=2, label='Ens-CGP')
+        results_ax.plot(NN_test_inputs_T[idx,:], NN_test_inputs_P[idx,:], '-', color=GP_plot_color, linewidth=2)
+        results_ax.plot(NN_pred_T[idx,:],        NN_pred_P[idx,:],                           color=GPNN_plot_color, linewidth=2, label='Ens-CGP+NN')
+        results_ax.invert_yaxis()
+        results_ax.set_ylabel(r'log$_{10}$ Pressure (bar)', fontsize=FS)
+        results_ax.xaxis.set_label_position('top')
+        results_ax.xaxis.tick_top()
+        results_ax.tick_params(axis='x', bottom=False, labelbottom=False, top=True, labeltop=True, labelsize=FS)
+        results_ax.set_xlabel('Temperature (K)', fontsize=FS)
+        if col == 'median':
+            results_ax.legend(fontsize=FS, loc='upper right')
+        results_ax.grid()
+
+        res_temp_ax.plot(NN_res_T[idx,:], NN_test_true_P[idx,:], '.', linestyle='-', color=GPNN_plot_color, linewidth=2)
+        res_temp_ax.errorbar(GP_res_T[idx,:], NN_test_true_P[idx,:], xerr=NN_test_inputs_Terr[idx,:],  alpha=0.4, fmt='-', color=GP_plot_color, linewidth=2)
+        res_temp_ax.plot(GP_res_T[idx,:], NN_test_true_P[idx,:], '-', color=GP_plot_color, linewidth=2)
+        res_temp_ax.xaxis.set_label_position('top')
+        res_temp_ax.xaxis.tick_top()
+        res_temp_ax.tick_params(axis='x', bottom=False, labelbottom=False, top=True, labeltop=True, labelsize=FS)
+        res_temp_ax.set_xlabel('Residuals (K)', fontsize=FS)
+        res_temp_ax.sharey(results_ax)
+        res_temp_ax.tick_params(axis='y', left=False, labelleft=False, right=False, labelright=False)
+        res_temp_ax.grid()
+        res_temp_ax.axvline(0, color='darkseagreen', linestyle='dashed', zorder=2)
+
+        multiplier = 1e4 if col in ['best', 'median'] else 1e2
+        multiplier_str = '$10^{-4}$' if col in ['best', 'median'] else '$10^{-2}$'
+
+        res_pres_ax.plot(NN_test_true_T[idx,:], NN_res_P[idx,:]*multiplier, '.', linestyle='-', color=GPNN_plot_color, linewidth=2)
+        res_pres_ax.errorbar(NN_test_true_T[idx,:], GP_res_P[idx,:]*multiplier, yerr=NN_test_inputs_Perr[idx,:]*multiplier, alpha=0.4, fmt='-', color=GP_plot_color, linewidth=2)
+        res_pres_ax.plot(NN_test_true_T[idx,:], GP_res_P[idx,:]*multiplier, '-', color=GP_plot_color, linewidth=2)
+        res_pres_ax.set_ylabel(f'Residuals \nx{multiplier_str} (bar)', fontsize=FS)
+        res_pres_ax.sharex(results_ax)
+        res_pres_ax.tick_params(axis='x', bottom=False, labelbottom=False, top=False, labeltop=False, labelsize=FS)
+        res_pres_ax.grid()
+        res_pres_ax.axhline(0, color='darkseagreen', linestyle='dashed', zorder=2)
+
+    # Figure 4 panel titles
+    fig.canvas.draw()
+    for col, col_str, idx in [('median', 'X - median', median_idx), ('sigma', r'O - median-$\mathbf{1\sigma}$', median_minus_1sigma_idx)]:
+        results_ax  = axs[f'{col}_results']
+        res_temp_ax = axs[f'{col}_res_temperature']
+        fig.canvas.draw()
+        bbox_left  = results_ax.get_position()
+        bbox_right = res_temp_ax.get_position()
+        x_center = (bbox_left.x0 + bbox_right.x1) / 2
+        y_top    = bbox_left.y1
+        rmse_val_T = NN_rmse_T[idx]
+        rmse_val_P = NN_rmse_P[idx]
+        multiplier = 1e4
+        multiplier_str = r'$\mathbf{\times 10^{-4}}$'
+        title_str = f'{col_str.capitalize()} (RMSE = {rmse_val_T:.2f} K, {rmse_val_P*multiplier:.2f}{multiplier_str} bar)'
+        fig.text(x_center, y_top + 0.035, title_str,
+                ha='center', va='bottom', fontsize=FS, fontweight='bold',
+                transform=fig.transFigure)
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # BOTTOM SECTION — Figure 3 (2x1, overlaid)
+    # ─────────────────────────────────────────────────────────────────────────────
+    bot_gs = gridspec.GridSpecFromSubplotSpec(
+        2, 1,
+        subplot_spec=master_gs[1],
+        hspace=0.25
+    )
+
+    ax_T = fig.add_subplot(bot_gs[0])
+    ax_P = fig.add_subplot(bot_gs[1])
+
+    ax_P.plot(np.linspace(-10, 10, 100),
+                np.linspace(-10, 10, 100),
+                'k--', zorder=3)
+    
+    ax_P.scatter(np.median(NN_pred_P[median_idx]), np.median(NN_test_true_P[median_idx]),
+            marker='x', c='black', zorder=3, s=100, linewidths=2)
+    
+    ax_P.scatter(np.median(NN_pred_P[median_minus_1sigma_idx]), np.median(NN_pred_P[median_minus_1sigma_idx]),
+            marker='o', zorder=3, s=100, linewidths=2, facecolors='none', edgecolors='black')
+    
+    ax_T.plot(np.linspace(-3000, 3000, 100),
+                np.linspace(-3000, 3000, 100),
+                'k--', zorder=3)
+    
+    ax_T.scatter(np.median(NN_pred_T[median_idx]), np.median(NN_test_true_T[median_idx]),
+            marker='x', c='black', zorder=3, s=100, linewidths=2)
             
-            #GP ST
-            r2, rmse, me = compute_stats(NN_test_true_ST, NN_test_inputs_ST)
-            axes[2, 0].errorbar(NN_test_inputs_ST[test_elem], NN_test_true_ST[test_elem],
-                                yerr= NN_test_inputs_STerr[test_elem], fmt='o', alpha=plot_alpha_ST, 
-                                color='orangered', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
+    ax_T.scatter(np.median(NN_pred_T[median_minus_1sigma_idx]), np.median(NN_test_true_T[median_minus_1sigma_idx]),
+            marker='o', zorder=3, s=100, linewidths=2, facecolors='none', edgecolors='black')
+    
+    for test_elem in range(n_test):
+        r2_gp,   rmse_gp,   me_gp   = compute_stats(NN_test_true_T.numpy(), NN_test_inputs_T.numpy())
+        r2_gpnn, rmse_gpnn, me_gpnn = compute_stats(NN_test_true_T.numpy(), NN_pred_T)
 
-            #GP+NN T
-            r2, rmse, me = compute_stats(NN_test_true_T.numpy(), NN_pred_T)
-            axes[0, 1].plot(NN_pred_T[test_elem], NN_test_true_T[test_elem],
-                            'o', alpha=plot_alpha, 
-                            color='skyblue', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
+        # Temperature — black dashed line first (zorder=1), then blue (zorder=2), then orange (zorder=3)
+        ax_T.plot(NN_pred_T[test_elem], NN_test_true_T[test_elem],
+                'o', alpha=plot_alpha, color='skyblue', zorder=2,
+                label=f"Ens-CGP+NN  R$^2$={r2_gpnn:.4f}  RMSE={rmse_gpnn:.4f}  ME={me_gpnn:.4f}" if test_elem == 0 else None)
+        ax_T.errorbar(NN_test_inputs_T[test_elem], NN_test_true_T[test_elem],
+                    yerr=NN_test_inputs_Terr[test_elem], fmt='o', alpha=plot_alpha,
+                    color='orange', zorder=1,
+                    label=f"Ens-CGP      R$^2$={r2_gp:.4f}  RMSE={rmse_gp:.4f}  ME={me_gp:.4f}" if test_elem == 0 else None)
 
-            #GP+NN P
-            r2, rmse, me = compute_stats(NN_test_true_P.numpy(), NN_pred_P)
-            axes[1, 1].plot(NN_pred_P[test_elem], NN_test_true_P[test_elem], 
-                            'o', alpha=plot_alpha, 
-                            color='deepskyblue', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
-            
-            #GP+NN ST
-            r2, rmse, me = compute_stats(NN_test_true_ST, NN_pred_ST)
-            axes[2, 1].plot(NN_pred_ST[test_elem], NN_test_true_ST[test_elem],
-                            'o', alpha=plot_alpha_ST,
-                            color='dodgerblue', zorder=2, label=f"R$^2$={r2:.4f}\n RMSE={rmse:.4f}\n ME = {me:.4f}" if test_elem == rp[0] else None)
+        r2_gp,   rmse_gp,   me_gp   = compute_stats(NN_test_true_P.numpy(), NN_test_inputs_P.numpy())
+        r2_gpnn, rmse_gpnn, me_gpnn = compute_stats(NN_test_true_P.numpy(), NN_pred_P)
 
+        # Pressure — black dashed line first (zorder=1), then blue (zorder=2), then orange (zorder=3)
+        ax_P.plot(NN_pred_P[test_elem], NN_test_true_P[test_elem],
+                'o', alpha=plot_alpha, color='deepskyblue', zorder=2,
+                label=f"Ens-CGP+NN  R$^2$={r2_gpnn:.4f}  RMSE={rmse_gpnn:.4f}  ME={me_gpnn:.4f}" if test_elem == 0 else None)
+        ax_P.errorbar(NN_test_inputs_P[test_elem], NN_test_true_P[test_elem],
+                    yerr=NN_test_inputs_Perr[test_elem], fmt='o', alpha=plot_alpha,
+                    color='darkorange', zorder=1,
+                    label=f"Ens-CGP      R$^2$={r2_gp:.4f}  RMSE={rmse_gp:.4f}  ME={me_gp:.4f}" if test_elem == 0 else None)
 
-        axes[0,0].plot(np.linspace(-3000, 3000, 100), np.linspace(-3000, 3000, 100), 'k--', zorder=3)
-        axes[0,0].set_xlim(min(NN_test_inputs_T[rp[::10]].flatten()), max(NN_test_inputs_T[rp[::10]].flatten()))
-        axes[0,0].set_ylim(min(NN_test_true_T[rp[::10]].flatten()), max(NN_test_true_T[rp[::10]].flatten()))
-        axes[0,0].set_ylabel('True Temperature (K)', fontsize=FS)
-        axes[0,0].set_xlabel('Predicted Temperature (K)', fontsize=FS)
-        axes[0,0].set_title('Ens-CGP', fontsize=FS)
-        axes[0,0].tick_params(axis='both', labelsize=FS)
-        axes[0,0].legend(fontsize=10, loc='upper left')
+    # Temperature axis formatting
+    ax_T.set_xlim(min(min(NN_test_inputs_T.flatten()), min(NN_pred_T.flatten())),
+                max(max(NN_test_inputs_T.flatten()), max(NN_pred_T.flatten())))
+    ax_T.set_ylim(min(NN_test_true_T.flatten()), max(NN_test_true_T.flatten()))
+    ax_T.set_ylabel('True Temperature (K)', fontsize=FS)
+    ax_T.set_xlabel('Predicted Temperature (K)', fontsize=FS)
+    ax_T.tick_params(axis='both', labelsize=FS)
+    ax_T.legend(fontsize=10, loc='upper left')
 
-        axes[1,0].plot(np.linspace(-10, 10, 100), np.linspace(-10, 10, 100), 'k--', zorder=3)
-        axes[1,0].set_xlim(min(NN_test_inputs_P[rp[::10]].flatten()), max(NN_test_inputs_P[rp[::10]].flatten()))
-        axes[1,0].set_ylim(min(NN_test_true_P[rp[::10]].flatten()), max(NN_test_true_P[rp[::10]].flatten()))
-        axes[1,0].set_ylabel(r'True Pressure ($\log_{10}$ bar)', fontsize=FS)
-        axes[1,0].set_xlabel(r'Predicted Pressure ($\log_{10}$ bar)', fontsize=FS)
-        axes[1,0].tick_params(axis='both', labelsize=FS)
-        axes[1,0].legend(fontsize=10, loc='lower right')
+    # Pressure axis formatting
+    ax_P.set_xlim(min(min(NN_test_inputs_P.flatten()), min(NN_pred_P.flatten())),
+                max(max(NN_test_inputs_P.flatten()), max(NN_pred_P.flatten())))
+    ax_P.set_ylim(min(NN_test_true_P.flatten()), max(NN_test_true_P.flatten()))
+    ax_P.set_ylabel(r'True Pressure ($\log_{10}$ bar)', fontsize=FS)
+    ax_P.set_xlabel(r'Predicted Pressure ($\log_{10}$ bar)', fontsize=FS)
+    ax_P.tick_params(axis='both', labelsize=FS)
+    ax_P.legend(fontsize=10, loc='lower right')
 
-        axes[2,0].plot(np.linspace(-1000, 1000, 100), np.linspace(-1000, 1000, 100), 'k--', zorder=3)
-        axes[2,0].set_xlim(min(NN_test_inputs_ST[rp[::10]].flatten()), max(NN_test_inputs_ST[rp[::10]].flatten()))
-        axes[2,0].set_ylim(min(NN_test_true_ST[rp[::10]].flatten()), max(NN_test_true_ST[rp[::10]].flatten()))
-        axes[2,0].set_ylabel(r'True Temperature (K)', fontsize=FS)
-        axes[2,0].set_xlabel(r'Predicted Temperature (K)', fontsize=FS)
-        axes[2,0].tick_params(axis='both', labelsize=FS)
-        axes[2,0].legend(fontsize=10, loc='lower left')
-
-        axes[0,1].plot(np.linspace(-3000, 3000, 100), np.linspace(-3000, 3000, 100), 'k--', zorder=3)
-        axes[0,1].set_xlim(min(NN_pred_T[rp[::10]].flatten()), max(NN_pred_T[rp[::10]].flatten()))
-        axes[0,1].set_ylim(min(NN_test_true_T[rp[::10]].flatten()), max(NN_test_true_T[rp[::10]].flatten()))
-        axes[0,1].set_title('Ens-CGP + NN', fontsize=FS)
-        axes[0,1].set_xlabel('Predicted Temperature (K)', fontsize=FS)
-        axes[0,1].tick_params(axis='both', labelsize=FS)
-        axes[0,1].legend(fontsize=10, loc='upper left')
-
-        axes[1,1].plot(np.linspace(-10, 10, 100), np.linspace(-10, 10, 100), 'k--', zorder=3)
-        axes[1,1].set_xlim(min(NN_pred_P[rp[::10]].flatten()), max(NN_pred_P[rp[::10]].flatten()))
-        axes[1,1].set_ylim(min(NN_test_true_P[rp[::10]].flatten()), max(NN_test_true_P[rp[::10]].flatten()))
-        axes[1,1].set_xlabel(r'Predicted Pressure ($\log_{10}$ bar)', fontsize=FS)
-        axes[1,1].tick_params(axis='both', labelsize=FS)
-        axes[1,1].legend(fontsize=10, loc='lower right')
-
-        axes[2,1].plot(np.linspace(-1000, 1000, 100), np.linspace(-1000, 1000, 100), 'k--', zorder=3)
-        axes[2,1].set_xlim(min(NN_pred_ST[rp[::10]].flatten()), max(NN_pred_ST[rp[::10]].flatten()))
-        axes[2,1].set_ylim(min(NN_test_true_ST[rp[::10]].flatten()), max(NN_test_true_ST[rp[::10]].flatten()))
-        axes[2,1].set_xlabel(r'Predicted Temperature (K)', fontsize=FS)
-        axes[2,1].tick_params(axis='both', labelsize=FS)
-        axes[2,1].legend(fontsize=10, loc='lower right') 
-
-        plt.tight_layout()
-        plt.savefig(plot_save_path + '/truthvspred_scatter.png', bbox_inches='tight', dpi=1000)
-        plt.close()
+    plt.savefig(plot_save_path + '/combined_figures.png', bbox_inches='tight', dpi=1000)
+    plt.close()
 
 
 
 
-    # ── Figure 4: corner plot of median RMSE across parameter space ────────────────────────────────────
+
+
+
+    # ── Figure 5: corner plot of median RMSE across parameter space ────────────────────────────────────
     test_inputs_np = raw_inputs[test_idx]   # shape (n_test, D)
     NN_rmse = np.sqrt(np.mean(NN_res_T**2, axis=1))
 
@@ -1525,7 +1630,7 @@ elif run_mode == 'evaluate':
 
 
 
-        # ── Figure 4: corner plot of median RMSE across parameter space ────────────────────────────────────
+    # ── Figure 5: corner plot of median RMSE across parameter space ────────────────────────────────────
     test_inputs_np = raw_inputs[test_idx]   # shape (n_test, D)
     NN_rmse = np.sqrt(np.mean(NN_res_P**2, axis=1))
 
@@ -1767,141 +1872,6 @@ elif run_mode == 'evaluate':
 
     plt.subplots_adjust(right=0.91, hspace=0.15, wspace=0.10)
     plt.savefig(plot_save_path + '/compact_rmse_corner_P.pdf', bbox_inches='tight')
-    plt.close()
-
-
-
-
-
-    # ── Figure 5: Plot of the best, worst, and median predictions ───────────────────
-    # Get indices that would sort the RMSE list
-    sorted_indices = np.argsort(NN_rmse_T)
-
-    # 1. Index of Lowest RMSE (Best)
-    best_idx = sorted_indices[0]
-
-    # 2. Index of Highest RMSE (Worst)
-    worst_idx = sorted_indices[-1]
-
-    # 3. Index of Median RMSE (Middle/Average)
-    median_idx = sorted_indices[len(sorted_indices) // 2]
-
-    FS=12
-    fig = plt.figure(figsize=(16, 6))
-
-    # Outer GridSpec: 3 groups, with wspace between them
-    outer_gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.2,
-                                left=0.06, right=0.98, top=0.82, bottom=0.1)
-
-    group_axes = {}
-    for g, col in enumerate(['best', 'median', 'worst']):
-        # Inner GridSpec per group: 2 rows × 2 cols, zero internal spacing
-        inner_gs = gridspec.GridSpecFromSubplotSpec(
-            2, 2,
-            subplot_spec=outer_gs[g],
-            width_ratios=(3, 1),
-            height_ratios=(3, 1),
-            wspace=0.0,
-            hspace=0.0,
-        )
-        group_axes[f'{col}_results']         = fig.add_subplot(inner_gs[0, 0])
-        group_axes[f'{col}_res_temperature'] = fig.add_subplot(inner_gs[0, 1])
-        group_axes[f'{col}_res_pressure']    = fig.add_subplot(inner_gs[1, 0])
-        # inner_gs[1, 1] intentionally empty
-
-    axs = group_axes
-
-    for col in ['best', 'median', 'worst']:
-        idx = {'best': best_idx, 'median': median_idx, 'worst': worst_idx}[col]
-
-        results_ax  = axs[f'{col}_results']
-        res_temp_ax = axs[f'{col}_res_temperature']
-        res_pres_ax = axs[f'{col}_res_pressure']
-
-        # ── Main results plot ──────────────────────────────────────────────────────
-        results_ax.plot(NN_test_true_T[idx,:],  NN_test_true_P[idx,:],  '.', linestyle='-', color='darkseagreen',  linewidth=2, label='Truth')
-        results_ax.errorbar(NN_test_inputs_T[idx,:], NN_test_inputs_P[idx,:], xerr=NN_test_inputs_Terr[idx,:], yerr=NN_test_inputs_Perr[idx,:], alpha=0.4, fmt='-', color=GP_plot_color, linewidth=2, label='Ens-CGP')
-        results_ax.plot(NN_test_inputs_T[idx,:], NN_test_inputs_P[idx,:], '-', color=GP_plot_color, linewidth=2)
-        results_ax.plot(NN_pred_T[idx,:],        NN_pred_P[idx,:],                           color=GPNN_plot_color, linewidth=2, label='Ens-CGP+NN')
-        results_ax.invert_yaxis()
-        results_ax.set_ylabel(r'log$_{10}$ Pressure (bar)', fontsize=FS)
-        results_ax.xaxis.set_label_position('top')
-        results_ax.xaxis.tick_top()
-        results_ax.tick_params(axis='x', bottom=False, labelbottom=False, top=True, labeltop=True, labelsize=FS)
-        results_ax.set_xlabel('Temperature (K)', fontsize=FS)
-        if col=='best':
-            results_ax.legend(fontsize=FS, loc='upper right')
-        results_ax.grid()
-
-        # ── Temperature residuals ──────────────────────────────────────────────────
-        res_temp_ax.plot(NN_res_T[idx,:], NN_test_true_P[idx,:], '.', linestyle='-', color=GPNN_plot_color, linewidth=2)
-        res_temp_ax.errorbar(GP_res_T[idx,:], NN_test_true_P[idx,:], xerr=NN_test_inputs_Terr[idx,:],  alpha=0.4, fmt='-', color=GP_plot_color,   linewidth=2)
-        res_temp_ax.plot(GP_res_T[idx,:], NN_test_true_P[idx,:], '-', color=GP_plot_color, linewidth=2)
-        res_temp_ax.xaxis.set_label_position('top')
-        res_temp_ax.xaxis.tick_top()
-        res_temp_ax.tick_params(axis='x', bottom=False, labelbottom=False, top=True, labeltop=True, labelsize=FS)
-        res_temp_ax.set_xlabel('Residuals (K)', fontsize=FS)
-        res_temp_ax.sharey(results_ax)
-        res_temp_ax.tick_params(axis='y', left=False, labelleft=False, right=False, labelright=False)
-        res_temp_ax.grid()
-        res_temp_ax.axvline(0, color='darkseagreen', linestyle='dashed', zorder=2)
-
-        # ── Pressure residuals ─────────────────────────────────────────────────────
-        multiplier = 1e4 if col in ['best', 'median'] else 1e2
-        multiplier_str = '$10^{-4}$' if col in ['best', 'median'] else '$10^{-2}$'
-
-        res_pres_ax.plot(NN_test_true_T[idx,:], NN_res_P[idx,:]*multiplier, '.', linestyle='-', color=GPNN_plot_color, linewidth=2)
-        res_pres_ax.errorbar(NN_test_true_T[idx,:], GP_res_P[idx,:]*multiplier, yerr=NN_test_inputs_Perr[idx,:]*multiplier,  alpha=0.4, fmt='-', color=GP_plot_color, linewidth=2)
-        res_pres_ax.plot(NN_test_true_T[idx,:], GP_res_P[idx,:]*multiplier, '-', color=GP_plot_color, linewidth=2)
-        res_pres_ax.set_ylabel(f'Residuals \nx{multiplier_str} (bar)', fontsize=FS)
-        res_pres_ax.sharex(results_ax)
-        res_pres_ax.tick_params(axis='x', bottom=False, labelbottom=False, top=False, labeltop=False, labelsize=FS)
-        res_pres_ax.grid()
-        res_pres_ax.axhline(0, color='darkseagreen', linestyle='dashed', zorder=2)
-
-    # After all plotting is done, remove the rightmost x-tick label
-    # on each results axis to prevent overlap with the adjacent residuals panel
-    fig.canvas.draw()  # force rendering so tick positions are populated
-
-    for col in ['worst']:
-        results_ax = axs[f'{col}_results']
-        # Suppress the last (rightmost) tick label on the top x-axis
-        ticks = results_ax.xaxis.get_major_ticks()
-        if ticks:
-            for tick in ticks[-2:]:
-                tick.label2.set_visible(False)
-
-    for col, idx in [('best', best_idx), ('median', median_idx), ('worst', worst_idx)]:
-        results_ax = axs[f'{col}_results']
-        res_temp_ax = axs[f'{col}_res_temperature']
-        
-        # Get the bounding boxes of both top axes in figure coordinates
-        fig.canvas.draw()
-        bbox_left  = results_ax.get_position()
-        bbox_right = res_temp_ax.get_position()
-        
-        # Centered x between left edge of results and right edge of temp residuals
-        x_center = (bbox_left.x0 + bbox_right.x1) / 2
-        y_top    = bbox_left.y1  # top of the results axis
-        
-        rmse_val_T = NN_rmse_T[idx]
-        rmse_val_P = NN_rmse_P[idx]
-        if col == 'best':
-            multiplier = 1e5
-            multiplier_str = r'$\mathbf{\times 10^{-5}}$'
-        elif col == 'median':
-            multiplier = 1e4
-            multiplier_str = r'$\mathbf{\times 10^{-4}}$'
-        else:
-            multiplier = 1e2
-            multiplier_str = r'$\mathbf{\times 10^{-2}}$'
-        title_str = f'{col.capitalize()} (RMSE = {rmse_val_T:.2f} K, {rmse_val_P*multiplier:.2f}{multiplier_str} bar)'
-        
-        fig.text(x_center, y_top + 0.095, title_str,
-                ha='center', va='bottom', fontsize=FS, fontweight='bold',
-                transform=fig.transFigure)
-
-    plt.savefig(plot_save_path + '/example_predictions.pdf', bbox_inches='tight')
     plt.close()
 
     print('Evaluation complete. Plots saved to:', plot_save_path)

@@ -38,7 +38,8 @@ from scipy.interpolate import RectBivariateSpline
 from scipy.ndimage import gaussian_filter
 import matplotlib.colors as mcolors
 from matplotlib import ticker
-from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+import matplotlib.gridspec as gridspec
+from sklearn.metrics import r2_score
 
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
@@ -1052,7 +1053,9 @@ elif run_mode == 'evaluate':
         plt.savefig(plot_save_path + '/res_GP_CNN.pdf', bbox_inches='tight')
         plt.close()
 
-    # ── Figure 4: corner plot of median RMSE across parameter space ────────────────────────────────────
+
+
+    # ── Figure 3: corner plot of median RMSE across parameter space ────────────────────────────────────
     test_inputs_np = raw_inputs[test_idx]   # shape (n_test, D)
     NN_rmse = np.sqrt(np.mean(NN_res**2, axis=1))
 
@@ -1299,59 +1302,79 @@ elif run_mode == 'evaluate':
 
 
 
+    # ── Figure 3 & 5 combined: heatmaps on top, scatter on bottom ────────────────
+    FS = 14
+    plot_alpha = 0.1
 
+    def compute_stats(y_true, y_pred):
+        y_true_flat = y_true.flatten()
+        y_pred_flat = y_pred.flatten()
+        r2   = r2_score(y_true_flat, y_pred_flat)
+        rmse = np.sqrt(np.mean((y_true_flat - y_pred_flat)**2))
+        me   = np.mean(y_pred_flat - y_true_flat)
+        return r2, rmse, me
 
-
-
-    # ── Figure 5: Plot of the best, worst, and median predictions ─────────────────
+    # ── Indices ───────────────────────────────────────────────────────────────────
     sorted_indices = np.argsort(NN_rmse)
-    best_idx   = sorted_indices[0]
-    worst_idx  = sorted_indices[-1]
     median_idx = sorted_indices[len(sorted_indices) // 2]
+    median_minus_1sigma = np.median(NN_rmse) - np.std(NN_rmse)
+    median_minus_1sigma_idx = np.argmin(np.abs(NN_rmse - median_minus_1sigma))
 
-    FS     = 12
-    idxs   = [best_idx, median_idx, worst_idx]
-    titles = ['Best', 'Median', 'Worst']
+    idxs   = [median_idx, median_minus_1sigma_idx]
+    titles = ['X - median', r'O - median-$\mathbf{1\sigma}$']
 
-    row_data   = [NN_test_true, NN_test_inputs_pred, NN_pred, GP_res, NN_res]
-    row_labels = ['True', 'Ens-CGP', 'Ens-CGP+NN', 'Ens-CGP Residual', 'Ens-CGP+NN Residual']
+    # Marker style per case — shape matches what appears on the scatter below
+    marker_styles = [
+        (median_idx, 'median', 'x', 120),
+        (median_minus_1sigma_idx, 'sigma', 'o', 120),
+    ]
 
     cmap = sns.color_palette("rocket", as_cmap=True)
+    row_data = [NN_test_true, NN_test_inputs_pred, NN_pred, GP_res, NN_res]
 
-    # ── Build figure with manual GridSpec for precise colorbar control ─────────────
-    fig = plt.figure(figsize=(12, 12))
+    # ── Master figure ─────────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(16, 18))
 
-    # Outer: 3 column groups with explicit margins and horizontal spacing
-    outer_gs = GridSpec(
-        1, 3, figure=fig,
-        left=0.07, right=0.97, top=0.95, bottom=0.07,
-        wspace=0.30,
+    master_gs = gridspec.GridSpec(
+        2, 1, figure=fig,
+        height_ratios=(14, 6),
+        hspace=0.1,
+        left=0.07, right=0.97, top=0.96, bottom=0.04
     )
 
-    axs       = np.empty((5, 3), dtype=object)
-    cbar_axes = np.empty((2, 3), dtype=object)  # [top_cbar, bot_cbar] × 3 columns
+    # ─────────────────────────────────────────────────────────────────────────────
+    # TOP SECTION — Figure 5 (heatmaps, 5 rows × 2 columns)
+    # ─────────────────────────────────────────────────────────────────────────────
+    top_gs = gridspec.GridSpecFromSubplotSpec(
+        1, 2,
+        subplot_spec=master_gs[0],
+        wspace=0.20
+    )
 
-    for col in range(3):
-        # Inner: 5 plot rows + 1 narrow colorbar column, identical width_ratios for all columns
-        inner = GridSpecFromSubplotSpec(
+    axs_heat  = np.empty((5, 3), dtype=object)
+    cbar_axes = np.empty((2, 3), dtype=object)
+
+    for col in range(2):
+        inner = gridspec.GridSpecFromSubplotSpec(
             5, 2,
-            subplot_spec=outer_gs[col],
-            width_ratios=[20, 1],   # same ratio → same absolute colorbar width across rows
+            subplot_spec=top_gs[col],
+            width_ratios=[20, 1],
             hspace=0.06,
             wspace=0.05,
         )
         for row in range(5):
-            axs[row, col] = fig.add_subplot(inner[row, 0])
+            axs_heat[row, col] = fig.add_subplot(inner[row, 0])
+        cbar_axes[0, col] = fig.add_subplot(inner[0:3, 1])   # spans rows 0–2
+        cbar_axes[1, col] = fig.add_subplot(inner[3:5, 1])   # spans rows 3–4
 
-        # Dedicated colorbar axes — span exactly the right rows
-        cbar_axes[0, col] = fig.add_subplot(inner[0:3, 1])   # spans rows 0-2
-        cbar_axes[1, col] = fig.add_subplot(inner[3:5, 1])   # spans rows 3-4
-
-    # ── Fill in heatmaps, ticks, and colorbars ────────────────────────────────────
     for col, (idx, title) in enumerate(zip(idxs, titles)):
-        axs[0, col].set_title(
-            f'{title} (RMSE: {NN_rmse[idx]:.2f} K)', fontsize=FS, fontweight='bold'
+        # ── Column title with marker glyph embedded via annotate ─────────────────
+        m_shape = marker_styles[col][2]
+        axs_heat[0, col].set_title(
+            f'{title}  (RMSE: {NN_rmse[idx]:.2f} K)',
+            fontsize=FS, fontweight='bold'
         )
+        # Small marker drawn just above the title using fig.transFigure coords later
 
         group1_data = np.concatenate([d[idx, :] for d in row_data[:3]])
         vmin1, vmax1 = group1_data.min(), group1_data.max()
@@ -1360,55 +1383,108 @@ elif run_mode == 'evaluate':
 
         for row, data in enumerate(row_data):
             vmin, vmax = (vmin1, vmax1) if row < 3 else (vmin2, vmax2)
-            ax = axs[row, col]
-
+            ax = axs_heat[row, col]
             sns.heatmap(
                 data[idx, :].reshape((IMG_H, IMG_W)),
-                ax=ax,
-                vmin=vmin, vmax=vmax,
-                cbar=False,
+                ax=ax, vmin=vmin, vmax=vmax, cbar=False,
             )
-
-            # ── y-axis: labels only on leftmost column ──────────────────────────
             if col == 0:
                 ax.set_yticks(np.linspace(0, IMG_H, 5))
-                # FIX 1: flip to 90→-90 so top tick = 90°N, bottom tick = 90°S
                 ax.set_yticklabels(np.linspace(90, -90, 5).astype(int), fontsize=FS - 2)
                 ax.set_ylabel(r'Latitude ($\circ$)', fontsize=FS)
             else:
                 ax.set_yticks(np.linspace(0, IMG_H, 5))
                 ax.set_ylabel('')
-
-            # ── x-axis: labels only on bottom row ───────────────────────────────
             if row == 4:
                 ax.set_xticks(np.linspace(0, IMG_W, 5))
-                ax.set_xticklabels(
-                    np.linspace(-180, 180, 5).astype(int),
-                    rotation=0,          # FIX 4: keep labels horizontal
-                    fontsize=FS - 2,
-                )
+                ax.set_xticklabels(np.linspace(-180, 180, 5).astype(int), rotation=0, fontsize=FS - 2)
                 ax.set_xlabel(r'Longitude ($\circ$)', fontsize=FS)
             else:
                 ax.set_xticks([])
 
-        # ── Colorbars into dedicated axes (FIX 3 & 5) ───────────────────────────
-        sm1 = mpl.cm.ScalarMappable(
-            cmap=cmap, norm=mpl.colors.Normalize(vmin=vmin1, vmax=vmax1)
-        )
+        sm1 = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=vmin1, vmax=vmax1))
         cb1 = fig.colorbar(sm1, cax=cbar_axes[0, col])
-
-        sm2 = mpl.cm.ScalarMappable(
-            cmap=cmap, norm=mpl.colors.Normalize(vmin=vmin2, vmax=vmax2)
-        )
+        sm2 = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=vmin2, vmax=vmax2))
         cb2 = fig.colorbar(sm2, cax=cbar_axes[1, col])
+        cb1.set_label('Temperature (K)', fontsize=FS)
+        cb2.set_label('Temperature (K)', fontsize=FS)
 
-        # Label only on rightmost column to avoid crowding (FIX 2: space is reserved by wspace)
-        if col == 2:
-            cb1.set_label('Temperature (K)', fontsize=FS)
-            cb2.set_label('Temperature (K)', fontsize=FS)
+    # ─────────────────────────────────────────────────────────────────────────────
+    # BOTTOM SECTION — Figure 3 (scatter, 1×2)
+    # ─────────────────────────────────────────────────────────────────────────────
+    bot_gs = gridspec.GridSpecFromSubplotSpec(
+        1, 1,
+        subplot_spec=master_gs[1],
+    )
 
-    plt.savefig(plot_save_path + '/example_predictions.pdf', bbox_inches='tight')
+    ax   = fig.add_subplot(bot_gs[0])
+
+    # ── Dashed 1:1 lines first (zorder=1) ────────────────────────────────────────
+    ax.plot(  np.linspace(-1000, 1000, 100), np.linspace(-1000, 1000, 100), 'k--', zorder=3)
+    ax.plot(np.linspace(-1000, 1000, 100), np.linspace(-1000, 1000, 100), 'k--', zorder=3)
+
+    # ── Scatter points (zorder=2) ─────────────────────────────────────────────────
+    shufflefig3_seed = 45
+    np.random.seed(shufflefig3_seed)
+    rp = np.random.permutation(n_test)
+
+    r2_gp,   rmse_gp,   me_gp   = compute_stats(NN_test_true.numpy(), NN_test_inputs_pred.numpy())
+    r2_gpnn, rmse_gpnn, me_gpnn = compute_stats(NN_test_true.numpy(), NN_pred)
+
+    for test_elem in rp[::10]:
+        ax.errorbar(
+            NN_test_inputs_pred[test_elem], NN_test_true[test_elem],
+            yerr=NN_test_inputs_err[test_elem], fmt='o', alpha=plot_alpha,
+            color='orangered', zorder=1,
+            label=f"Ens-CGP      R$^2$={r2_gp:.4f}  RMSE={rmse_gp:.4f}  ME={me_gp:.4f}" if test_elem == rp[0] else None
+        )
+        ax.plot(
+            NN_pred[test_elem], NN_test_true[test_elem],
+            'o', alpha=plot_alpha, color='dodgerblue', zorder=2,
+            label=f"Ens-CGP+NN  R$^2$={r2_gpnn:.4f}  RMSE={rmse_gpnn:.4f}  ME={me_gpnn:.4f}" if test_elem == rp[0] else None
+        )
+
+    # ── Best / Median / Worst markers on top (zorder=5) ──────────────────────────
+    marker_styles = [
+        (median_idx, 'median', 'x', 120),
+        (median_minus_1sigma_idx, 'sigma', 'o', 120),
+    ]
+    ax.scatter(
+            np.median(NN_test_inputs_pred[median_idx]), np.median(NN_test_true[median_idx]),
+            marker='x', c='black', zorder=5, s=120, linewidths=2,
+        )
+    
+    ax.scatter(
+            np.median(NN_test_inputs_pred[median_minus_1sigma_idx]), np.median(NN_test_true[median_minus_1sigma_idx]),
+            marker='o', facecolors='none', edgecolors='black', zorder=5, s=120, linewidths=2,
+        )
+
+    # ── Axis formatting ───────────────────────────────────────────────────────────
+    ax.set_xlim(min(min(NN_pred[rp[::10]].flatten()),min(NN_test_inputs_pred[rp[::10]].flatten())), max(max(NN_pred[rp[::10]].flatten()),max(NN_test_inputs_pred[rp[::10]].flatten())))
+    ax.set_ylim(min(NN_test_true[rp[::10]].flatten()),        max(NN_test_true[rp[::10]].flatten()))
+    ax.set_ylabel('True Temperature (K)', fontsize=FS)
+    ax.set_xlabel('Predicted Temperature (K)', fontsize=FS)
+    ax.tick_params(axis='both', labelsize=FS)
+    ax.legend(fontsize=10, loc='lower left')
+
+    # ── Row labels ────────────────────────────────────────────────────────────────
+    row_labels = ['Truth', 'Ens-CGP', 'Ens-CGP + NN', 'Ens-CGP Res.', 'Ens-CGP + NN Res.']
+
+    fig.canvas.draw()  # needed so get_position() returns correct bounding boxes
+
+    for row, label in enumerate(row_labels):
+        ax_row = axs_heat[row, 0]
+        bbox = ax_row.get_position()
+        y_center = (bbox.y0 + bbox.y1) / 2
+        fig.text(
+            0.01, y_center, label,
+            ha='left', va='center',
+            fontsize=FS, fontweight='bold',
+            rotation=90,
+            transform=fig.transFigure
+        )
+
+    plt.savefig(plot_save_path + '/combined_figures.png', bbox_inches='tight', dpi=1000)
     plt.close()
-
 
     print('Evaluation complete. Plots saved to:', plot_save_path)
