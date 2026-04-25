@@ -1055,8 +1055,16 @@ elif run_mode == 'evaluate':
 
 
 
-    # ── Figure 3: corner plot of median RMSE across parameter space ────────────────────────────────────
+    #Convert test_inputs_np[:, 2] to days and store in a list for later use in tick labels
     test_inputs_np = raw_inputs[test_idx]   # shape (n_test, D)
+    current_lod = np.unique(test_inputs_np[:, 2])
+    new_lod = np.array([0.17, 0.26, 0.42, 0.66, 1.04, 1.64, 2.71, 4.17, 6.67, 10.42])
+        
+    for lod_idx, lod in enumerate(current_lod):
+        idx = np.where(test_inputs_np[:, 2] == lod)[0]
+        test_inputs_np[idx, 2] = new_lod[lod_idx]
+
+    # ── Figure 3: corner plot of median RMSE across parameter space ────────────────────────────────────
     NN_rmse = np.sqrt(np.mean(NN_res**2, axis=1))
 
     param_names = [
@@ -1420,8 +1428,7 @@ elif run_mode == 'evaluate':
     ax   = fig.add_subplot(bot_gs[0])
 
     # ── Dashed 1:1 lines first (zorder=1) ────────────────────────────────────────
-    ax.plot(  np.linspace(-1000, 1000, 100), np.linspace(-1000, 1000, 100), 'k--', zorder=3)
-    ax.plot(np.linspace(-1000, 1000, 100), np.linspace(-1000, 1000, 100), 'k--', zorder=3)
+    ax.plot(np.linspace(-1000, 1000, 100), np.linspace(-1000, 1000, 100), 'k--', zorder=3, label='Perfect prediction - 1:1 line')
 
     # ── Scatter points (zorder=2) ─────────────────────────────────────────────────
     shufflefig3_seed = 45

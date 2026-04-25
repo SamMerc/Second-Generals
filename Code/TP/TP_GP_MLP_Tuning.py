@@ -1240,10 +1240,10 @@ elif run_mode == 'evaluate':
         res_temp_ax = axs[f'{col}_res_temperature']
         res_pres_ax = axs[f'{col}_res_pressure']
 
-        results_ax.plot(NN_test_true_T[idx,:],  NN_test_true_P[idx,:],  '.', linestyle='-', color='darkseagreen',  linewidth=2, label='Truth')
+        results_ax.plot(NN_test_true_T[idx,:],  NN_test_true_P[idx,:],  '.', linestyle='--', color='black',  linewidth=2, label='Truth')
         results_ax.errorbar(NN_test_inputs_T[idx,:], NN_test_inputs_P[idx,:], xerr=NN_test_inputs_Terr[idx,:], yerr=NN_test_inputs_Perr[idx,:], alpha=0.4, fmt='-', color=GP_plot_color, linewidth=2, label='Ens-CGP')
         results_ax.plot(NN_test_inputs_T[idx,:], NN_test_inputs_P[idx,:], '-', color=GP_plot_color, linewidth=2)
-        results_ax.plot(NN_pred_T[idx,:],        NN_pred_P[idx,:],                           color=GPNN_plot_color, linewidth=2, label='Ens-CGP+NN')
+        results_ax.plot(NN_pred_T[idx,:],        NN_pred_P[idx,:], color=GPNN_plot_color, linewidth=2, label='Ens-CGP+NN')
         results_ax.invert_yaxis()
         results_ax.set_ylabel(r'log$_{10}$ Pressure (bar)', fontsize=FS)
         results_ax.xaxis.set_label_position('top')
@@ -1264,7 +1264,7 @@ elif run_mode == 'evaluate':
         res_temp_ax.sharey(results_ax)
         res_temp_ax.tick_params(axis='y', left=False, labelleft=False, right=False, labelright=False)
         res_temp_ax.grid()
-        res_temp_ax.axvline(0, color='darkseagreen', linestyle='dashed', zorder=2)
+        res_temp_ax.axvline(0, color='black', linestyle='dashed', zorder=2)
 
         multiplier = 1e4 if col in ['best', 'median'] else 1e2
         multiplier_str = '$10^{-4}$' if col in ['best', 'median'] else '$10^{-2}$'
@@ -1276,7 +1276,7 @@ elif run_mode == 'evaluate':
         res_pres_ax.sharex(results_ax)
         res_pres_ax.tick_params(axis='x', bottom=False, labelbottom=False, top=False, labeltop=False, labelsize=FS)
         res_pres_ax.grid()
-        res_pres_ax.axhline(0, color='darkseagreen', linestyle='dashed', zorder=2)
+        res_pres_ax.axhline(0, color='black', linestyle='dashed', zorder=2)
 
     # Figure 4 panel titles
     fig.canvas.draw()
@@ -1316,12 +1316,12 @@ elif run_mode == 'evaluate':
     ax_P.scatter(np.median(NN_pred_P[median_idx]), np.median(NN_test_true_P[median_idx]),
             marker='x', c='black', zorder=3, s=100, linewidths=2)
     
-    ax_P.scatter(np.median(NN_pred_P[median_minus_1sigma_idx]), np.median(NN_pred_P[median_minus_1sigma_idx]),
+    ax_P.scatter(np.median(NN_pred_P[median_minus_1sigma_idx]), np.median(NN_test_true_P[median_minus_1sigma_idx]),
             marker='o', zorder=3, s=100, linewidths=2, facecolors='none', edgecolors='black')
     
     ax_T.plot(np.linspace(-3000, 3000, 100),
                 np.linspace(-3000, 3000, 100),
-                'k--', zorder=3)
+                'k--', zorder=3, label='Perfect prediction - 1:1 line')
     
     ax_T.scatter(np.median(NN_pred_T[median_idx]), np.median(NN_test_true_T[median_idx]),
             marker='x', c='black', zorder=3, s=100, linewidths=2)
@@ -1378,11 +1378,16 @@ elif run_mode == 'evaluate':
 
 
 
-
+    #Convert test_inputs_np[:, 2] to days and store in a list for later use in tick labels
+    current_lod = np.unique(test_inputs_np[:, 2])
+    new_lod = np.array([0.17, 0.26, 0.42, 0.66, 1.04, 1.64, 2.71, 4.17, 6.67, 10.42])
+        
+    for lod_idx, lod in enumerate(current_lod):
+        idx = np.where(test_inputs_np[:, 2] == lod)[0]
+        test_inputs_np[idx, 2] = new_lod[lod_idx]
 
 
     # ── Figure 5: corner plot of median RMSE across parameter space ────────────────────────────────────
-    test_inputs_np = raw_inputs[test_idx]   # shape (n_test, D)
     NN_rmse = np.sqrt(np.mean(NN_res_T**2, axis=1))
 
     param_names = [
@@ -1631,7 +1636,6 @@ elif run_mode == 'evaluate':
 
 
     # ── Figure 5: corner plot of median RMSE across parameter space ────────────────────────────────────
-    test_inputs_np = raw_inputs[test_idx]   # shape (n_test, D)
     NN_rmse = np.sqrt(np.mean(NN_res_P**2, axis=1))
 
     param_names = [
