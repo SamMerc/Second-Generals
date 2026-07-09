@@ -1,0 +1,1072 @@
+#############################
+#### Importing libraries ####
+#############################
+import os
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+from torch.optim import Adam
+import torch.optim.lr_scheduler as lr_scheduler
+from pytorch_lightning.loggers import CSVLogger
+from pytorch_lightning import Trainer
+import pytorch_lightning as pl
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+from torchinfo import summary
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+from tqdm import tqdm
+from jax import jit, vmap
+from functools import partial
+import jax.numpy as jnp
+from time import time
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+import glob
+from bayesian_torch.models.dnn_to_bnn import dnn_to_bnn, get_kl_loss
+torch.set_float32_matmul_precision('high')
+
+##########################################################
+#### Importing raw data and defining hyper-parameters ####
+##########################################################
+#Defining function to check if directory exists, if not it generates it
+def check_and_make_dir(dir):
+    if not os.path.isdir(dir):os.mkdir(dir)
+#Base directory 
+base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
+#File containing temperature values
+raw_T_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_T.csv', delimiter=',')
+raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
+#File containing pressure values
+raw_P_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_P.csv', delimiter=',')
+raw_P_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_P.csv', delimiter=',')
+#Path to store model
+model_save_path = base_dir+'Model_Storage/BNN_GP_MLP/'
+check_and_make_dir(model_save_path)
+#Path to store plots
+plot_save_path = base_dir+'Plots/BNN_GP_MLP/'
+check_and_make_dir(plot_save_path)
+
+#Last 51 columns are the temperature/pressure values, 
+#First 5 are the input values (H2 pressure in bar, CO2 pressure in bar, LoD in hours, Obliquity in deg, H2+Co2 pressure) but we remove the last one since it's not adding info.
+# Extract the 4 physical inputs and append stellar temperature as 5th column
+inputs_3000 = np.hstack([raw_T_data3000[:, :4], np.full((len(raw_T_data3000), 1), 3000.0)])
+inputs_4500 = np.hstack([raw_T_data4500[:, :4], np.full((len(raw_T_data4500), 1), 4500.0)])
+
+# # Concatenate along the sample axis
+raw_inputs    = np.vstack([inputs_3000,            inputs_4500           ])  # (N_3000+N_4500, 5)
+raw_outputs_T = np.vstack([raw_T_data3000[:, 5:],  raw_T_data4500[:, 5:]])  # (N_3000+N_4500, O)
+raw_outputs_P = np.vstack([raw_P_data3000[:, 5:],  raw_P_data4500[:, 5:]])  # (N_3000+N_4500, O)
+
+#Convert raw outputs to log10 scale so we don't have to deal with it later
+raw_outputs_P = np.log10(raw_outputs_P/1000)
+
+#Storing useful quantitites
+N = raw_inputs.shape[0] #Number of data points
+D = raw_inputs.shape[1] #Number of features
+O = raw_outputs_T.shape[1] #Number of outputs
+
+# Shuffle data
+shuffle_seed = 3
+np.random.seed(shuffle_seed)
+rp = np.random.permutation(N) #random permutation of the indices
+# Apply random permutation to shuffle the data
+raw_inputs = raw_inputs[rp, :]
+raw_outputs_T = raw_outputs_T[rp, :]
+raw_outputs_P = raw_outputs_P[rp, :]
+
+## HYPER-PARAMETERS for ens-CGP ##
+
+#Number of nearest neighbors to choose
+N_neighbor = 4
+
+## HYPER-PARAMETERS for NN ##
+#Definine partitiion for splitting NN dataset
+data_partition = [0.7, 0.1, 0.2]
+
+#Defining the device
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+num_threads = 96
+torch.set_num_threads(num_threads)
+print(f"Using {device} device with {num_threads} threads")
+
+#Defining the noise seed for the random partitioning of the training data
+partition_seed = 4
+partition_rng = torch.Generator()
+partition_rng.manual_seed(partition_seed)
+
+#Defining the noise seed for the generating of batches from the partitioned data
+batch_seed = 5
+batch_rng = torch.Generator()
+batch_rng.manual_seed(batch_seed)
+
+#Defining the noise seed for the neural network initialization
+NN_seed = 6
+NN_rng = torch.Generator()
+NN_rng.manual_seed(NN_seed)
+
+# Variable to show plots or not 
+show_plot = False
+
+#Neural network width and depth
+nn_width = 209
+nn_depth = 32
+
+# Prior/posterior parameters for the mean-field-Gaussian variational layers that
+# nn.Linear gets converted into. 'type' picks the gradient estimator.
+bnn_prior_parameters = {
+    "prior_mu": 0.0,
+    "prior_sigma": 1.0,
+    "posterior_mu_init": 0.0,
+    "posterior_rho_init": -3.0,
+    "type": "Reparameterization",   # or "Flipout"
+    "moped_enable": False,          # training from scratch, no pretrained warm-start
+    "moped_delta": 0.5,
+}
+
+# Optimizer learning rate schedule - ReduceLROnPlateau
+lr_init      = 1e-3   # initial LR — ReduceLROnPlateau will reduce from here
+lr_patience  = 50     # epochs to wait before reducing LR
+lr_factor    = 0.7    # multiply LR by this when plateauing
+lr_min       = 1e-7   # floor
+
+#Regularization coefficient
+regularization_coeff_l1 = 0.0
+regularization_coeff_l2 = 5e-5
+
+#Smoothness constraint coefficient
+smoothness_coeff = 1e-1
+
+#Weight decay 
+weight_decay = 0.0
+
+#Batch size 
+batch_size = 200
+
+#Number of epochs 
+n_epochs = 50
+
+#Early stopping patience (in epochs)
+early_stopping_patience = 200
+
+# Number of stochastic forward passes used to form the predictive mean/std at inference
+mc_samples = 100
+
+#Mode for optimization
+run_mode = 'load'
+
+
+
+
+
+
+
+
+
+###############################################
+#### Ensemble Conditional Gaussian Process ####
+###############################################
+# ── JAX KNN ───────────────────────────────────────────────────────────────────
+@partial(jit, static_argnames=('k',))
+def _mahal_knn_single(X_train, xq, VI, k):
+    """Single query point. X_train: (D, N), xq: (D,), returns (k,)"""
+    diff = X_train - xq[:, None]                     # (D, N)
+    dists_sq = jnp.sum(diff * (VI @ diff), axis=0)   # (N,)
+    return jnp.argsort(dists_sq)[:k]
+
+@partial(jit, static_argnames=('k',))
+def _mahal_knn_batch(X_train, X_queries, VI, k):
+    """Batch of query points. X_queries: (D, Q), returns (Q, k)"""
+    def single(xq):
+        diff = X_train - xq[:, None]
+        dists_sq = jnp.sum(diff * (VI @ diff), axis=0)
+        return jnp.argsort(dists_sq)[:k]
+    return vmap(single)(X_queries.T)
+
+# ── JAX CGP step ──────────────────────────────────────────────────────────────
+@partial(jit, static_argnames=('N_neighbor',))
+def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
+    """idxs is always shape (N_neighbor,) — no dynamic shapes."""
+    Xens_NN = Xens[:, idxs]   # shape always (D, N_neighbor) ← fixed!
+    Yens_NN = Yens[:, idxs]   # shape always (M, N_neighbor) ← fixed!
+
+    Xm = Xens_NN.mean(axis=1, keepdims=True)
+    Ym = Yens_NN.mean(axis=1, keepdims=True)
+    dX = Xens_NN - Xm
+    dY = Yens_NN - Ym
+
+    Cxx = dX @ dX.T
+    Cyx = dY @ dX.T
+    Cyy = dY @ dY.T
+    Cxy = dX @ dY.T
+
+    rdgx = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cxx)))
+    rdgy = jnp.maximum(1e-10, jnp.min(jnp.linalg.eigvalsh(Cyy)))
+
+    Mf = Cyx @ jnp.linalg.pinv(Cxx + rdgx * jnp.eye(Cxx.shape[0]))
+    Mb = Cxy @ jnp.linalg.pinv(Cyy + rdgy * jnp.eye(Cyy.shape[0]))
+
+    YhSel = Yens_NN + Mf @ (Xq - Xens_NN)
+    XhSel = Xens_NN + Mb @ (Ym - YhSel)
+
+    # Fixed-size unique: always returns exactly N_neighbor indices
+    idxs2 = _mahal_knn_batch(Xens, XhSel, VI, 1).flatten()   # (N_neighbor,)
+    idxs_new = jnp.unique(idxs2, size=N_neighbor,
+                          fill_value=-1)                       # (N_neighbor,)
+
+    # Top-up: always pull N_neighbor candidates from Xq, use where idxs_new has fill
+    idxs_topup = _mahal_knn_single(Xens, Xq.ravel(), VI, N_neighbor)
+    idxs_final = jnp.where(idxs_new >= 0, idxs_new, idxs_topup)
+
+    Yh     = Ym + Mf @ (Xq - Xm)
+    cov_Yh = Cyy - Mf @ Cxy
+
+    return idxs_final, Mf, Cxy, Xm, Ym, Yh, cov_Yh
+
+# ── Main function ─────────────────────────────────────────────────────────────
+def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=1000):
+    """
+    Parameters:
+    Xens_j: array of input features which compose the ensemble. shape:(D, N) 
+    Yens_j: array of input labels which compose the ensemble. shape:(M, N) 
+    Xq: query point for which we want to compute a prediction. shape:(D,) or (D,1)
+    VI_j: inverse of the covariance matrix for the input ensemble. shape:(D, D)
+    N_neighbor: int, number of neighbors to use in CGP
+    tol: float, convergence threshold on average relative change in prediction (default 1%)
+    max_iter: int, safety cap on number of iterations (default 100)
+    """
+    Xq_j = jnp.array(Xq.ravel())   # (D,)
+
+    idxs = _mahal_knn_single(Xens_j, Xq_j, VI_j, N_neighbor)
+
+    # Run first iteration to get an initial prediction
+    idxs, _, _, _, _, Yh_prev, cov_Yh = _cgp_step_fixed(
+        Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
+    )
+    Yh_prev = np.array(Yh_prev.flatten())
+
+    rel_change_history = []
+
+    for i in range(max_iter - 1):
+        idxs, _, _, _, _, Yh, cov_Yh = _cgp_step_fixed(
+            Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
+        )
+        Yh = np.array(Yh.flatten())
+
+        # Average relative change between this and previous prediction
+        # Add small epsilon to denominator to avoid division by zero
+        rel_change = np.mean(
+            np.abs(Yh - Yh_prev) / (np.abs(Yh_prev) + 1e-10)
+        )
+
+        if rel_change < tol:
+            break
+
+        # Oscillation detection: count how many times the current value
+        # has appeared in the full history
+        n_repeats = np.sum(np.isclose(rel_change_history, rel_change, rtol=1e-3))
+        if n_repeats >= 5:
+            break
+
+        rel_change_history.append(rel_change)
+
+        Yh_prev = Yh
+
+    err_Yh = jnp.sqrt(jnp.maximum(0.0, jnp.diag(cov_Yh)))
+    return Yh, np.array(err_Yh), i + 2   # +2 because of the initial iteration before the loop
+
+
+
+
+
+
+###################
+#### Build MLP ####
+###################
+class ResidualBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
+        self.activation = nn.GELU()
+
+    def forward(self, x):
+        return self.activation(x + self.block(x))   # ← skip connection
+
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, depth, generator=None):
+        super().__init__()
+        if generator is not None:
+            torch.manual_seed(generator.initial_seed())
+
+        # First layer : Project input to hidden dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+        # Stack fully-connected with dimension hidden_dim
+        self.blocks = nn.Sequential(*[ResidualBlock(hidden_dim) for _ in range(depth)])
+        # Project to output
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.blocks(x)
+        return self.output_proj(x)
+
+# PyTorch Lightning DataModule
+class CustomDataModule(pl.LightningDataModule):
+    def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs, test_inputs, test_outputs, batch_size, rng):
+        super().__init__()
+
+        # Standardizing the output
+        ## Create scaler
+        out_scaler_T = StandardScaler()
+        out_scaler_P = StandardScaler()
+        
+        ## Fit scaler on training dataset (convert to numpy)
+        out_scaler_T.fit(train_outputs[:, :O].cpu().numpy())
+        out_scaler_P.fit(train_outputs[:, O:].cpu().numpy())
+
+        ## Transform all datasets and convert back to tensors
+        train_T_scaled = torch.tensor(out_scaler_T.transform(train_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        train_P_scaled = torch.tensor(out_scaler_P.transform(train_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        valid_T_scaled = torch.tensor(out_scaler_T.transform(valid_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        valid_P_scaled = torch.tensor(out_scaler_P.transform(valid_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+
+        test_T_scaled = torch.tensor(out_scaler_T.transform(test_outputs[:, :O].cpu().numpy()), dtype=torch.float32)
+        test_P_scaled = torch.tensor(out_scaler_P.transform(test_outputs[:, O:].cpu().numpy()), dtype=torch.float32)
+        
+        # Concatenate
+        train_outputs = torch.cat([train_T_scaled, train_P_scaled], dim=1)
+        valid_outputs = torch.cat([valid_T_scaled, valid_P_scaled], dim=1)
+        test_outputs = torch.cat([test_T_scaled, test_P_scaled], dim=1)
+
+        # Store the scaler if you need to inverse transform later
+        self.out_scaler_T = out_scaler_T
+        self.out_scaler_P = out_scaler_P
+        
+        # --- Input scaling: one scaler per block ---
+        # Block indices: [phys(D) | GP_T(O) | GP_P(O) | GP_Terr(O) | GP_Perr(O)]
+        i0, i1, i2, i3, i4 = 0, D, D+O, D+2*O, D+3*O
+
+        in_scaler_phys = StandardScaler()
+        in_scaler_T    = StandardScaler()
+        in_scaler_P    = StandardScaler()
+        in_scaler_Terr = StandardScaler()
+        in_scaler_Perr = StandardScaler()
+
+        in_scaler_phys.fit(train_inputs[:, i0:i1].cpu().numpy())
+        in_scaler_T.fit(   train_inputs[:, i1:i2].cpu().numpy())
+        in_scaler_P.fit(   train_inputs[:, i2:i3].cpu().numpy())
+        in_scaler_Terr.fit(train_inputs[:, i3:i4].cpu().numpy())
+        in_scaler_Perr.fit(train_inputs[:, i4:  ].cpu().numpy())
+
+        def scale_inputs(X):
+            X = X.cpu().numpy()
+            return torch.tensor(np.hstack([
+                in_scaler_phys.transform(X[:, i0:i1]),
+                in_scaler_T.transform(   X[:, i1:i2]),
+                in_scaler_P.transform(   X[:, i2:i3]),
+                in_scaler_Terr.transform(X[:, i3:i4]),
+                in_scaler_Perr.transform(X[:, i4:  ]),
+            ]), dtype=torch.float32)
+
+        self.train_inputs  = scale_inputs(train_inputs)
+        self.valid_inputs  = scale_inputs(valid_inputs)
+        self.test_inputs   = scale_inputs(test_inputs)
+
+        # Store all scalers for inference
+        self.in_scaler_phys = in_scaler_phys
+        self.in_scaler_T    = in_scaler_T
+        self.in_scaler_P    = in_scaler_P
+        self.in_scaler_Terr = in_scaler_Terr
+        self.in_scaler_Perr = in_scaler_Perr
+
+        # Storing it and passing it to loaders
+        self.train_outputs = train_outputs
+        self.valid_outputs = valid_outputs
+        self.test_outputs = test_outputs
+        self.batch_size = batch_size
+        self.rng = rng
+    
+    def train_dataloader(self):
+        dataset = TensorDataset(self.train_inputs, self.train_outputs)
+        return DataLoader(
+         dataset,
+         batch_size=self.batch_size, 
+         shuffle=True, 
+         generator=self.rng,
+         pin_memory=True,
+        #  persistent_workers=True,
+         )
+    
+    def val_dataloader(self):
+        dataset = TensorDataset(self.valid_inputs, self.valid_outputs)
+        return DataLoader(
+         dataset,
+         batch_size=self.batch_size, 
+         generator=self.rng,
+         pin_memory=True,
+        #  persistent_workers=True,
+         )
+
+    def test_dataloader(self):
+        dataset = TensorDataset(self.test_inputs, self.test_outputs)
+        return DataLoader(
+         dataset,
+         batch_size=self.batch_size, 
+         generator=self.rng,
+         pin_memory=True,
+        #  persistent_workers=True,
+         )
+
+model = NeuralNetwork(D + 4*O, nn_width, 2*O, nn_depth, generator=NN_rng)
+
+# Convert deep neural network to Bayesian neural network with mean-field Gaussian variational layers
+dnn_to_bnn(model, bnn_prior_parameters)
+
+summary(model)
+
+
+
+
+################################
+### Build/Load training set ####
+################################
+
+print('BUILDING GP TRAINING SET')
+
+# --- Define a cache path tied to the key hyperparameters ---
+gp_cache_path = (
+    base_dir
+    + f'Model_Storage/gp_cache_Nn{N_neighbor}_seed{shuffle_seed}.npz'
+)
+matching_files = glob.glob(base_dir+'Model_Storage/gp_cache_*.npz')
+
+if os.path.exists(gp_cache_path):
+    # ── Load from cache ───────────────────────────────────────
+    print(f'  Loading cached GP outputs from:\n  {gp_cache_path}')
+    cache = np.load(gp_cache_path)
+    GP_outputs_T    = cache['GP_outputs_T']
+    GP_outputs_P    = cache['GP_outputs_P']
+    GP_outputs_Terr = cache['GP_outputs_Terr']
+    GP_outputs_Perr = cache['GP_outputs_Perr']
+
+elif matching_files:
+    # ── Cache mismatch warning ────────────────────────────────
+    raise RuntimeError(
+        f'WARNING: A GP cache with different hyperparameters was found:\n'
+        f'  {matching_files}\n'
+        f'Delete it or update your hyperparameters to match.'
+    )
+
+else:
+    # ── Compute and cache GP outputs ───────────────────────────
+    print(f'  No cache found. Computing GP outputs and saving to:\n  {gp_cache_path}')
+    
+    # Initialize array to store NN inputs / GP outputs
+    GP_outputs_T = np.zeros(raw_outputs_T.shape, dtype=float)
+    GP_outputs_P = np.zeros(raw_outputs_P.shape, dtype=float)
+    GP_outputs_Terr = np.zeros(raw_outputs_T.shape, dtype=float)
+    GP_outputs_Perr = np.zeros(raw_outputs_P.shape, dtype=float)
+
+    for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
+
+        #Define ensemble without the query point
+        XTr = np.delete(
+                    raw_inputs.T,
+                    query_idx,
+                    axis=1
+                    )                           # (D, N)
+        
+        YTr = np.delete(
+            np.hstack([raw_outputs_T, raw_outputs_P]).T,   # shape: (2O, N)
+            query_idx,
+            axis=1
+            )                                   # (O, N)
+
+        Xens_j = jnp.array(XTr)
+        Yens_j = jnp.array(YTr)
+        VI_j   = jnp.linalg.inv(jnp.cov(Xens_j))
+
+        #Call the ens-CGP
+        Yh, Yh_err, it = ens_CGP(
+                    Xens_j, Yens_j,
+                    query_input,
+                    VI_j,
+                    N_neighbor,
+                )
+        
+        #Store outputs
+        GP_outputs_T[query_idx, :] = Yh[:O]
+        GP_outputs_Terr[query_idx, :] = Yh_err[:O]
+        GP_outputs_P[query_idx, :] = Yh[O:]
+        GP_outputs_Perr[query_idx, :] = Yh_err[O:]
+
+    # Save to cache so the loop is skipped next time
+    np.savez(
+        gp_cache_path,
+        GP_outputs_T=GP_outputs_T,
+        GP_outputs_P=GP_outputs_P,
+        GP_outputs_Terr=GP_outputs_Terr,
+        GP_outputs_Perr=GP_outputs_Perr,
+    )
+    print(f'  GP outputs cached to:\n  {gp_cache_path}')
+
+#Diagnostic plot
+if show_plot:
+    for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
+        #Plot TP profiles
+        # fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        fig, ax = plt.subplots(1, 1, figsize=(14, 4))
+        
+        #ax1 : prediction, truth and prediction errorbars in T
+        # ax.plot(query_output_P, query_output_T, '.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4)
+        # ax.fill_betweenx(GP_outputs_P[query_idx, :], GP_outputs_T[query_idx, :]-GP_outputs_Terr[query_idx, :], GP_outputs_T[query_idx, :]+GP_outputs_Terr[query_idx, :], color='green', zorder=2, alpha=0.2)
+        
+        #ax2 : prediction, truth and prediction errorbars in P
+        # ax2.errorbar(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :], yerr=GP_outputs_Perr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4, label='Prediction')
+        # ax2.fill_between(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :]-GP_outputs_Perr[query_idx, :], GP_outputs_P[query_idx, :]+GP_outputs_Perr[query_idx, :], color='green', zorder=2, alpha=0.2)
+
+        # for ax in [ax1, ax2]:
+
+        ax.plot(query_output_P, query_output_T, '.', linestyle='-', color='blue', linewidth=2, zorder=3, markersize=10)
+
+        ax.invert_xaxis()
+        
+        ax.set_xlabel(r'log$_{10}$ Pressure (bar)')
+        ax.set_ylabel('Temperature (K)')
+        
+        # ax.grid()
+        # ax.legend()        
+
+        plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Teff : {query_input[4]} K')
+        plt.subplots_adjust(wspace=0.2)
+        plt.show()
+
+# Targets are residuals: truth - GP prediction
+residuals_T = raw_outputs_T - GP_outputs_T   # (N, O)
+residuals_P = raw_outputs_P - GP_outputs_P   # (N, O)
+
+# Split training dataset into training, validation, and testing, and format it correctly
+
+## Retrieving indices of data partitions
+train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(N), data_partition, generator=partition_rng)
+
+## Generate the data partitions
+
+
+# --- Inputs ---
+# --- Initial inputs ---
+NN_train_inputs_phys = torch.tensor(raw_inputs[train_idx], dtype=torch.float32)
+NN_valid_inputs_phys = torch.tensor(raw_inputs[valid_idx], dtype=torch.float32)
+NN_test_inputs_phys  = torch.tensor(raw_inputs[test_idx],  dtype=torch.float32)
+
+# --- GP predictions ---
+NN_train_inputs_T = torch.tensor(GP_outputs_T[train_idx],    dtype=torch.float32)
+NN_train_inputs_P = torch.tensor(GP_outputs_P[train_idx],    dtype=torch.float32)
+NN_valid_inputs_T = torch.tensor(GP_outputs_T[valid_idx],    dtype=torch.float32)
+NN_valid_inputs_P = torch.tensor(GP_outputs_P[valid_idx],    dtype=torch.float32)
+NN_test_inputs_T  = torch.tensor(GP_outputs_T[test_idx],     dtype=torch.float32)
+NN_test_inputs_P  = torch.tensor(GP_outputs_P[test_idx],     dtype=torch.float32)
+
+# --- GP errors ---
+NN_train_inputs_Terr = torch.tensor(GP_outputs_Terr[train_idx], dtype=torch.float32)
+NN_train_inputs_Perr = torch.tensor(GP_outputs_Perr[train_idx], dtype=torch.float32)
+NN_valid_inputs_Terr = torch.tensor(GP_outputs_Terr[valid_idx], dtype=torch.float32)
+NN_valid_inputs_Perr = torch.tensor(GP_outputs_Perr[valid_idx], dtype=torch.float32)
+NN_test_inputs_Terr  = torch.tensor(GP_outputs_Terr[test_idx],  dtype=torch.float32)
+NN_test_inputs_Perr  = torch.tensor(GP_outputs_Perr[test_idx],  dtype=torch.float32)
+
+# --- Outputs ---
+# --- residuals ---
+NN_train_outputs_T = torch.tensor(residuals_T[train_idx], dtype=torch.float32)
+NN_train_outputs_P = torch.tensor(residuals_P[train_idx], dtype=torch.float32)
+NN_valid_outputs_T = torch.tensor(residuals_T[valid_idx], dtype=torch.float32)
+NN_valid_outputs_P = torch.tensor(residuals_P[valid_idx], dtype=torch.float32)
+NN_test_outputs_T  = torch.tensor(residuals_T[test_idx],  dtype=torch.float32)
+NN_test_outputs_P  = torch.tensor(residuals_P[test_idx],  dtype=torch.float32)
+
+# --- Plotting purposes: truth ---
+NN_test_true_T     = torch.tensor(raw_outputs_T[test_idx], dtype=torch.float32)
+NN_test_true_P     = torch.tensor(raw_outputs_P[test_idx], dtype=torch.float32)
+
+# --- Concatenate: [init | GP_T | GP_P | GP_Terr | GP_Perr] ---
+NN_train_inputs = torch.cat([NN_train_inputs_phys, NN_train_inputs_T, NN_train_inputs_P, NN_train_inputs_Terr, NN_train_inputs_Perr], dim=1)
+NN_valid_inputs = torch.cat([NN_valid_inputs_phys, NN_valid_inputs_T, NN_valid_inputs_P, NN_valid_inputs_Terr, NN_valid_inputs_Perr], dim=1)
+NN_test_inputs  = torch.cat([NN_test_inputs_phys,  NN_test_inputs_T,  NN_test_inputs_P,  NN_test_inputs_Terr,  NN_test_inputs_Perr],  dim=1)
+NN_train_outputs = torch.cat([NN_train_outputs_T, NN_train_outputs_P], dim=1)
+NN_valid_outputs = torch.cat([NN_valid_outputs_T, NN_valid_outputs_P], dim=1)
+NN_test_outputs  = torch.cat([NN_test_outputs_T,  NN_test_outputs_P],  dim=1)
+
+
+# Create DataModule
+data_module = CustomDataModule(
+    NN_train_inputs, NN_train_outputs,
+    NN_valid_inputs, NN_valid_outputs,
+    NN_test_inputs, NN_test_outputs,
+    batch_size, batch_rng
+)
+
+# Standard ELBO weighting: each minibatch sees the full KL term, scaled down so
+# that summed over one epoch it counts the model's KL divergence roughly once.
+n_train_batches = -(-len(train_idx) // batch_size)  # ceil division
+kl_weight = 1.0 / n_train_batches
+
+
+
+
+
+
+###################################
+#### Define optimization block ####
+###################################
+# PyTorch Lightning Module
+class RegressionModule(pl.LightningModule):
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0,
+                 reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0,
+                 lr_patience=10, lr_factor=0.5, lr_min=1e-7, kl_weight=0.0):
+        super().__init__()
+        self.model            = model
+        self.learning_rate    = learning_rate
+        self.reg_coeff_l1     = reg_coeff_l1
+        self.reg_coeff_l2     = reg_coeff_l2
+        self.smoothness_coeff = smoothness_coeff
+        self.weight_decay     = weight_decay
+        self.kl_weight        = kl_weight
+        self.loss_fn          = nn.MSELoss()
+        self.optimizer_class  = optimizer
+        self.lr_patience      = lr_patience
+        self.lr_factor        = lr_factor
+        self.lr_min           = lr_min
+    
+    def compute_weight_regularization(self):
+        """
+        Compute L1 and L2 regularization on model weights (parameters).
+        """
+        if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
+            return torch.tensor(0., device=self.device), torch.tensor(0., device=self.device)
+        
+        l1_penalty = torch.tensor(0., device=self.device)
+        l2_penalty = torch.tensor(0., device=self.device)
+        
+        for param in self.model.parameters():
+            if self.reg_coeff_l1 > 0:
+                l1_penalty += torch.sum(torch.abs(param))
+            if self.reg_coeff_l2 > 0:
+                l2_penalty += torch.sum(param ** 2)
+        
+        return self.reg_coeff_l1 * l1_penalty, self.reg_coeff_l2 * l2_penalty
+
+    def forward(self, x):
+        return self.model(x)
+    
+    def training_step(self, batch):
+        X, y = batch
+        if self.smoothness_coeff > 0:
+            X.requires_grad_(True)
+        pred = self(X)
+        
+        # Base loss: ||y - s||
+        mse = self.loss_fn(pred, y)
+        
+        # Add weight regularization (L1/L2 on network parameters)
+        l1_penalty, l2_penalty = self.compute_weight_regularization()
+        loss = mse + l1_penalty + l2_penalty
+
+        # ELBO: negative log-likelihood (approximated here by MSE) + weighted KL
+        # divergence between each Bayesian layer's posterior and its prior.
+        kl = get_kl_loss(self.model)
+        loss = loss + self.kl_weight * kl
+        self.log('train_kl', kl, on_step=True, on_epoch=True, prog_bar=False)
+
+        # Compute gradients for smoothness penalty
+        if self.smoothness_coeff > 0:
+            # Compute gradient of loss w.r.t. inputs
+            grad_loss = torch.autograd.grad(
+                outputs=mse,
+                inputs=X,
+                create_graph=True,
+                retain_graph=True,
+            )[0]
+            
+            # Penalize large input gradients (smoother decision boundaries)
+            smoothness_penalty = self.smoothness_coeff * torch.mean(grad_loss ** 2)
+            loss += smoothness_penalty
+
+        # Log metrics
+        self.log('train_mse', mse, on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        return loss
+    
+    def validation_step(self, batch):
+        X, y = batch
+        pred = self(X)
+        mse = self.loss_fn(pred, y)
+        kl = get_kl_loss(self.model)
+        loss = mse + self.kl_weight * kl
+
+        # Log metrics
+        self.log('valid_mse', mse, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('valid_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def test_step(self, batch):
+        X, y = batch
+        pred = self(X)
+        mse = self.loss_fn(pred, y)
+        kl = get_kl_loss(self.model)
+        loss = mse + self.kl_weight * kl
+
+        # Log metrics
+        self.log('test_mse', mse, on_step=False, on_epoch=True, prog_bar=False)
+        self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = self.optimizer_class(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+        scheduler = lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=self.lr_factor,
+            patience=self.lr_patience,
+            min_lr=self.lr_min,
+        ) 
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'valid_loss',   # ReduceLROnPlateau needs a metric to watch
+                'interval': 'epoch',
+                'frequency': 1,
+            }
+        }
+
+######################
+#### Run training ####
+######################
+# Create Lightning Module
+lightning_module = RegressionModule(
+    model=model,
+    optimizer=Adam,
+    learning_rate=lr_init,
+    reg_coeff_l1=regularization_coeff_l1,
+    reg_coeff_l2=regularization_coeff_l2,
+    weight_decay=weight_decay,
+    smoothness_coeff=smoothness_coeff,
+    lr_patience=lr_patience,
+    lr_factor=lr_factor,
+    lr_min=lr_min,
+    kl_weight=kl_weight,
+)
+
+# Setup logger
+logger = CSVLogger(model_save_path+'logs', name='NeuralNetwork')
+
+# Set all seeds for complete reproducibility
+pl.seed_everything(NN_seed, workers=True)
+
+#Define early stopping callback
+early_stopping = EarlyStopping(
+    monitor='valid_loss',
+    patience=early_stopping_patience,
+    mode='min',
+    verbose=True,
+)
+
+# Create Trainer and train
+trainer = Trainer(
+    max_epochs=n_epochs,
+    logger=logger,
+    deterministic=True,
+    enable_checkpointing=True,
+    callbacks=[
+        ModelCheckpoint(
+            dirpath=model_save_path,
+            save_top_k=1,
+            monitor='valid_loss',
+            mode='min',
+        ),
+        early_stopping,
+    ],
+    enable_progress_bar=True,
+)
+
+#Start time 
+t0 = time()
+
+if run_mode == 'use':
+    
+    # Try to resume from last checkpoint if it exists
+    last_ckpt = None
+    if os.path.exists(model_save_path + 'last.ckpt'):
+        last_ckpt = model_save_path + 'last.ckpt'
+    
+    trainer.fit(lightning_module, datamodule=data_module, ckpt_path=last_ckpt)
+
+    # Get the best checkpoint path from ModelCheckpoint callback
+    best_model_path = trainer.checkpoint_callback.best_model_path
+    print(f"Best model path: {best_model_path}")
+
+    # Save best path for later loading
+    with open(model_save_path + 'best_ckpt_path.txt', 'w') as f:
+        f.write(best_model_path)
+
+    finish_time_s = time() - t0
+    finish_time_min = finish_time_s/60
+    finish_time_hrs = finish_time_s/3600
+    finish_time_days = finish_time_s/(3600*24)
+    print(f"Done! In {finish_time_s:.3f} s/{finish_time_min:.3f} min/{finish_time_hrs:.3f} hrs/{finish_time_days:.3f} days")
+    
+else:
+    with open(model_save_path + 'best_ckpt_path.txt', 'r') as f:
+        best_ckpt_path = f.read().strip()
+
+    # Load model
+    lightning_module = RegressionModule.load_from_checkpoint(
+        best_ckpt_path,
+        model=model,
+        optimizer=Adam,
+        learning_rate=lr_init,
+        reg_coeff_l1=regularization_coeff_l1,
+        reg_coeff_l2=regularization_coeff_l2,
+        weight_decay=weight_decay,
+        smoothness_coeff=smoothness_coeff,
+        lr_patience=lr_patience,
+        lr_factor=lr_factor,
+        lr_min=lr_min,
+        kl_weight=kl_weight,
+
+    )
+    print("Model loaded!")
+
+model = lightning_module.model
+model.cpu()
+model.eval()
+
+#Testing model on test dataset
+if run_mode == 'use':trainer.test(lightning_module, datamodule=data_module)
+
+# --- Accessing Training History After Training ---
+# Find the version directory (e.g., version_0, version_1, etc.)
+log_dir = model_save_path+'logs/NeuralNetwork'
+versions = [d for d in os.listdir(log_dir) if d.startswith('version_')]
+latest_version = sorted(versions)[-1]  # Get the latest version
+csv_path = os.path.join(log_dir, latest_version, 'metrics.csv')
+
+# Read the metrics
+metrics_df = pd.read_csv(csv_path)
+
+# Extract losses per epoch
+train_losses = metrics_df[metrics_df['train_mse_epoch'].notna()]['train_mse_epoch'].tolist()
+eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
+
+
+
+
+
+
+
+##########################
+#### Diagnostic plots ####
+##########################
+# Loss curves
+fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios':[3, 1]}, figsize=(10, 6))
+
+# Calculate number of batches per epoch
+actual_epochs = len(eval_losses)  # one entry per epoch
+n_batches = len(train_losses) // actual_epochs  # batches per epoch
+n_batches = max(1, n_batches)     # safety guard
+
+# Create x-axis in terms of epochs (0 to n_epochs)
+x_all = np.linspace(0, actual_epochs, len(train_losses))
+x_epoch = np.arange(actual_epochs + 1)
+
+# Plot transparent background showing all batch losses
+ax1.plot(x_all, train_losses, alpha=0.3, color='C0', linewidth=0.5)
+ax1.plot(x_all, eval_losses, alpha=0.3, color='C1', linewidth=0.5)
+
+# Plot solid lines showing epoch-level losses (every n_batches steps)
+train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]
+eval_epoch  = [eval_losses[0]]  + eval_losses[n_batches-1::n_batches]
+ax1.plot(x_epoch, train_epoch, label="Train", color='C0', linewidth=2, marker='o')
+ax1.plot(x_epoch, eval_epoch, label="Validation", color='C1', linewidth=2, marker='o')
+
+# Same for difference plot
+diff_epoch  = np.abs(np.array(train_epoch) - np.array(eval_epoch))
+ax2.plot(x_epoch, diff_epoch, color='C2', linewidth=2, marker='o')
+
+ax1.set_yscale('log')
+ax2.set_yscale('log')
+ax2.set_xlabel("Epoch")
+ax1.set_ylabel("MSE Loss")
+ax2.set_ylabel("Loss Diff.")
+ax1.legend()
+ax1.grid()
+ax2.grid()
+plt.subplots_adjust(hspace=0)
+plt.savefig(plot_save_path+'/loss.pdf')
+plt.close()
+
+#Comparing GP predicted T-P profiles vs NN predicted T-P profiles vs true T-P profiles with residuals
+substep = 100
+
+# Get the scalers from data module
+out_scaler_T = data_module.out_scaler_T
+out_scaler_P = data_module.out_scaler_P
+
+#Converting tensors to numpy arrays if this isn't already done
+if (type(NN_test_outputs_T) != np.ndarray):
+    NN_test_outputs_T = NN_test_outputs_T.cpu().numpy()
+    NN_test_outputs_P = NN_test_outputs_P.cpu().numpy()
+
+# --- BNN predictive mean/std via Monte Carlo sampling ---
+# Every forward call resamples each layer's weights from its variational posterior
+# (dnn_to_bnn leaves this active regardless of model.eval()), so repeated calls on
+# the same (already-scaled) test inputs form a Monte Carlo estimate of the model's
+# epistemic (weight) uncertainty around the residual correction.
+n_test = data_module.test_inputs.shape[0]
+mc_preds = np.empty((mc_samples, n_test, 2*O), dtype=np.float32)
+with torch.no_grad():
+    for s in range(mc_samples):
+        mc_preds[s] = model(data_module.test_inputs).numpy()
+
+# Inverse-transform every MC sample back to physical residual units, then add the
+# (fixed) GP baseline before taking statistics across the MC dimension.
+mc_resid_T = out_scaler_T.inverse_transform(mc_preds[:, :, :O].reshape(-1, O)).reshape(mc_samples, n_test, O)
+mc_resid_P = out_scaler_P.inverse_transform(mc_preds[:, :, O:].reshape(-1, O)).reshape(mc_samples, n_test, O)
+mc_pred_T = NN_test_inputs_T.numpy()[None, :, :] + mc_resid_T   # (mc_samples, n_test, O)
+mc_pred_P = NN_test_inputs_P.numpy()[None, :, :] + mc_resid_P
+
+NN_pred_mean_T = mc_pred_T.mean(axis=0)   # (n_test, O)
+NN_pred_std_T  = mc_pred_T.std(axis=0)
+NN_pred_mean_P = mc_pred_P.mean(axis=0)
+NN_pred_std_P  = mc_pred_P.std(axis=0)
+
+GP_res_T = np.zeros(NN_test_outputs_P.shape, dtype=float)
+GP_res_P = np.zeros(NN_test_outputs_P.shape, dtype=float)
+NN_res_T = np.zeros(NN_test_outputs_P.shape, dtype=float)
+NN_res_P = np.zeros(NN_test_outputs_P.shape, dtype=float)
+
+for NN_test_idx, (NN_test_input, GP_test_output_T, GP_test_output_P,
+                  GP_pred_err_T, GP_pred_err_P,
+                  NN_pred_output_T, NN_pred_output_P,
+                  NN_pred_err_T, NN_pred_err_P,
+                  true_T, true_P) in enumerate(zip(
+    NN_test_inputs_phys,
+    NN_test_inputs_T,   NN_test_inputs_P,
+    NN_test_inputs_Terr, NN_test_inputs_Perr,
+    NN_pred_mean_T,      NN_pred_mean_P,
+    NN_pred_std_T,       NN_pred_std_P,
+    NN_test_true_T,     NN_test_true_P
+)):
+
+    #Convert to numpy
+    true_T_np = true_T.cpu().numpy()
+    true_P_np = true_P.cpu().numpy()
+    NN_test_input = NN_test_input.cpu().numpy()
+    GP_test_output_T = GP_test_output_T.numpy()
+    GP_test_output_P = GP_test_output_P.numpy()
+    GP_pred_err_T = GP_pred_err_T.numpy()
+    GP_pred_err_P = GP_pred_err_P.numpy()
+
+    #Storing residuals
+    GP_res_T[NN_test_idx, :] = GP_test_output_T - true_T_np
+    GP_res_P[NN_test_idx, :] = GP_test_output_P - true_P_np
+    NN_res_T[NN_test_idx, :] = NN_pred_output_T - true_T_np
+    NN_res_P[NN_test_idx, :] = NN_pred_output_P - true_P_np
+
+    #Plotting
+    if (NN_test_idx % substep == 0):
+        fig, axs = plt.subplot_mosaic([['res_pressure', '.'],
+                                       ['results', 'res_temperature']],
+                              figsize=(8, 6),
+                              width_ratios=(3, 1), height_ratios=(1, 3),
+                              layout='constrained')        
+        axs['results'].plot(true_T_np, true_P_np, '.', linestyle='-', color='blue', linewidth=2, label='Truth')
+        axs['results'].plot(NN_pred_output_T, NN_pred_output_P, color='green', linewidth=2, label='NN prediction')
+        axs['results'].plot(GP_test_output_T, GP_test_output_P, color='red', linewidth=2, label='GP prediction')
+        axs['results'].invert_yaxis()
+        axs['results'].set_ylabel(r'log$_{10}$ Pressure (bar)')
+        axs['results'].set_xlabel('Temperature (K)')
+        axs['results'].legend()
+        axs['results'].grid()
+
+        axs['res_temperature'].errorbar(NN_res_T[NN_test_idx, :], true_P_np, alpha=0.5, xerr=NN_pred_err_T, fmt='.', linestyle='-', color='green', linewidth=2, label='NN residuals')
+        axs['res_temperature'].plot(NN_res_T[NN_test_idx, :], true_P_np, '.', linestyle='-', color='green', linewidth=2, label='NN residuals')
+        axs['res_temperature'].errorbar(GP_res_T[NN_test_idx, :], true_P_np, alpha=0.5, xerr=GP_pred_err_T, fmt='.', linestyle='-', color='red', linewidth=2, label='GP residuals')
+        axs['res_temperature'].plot(GP_res_T[NN_test_idx, :], true_P_np, '.', linestyle='-', color='red', linewidth=2, label='GP residuals')
+        axs['res_temperature'].set_xlabel('Residuals (K)')
+        axs['res_temperature'].invert_yaxis()
+        axs['res_temperature'].grid()
+        axs['res_temperature'].axvline(0, color='black', linestyle='dashed', zorder=2)
+        axs['res_temperature'].yaxis.tick_right()
+        axs['res_temperature'].yaxis.set_label_position("right")
+        axs['res_temperature'].sharey(axs['results'])
+
+        axs['res_pressure'].errorbar(true_T_np, NN_res_P[NN_test_idx, :], alpha=0.5, yerr=NN_pred_err_P, fmt='.', linestyle='-', color='green', linewidth=2, label='NN residuals')
+        axs['res_pressure'].plot(true_T_np, NN_res_P[NN_test_idx, :], '.', linestyle='-', color='green', linewidth=2, label='NN residuals')
+        axs['res_pressure'].errorbar(true_T_np, GP_res_P[NN_test_idx, :], alpha=0.5, yerr=GP_pred_err_P, fmt='.', linestyle='-', color='red', linewidth=2, label='GP residuals')
+        axs['res_pressure'].plot(true_T_np, GP_res_P[NN_test_idx, :], '.', linestyle='-', color='red', linewidth=2, label='GP residuals')
+        axs['res_pressure'].set_ylabel('Residuals (bar)')
+        axs['res_pressure'].invert_yaxis()
+        axs['res_pressure'].grid()
+        axs['res_pressure'].axhline(0, color='black', linestyle='dashed', zorder=2)
+        axs['res_pressure'].xaxis.tick_top()
+        axs['res_pressure'].xaxis.set_label_position("top")
+        axs['res_pressure'].sharex(axs['results'])
+
+        plt.suptitle(rf'H$_2$ : {NN_test_input[0]} bar, CO$_2$ : {NN_test_input[1]} bar, LoD : {NN_test_input[2]:.0f} days, Obliquity : {NN_test_input[3]} deg, Teff : {NN_test_input[4]} K')
+        plt.savefig(plot_save_path+f'/pred_vs_actual_n.{NN_test_idx}.pdf')  
+        plt.close()
+
+
+#Plot residuals
+fig, ((ax1, ax3),(ax2,ax4)) = plt.subplots(2, 2, sharex=True, figsize=[12, 8])
+ax1.plot(GP_res_T.T, alpha=0.1, color='green')
+ax2.plot(GP_res_P.T, alpha=0.1, color='green')
+ax3.plot(NN_res_T.T, alpha=0.1, color='blue')
+ax4.plot(NN_res_P.T, alpha=0.1, color='blue')
+for ax in [ax1, ax2, ax3, ax4]:
+    ax.axhline(0, color='black', linestyle='dashed')
+    ax.grid()
+ax2.set_xlabel('Index')
+ax4.set_xlabel('Index')
+ax1.set_ylabel('Temperature')
+ax2.set_ylabel('log$_{10}$ Pressure (bar)')
+ax3.set_ylabel('Temperature')
+ax4.set_ylabel('log$_{10}$ Pressure (bar)')
+plt.subplots_adjust(hspace=0.1, bottom=0.25)
+
+# Add statistics text at the bottom
+stats_text = (
+    f"--- GP Residuals ---\n"
+    f"Temperature Residuals : Median = {np.median(GP_res_T):.2f} K, Std = {np.std(GP_res_T):.2f} K\n"
+    f"Pressure Residuals : Median = {np.median(GP_res_P):.2f} $log_{{10}}$ bar, Std = {np.std(GP_res_P):.2f} $log_{{10}}$ bar\n"
+    f"\n"
+    f"--- NN Residuals ---\n"
+    f"Temperature Residuals : Median = {np.median(NN_res_T):.2f} K, Std = {np.std(NN_res_T):.2f} K\n"
+    f"Pressure Residuals : Median = {np.median(NN_res_P):.3f} $log_{{10}}$ bar, Std = {np.std(NN_res_P):.2f} $log_{{10}}$ bar"
+)
+
+fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
+         verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+plt.savefig(plot_save_path+f'/res_GP_NN.pdf', bbox_inches='tight')
+plt.close()
