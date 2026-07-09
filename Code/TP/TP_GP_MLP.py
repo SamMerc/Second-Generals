@@ -35,7 +35,7 @@ torch.set_float32_matmul_precision('high')
 def check_and_make_dir(dir):
     if not os.path.isdir(dir):os.mkdir(dir)
 #Base directory 
-base_dir = '/home/merci228/WORK/2G_ML/'
+base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing temperature values
 raw_T_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_T.csv', delimiter=',')
 raw_T_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_T.csv', delimiter=',')
@@ -108,7 +108,7 @@ NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
 # Variable to show plots or not 
-show_plot = False
+show_plot = True
 
 #Neural network width and depth
 nn_width = 209
@@ -508,29 +508,30 @@ else:
 if show_plot:
     for query_idx, (query_input, query_output_T, query_output_P) in enumerate(zip(tqdm(raw_inputs), raw_outputs_T, raw_outputs_P)):
         #Plot TP profiles
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        # fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        fig, ax = plt.subplots(1, 1, figsize=(14, 4))
         
         #ax1 : prediction, truth and prediction errorbars in T
-        ax1.errorbar(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :], xerr=GP_outputs_Terr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4, label='Prediction')
-        ax1.fill_betweenx(GP_outputs_P[query_idx, :], GP_outputs_T[query_idx, :]-GP_outputs_Terr[query_idx, :], GP_outputs_T[query_idx, :]+GP_outputs_Terr[query_idx, :], color='green', zorder=2, alpha=0.2)
+        # ax.plot(query_output_P, query_output_T, '.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4)
+        # ax.fill_betweenx(GP_outputs_P[query_idx, :], GP_outputs_T[query_idx, :]-GP_outputs_Terr[query_idx, :], GP_outputs_T[query_idx, :]+GP_outputs_Terr[query_idx, :], color='green', zorder=2, alpha=0.2)
         
         #ax2 : prediction, truth and prediction errorbars in P
-        ax2.errorbar(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :], yerr=GP_outputs_Perr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4, label='Prediction')
-        ax2.fill_between(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :]-GP_outputs_Perr[query_idx, :], GP_outputs_P[query_idx, :]+GP_outputs_Perr[query_idx, :], color='green', zorder=2, alpha=0.2)
+        # ax2.errorbar(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :], yerr=GP_outputs_Perr[query_idx, :], fmt='.', linestyle='-', color='green', linewidth=2, markersize=10, zorder=2, alpha=0.4, label='Prediction')
+        # ax2.fill_between(GP_outputs_T[query_idx, :], GP_outputs_P[query_idx, :]-GP_outputs_Perr[query_idx, :], GP_outputs_P[query_idx, :]+GP_outputs_Perr[query_idx, :], color='green', zorder=2, alpha=0.2)
 
-        for ax in [ax1, ax2]:
+        # for ax in [ax1, ax2]:
 
-            ax.plot(query_output_T, query_output_P, '.', linestyle='-', color='blue', linewidth=2, zorder=3, markersize=10, label='Truth')
+        ax.plot(query_output_P, query_output_T, '.', linestyle='-', color='blue', linewidth=2, zorder=3, markersize=10)
 
-            ax.invert_yaxis()
-            
-            if ax == ax1 : ax.set_ylabel(r'log$_{10}$ Pressure (bar)')
-            ax.set_xlabel('Temperature (K)')
-            
-            ax.grid()
-            ax.legend()        
+        ax.invert_xaxis()
+        
+        ax.set_xlabel(r'log$_{10}$ Pressure (bar)')
+        ax.set_ylabel('Temperature (K)')
+        
+        # ax.grid()
+        # ax.legend()        
 
-        plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Teff : {query_input[4]} K, Number of iterations: {it}')
+        plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, Teff : {query_input[4]} K')
         plt.subplots_adjust(wspace=0.2)
         plt.show()
 

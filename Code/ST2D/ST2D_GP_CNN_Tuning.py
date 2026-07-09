@@ -1338,14 +1338,14 @@ elif run_mode == 'evaluate':
     ]
 
     cmap = sns.color_palette("rocket", as_cmap=True)
-    row_data = [NN_test_true, NN_test_inputs_pred, NN_pred, GP_res, NN_res]
+    row_data = [NN_test_true, NN_test_inputs_pred, NN_pred, GP_res, NN_res, NN_test_inputs_err]
 
     # ── Master figure ─────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(16, 18))
+    fig = plt.figure(figsize=(16, 22))
 
     master_gs = gridspec.GridSpec(
         2, 1, figure=fig,
-        height_ratios=(14, 6),
+        height_ratios=(18, 6),
         hspace=0.1,
         left=0.07, right=0.97, top=0.96, bottom=0.04
     )
@@ -1359,21 +1359,24 @@ elif run_mode == 'evaluate':
         wspace=0.20
     )
 
-    axs_heat  = np.empty((5, 3), dtype=object)
-    cbar_axes = np.empty((2, 3), dtype=object)
+    axs_heat       = np.empty((6, 3), dtype=object)
+    cbar_axes_temp = {}   # temperature: one per column, spans rows 0-2
+    cbar_axes_res  = {}   # residuals: one per column, spans rows 3-5
+    cbar_axes_unc  = {}   # uncertainty: individual per column, row 4 only
 
     for col in range(2):
         inner = gridspec.GridSpecFromSubplotSpec(
-            5, 2,
+            6, 3,
             subplot_spec=top_gs[col],
-            width_ratios=[20, 1],
+            width_ratios=[20, 1, 1],
             hspace=0.06,
             wspace=0.05,
         )
-        for row in range(5):
+        for row in range(6):
             axs_heat[row, col] = fig.add_subplot(inner[row, 0])
-        cbar_axes[0, col] = fig.add_subplot(inner[0:3, 1])   # spans rows 0–2
-        cbar_axes[1, col] = fig.add_subplot(inner[3:5, 1])   # spans rows 3–4
+        cbar_axes_temp[col] = fig.add_subplot(inner[0:3, 1])   # spans rows 0–2
+        cbar_axes_res[col]  = fig.add_subplot(inner[3:5, 1])   # spans rows 3–4
+        cbar_axes_unc[col]  = fig.add_subplot(inner[5, 2])     # row 5 only (uncertainty)
 
     for col, (idx, title) in enumerate(zip(idxs, titles)):
         # ── Column title with marker glyph embedded via annotate ─────────────────
@@ -1384,13 +1387,23 @@ elif run_mode == 'evaluate':
         )
         # Small marker drawn just above the title using fig.transFigure coords later
 
-        group1_data = np.concatenate([d[idx, :] for d in row_data[:3]])
+        def _to_np(x):
+            return x.detach().numpy() if hasattr(x, 'detach') else np.asarray(x)
+
+        group1_data = np.concatenate([_to_np(d[idx, :]) for d in row_data[:3]])
         vmin1, vmax1 = group1_data.min(), group1_data.max()
-        group2_data = np.concatenate([d[idx, :] for d in row_data[3:]])
+        group2_data = np.concatenate([_to_np(d[idx, :]) for d in row_data[3:5]])
         vmin2, vmax2 = group2_data.min(), group2_data.max()
+        unc_data = _to_np(row_data[5][idx, :])
+        vmin_unc, vmax_unc = unc_data.min(), unc_data.max()
 
         for row, data in enumerate(row_data):
-            vmin, vmax = (vmin1, vmax1) if row < 3 else (vmin2, vmax2)
+            if row < 3:
+                vmin, vmax = vmin1, vmax1
+            elif row == 5:
+                vmin, vmax = vmin_unc, vmax_unc
+            else:
+                vmin, vmax = vmin2, vmax2
             ax = axs_heat[row, col]
             sns.heatmap(
                 data[idx, :].reshape((IMG_H, IMG_W)),
@@ -1403,7 +1416,7 @@ elif run_mode == 'evaluate':
             else:
                 ax.set_yticks(np.linspace(0, IMG_H, 5))
                 ax.set_ylabel('')
-            if row == 4:
+            if row == 5:
                 ax.set_xticks(np.linspace(0, IMG_W, 5))
                 ax.set_xticklabels(np.linspace(-180, 180, 5).astype(int), rotation=0, fontsize=FS - 2)
                 ax.set_xlabel(r'Longitude ($\circ$)', fontsize=FS)
@@ -1411,11 +1424,15 @@ elif run_mode == 'evaluate':
                 ax.set_xticks([])
 
         sm1 = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=vmin1, vmax=vmax1))
-        cb1 = fig.colorbar(sm1, cax=cbar_axes[0, col])
-        sm2 = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=vmin2, vmax=vmax2))
-        cb2 = fig.colorbar(sm2, cax=cbar_axes[1, col])
+        cb1 = fig.colorbar(sm1, cax=cbar_axes_temp[col])
         cb1.set_label('Temperature (K)', fontsize=FS)
-        cb2.set_label('Temperature (K)', fontsize=FS)
+        sm2 = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=vmin2, vmax=vmax2))
+        cb2 = fig.colorbar(sm2, cax=cbar_axes_res[col])
+        cb2.set_label('Residual (K)', fontsize=FS)
+        sm_unc = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=vmin_unc, vmax=vmax_unc))
+        cb_unc = fig.colorbar(sm_unc, cax=cbar_axes_unc[col])
+        cb_unc.set_label('Uncertainty (K)', fontsize=FS - 2)
+        cb_unc.ax.tick_params(labelsize=FS - 4)
 
     # ─────────────────────────────────────────────────────────────────────────────
     # BOTTOM SECTION — Figure 3 (scatter, 1×2)
@@ -1451,21 +1468,6 @@ elif run_mode == 'evaluate':
             label=f"Ens-CGP+NN  R$^2$={r2_gpnn:.4f}  RMSE={rmse_gpnn:.4f}  ME={me_gpnn:.4f}" if test_elem == rp[0] else None
         )
 
-    # ── Best / Median / Worst markers on top (zorder=5) ──────────────────────────
-    marker_styles = [
-        (median_idx, 'median', 'x', 120),
-        (median_minus_1sigma_idx, 'sigma', 'o', 120),
-    ]
-    ax.scatter(
-            np.median(NN_test_inputs_pred[median_idx]), np.median(NN_test_true[median_idx]),
-            marker='x', c='black', zorder=5, s=120, linewidths=2,
-        )
-    
-    ax.scatter(
-            np.median(NN_test_inputs_pred[median_minus_1sigma_idx]), np.median(NN_test_true[median_minus_1sigma_idx]),
-            marker='o', facecolors='none', edgecolors='black', zorder=5, s=120, linewidths=2,
-        )
-
     # ── Axis formatting ───────────────────────────────────────────────────────────
     ax.set_xlim(min(min(NN_pred[rp[::10]].flatten()),min(NN_test_inputs_pred[rp[::10]].flatten())), max(max(NN_pred[rp[::10]].flatten()),max(NN_test_inputs_pred[rp[::10]].flatten())))
     ax.set_ylim(min(NN_test_true[rp[::10]].flatten()),        max(NN_test_true[rp[::10]].flatten()))
@@ -1475,7 +1477,7 @@ elif run_mode == 'evaluate':
     ax.legend(fontsize=10, loc='lower left')
 
     # ── Row labels ────────────────────────────────────────────────────────────────
-    row_labels = ['Truth', 'Ens-CGP', 'Ens-CGP + NN', 'Ens-CGP Res.', 'Ens-CGP + NN Res.']
+    row_labels = ['Truth', 'Ens-CGP', 'Ens-CGP + NN', 'Ens-CGP Res.', 'Ens-CGP + NN Res.', 'Ens-CGP Unc.']
 
     fig.canvas.draw()  # needed so get_position() returns correct bounding boxes
 

@@ -38,7 +38,7 @@ def check_and_make_dir(dir):
     if not os.path.isdir(dir): os.mkdir(dir)
 
 # Base directory
-base_dir = '/home/merci228/WORK/2G_ML/'
+base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 
 # File containing surface temperature map
 raw_data3000 = np.loadtxt(base_dir + 'Data/bt-3000k/training_data_ST2D.csv', delimiter=',')
@@ -108,7 +108,7 @@ NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
 # Variable to show plots or not 
-show_plot = False
+show_plot = True
 
 # CNN architecture
 cnn_hidden_channels = 64   # number of feature maps in residual blocks
@@ -506,38 +506,40 @@ else:
 
 # Diagnostic plot
 if show_plot:
-    plot_query_output = query_output.reshape((IMG_H, IMG_W))
-    plot_model_output = Yh.reshape((IMG_H, IMG_W))
-    plot_error_output = err_Yh.reshape((IMG_H, IMG_W))
+    for query_idx, (query_input, query_output, Yh, err_Yh) in enumerate(zip(tqdm(raw_inputs), raw_outputs, GP_outputs, GP_outputs_err)):
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True, layout='constrained')
-    vmin = np.min(query_output)
-    vmax = np.max(query_output)
+        plot_query_output = query_output.reshape((IMG_H, IMG_W))
+        plot_model_output = Yh.reshape((IMG_H, IMG_W))
+        plot_error_output = err_Yh.reshape((IMG_H, IMG_W))
 
-    ax1.set_title('Data')
-    hm1 = sns.heatmap(plot_query_output, ax=ax1)
-    cbar = hm1.collections[0].colorbar
-    cbar.set_label('Temperature (K)')
-    ax2.set_title('Model')
-    hm2 = sns.heatmap(plot_model_output, ax=ax2)
-    cbar = hm2.collections[0].colorbar
-    cbar.set_label('Temperature (K)')
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True, layout='constrained')
+        vmin = np.min(query_output)
+        vmax = np.max(query_output)
 
-    ax2.set_xticks(np.linspace(0, IMG_W, 5))
-    ax2.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
-    ax2.set_xlabel('Longitude (degrees)')
+        ax1.set_title('Data')
+        hm1 = sns.heatmap(plot_query_output, ax=ax1)
+        cbar = hm1.collections[0].colorbar
+        cbar.set_label('Temperature (K)')
+        ax2.set_title('Model')
+        hm2 = sns.heatmap(plot_model_output, ax=ax2)
+        cbar = hm2.collections[0].colorbar
+        cbar.set_label('Temperature (K)')
 
-    for ax in [ax1, ax2]:
-        ax.set_yticks(np.linspace(0, IMG_H, 5))
-        ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
-        ax.set_ylabel('Latitude (degrees)')
+        ax2.set_xticks(np.linspace(0, IMG_W, 5))
+        ax2.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
+        ax2.set_xlabel('Longitude (degrees)')
 
-    plt.suptitle(
-        rf'H$_2$O : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, '
-        rf'LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, '
-        rf'Teff : {query_input[4]} K, Number of iterations: {it}'
-    )
-    plt.show()
+        for ax in [ax1, ax2]:
+            ax.set_yticks(np.linspace(0, IMG_H, 5))
+            ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
+            ax.set_ylabel('Latitude (degrees)')
+
+        plt.suptitle(
+            rf'H$_2$O : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, '
+            rf'LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg, '
+            rf'Teff : {query_input[4]} K'
+        )
+        plt.show()
 
 
 # ── Targets are residuals: truth − GP prediction ─────────────────────────────

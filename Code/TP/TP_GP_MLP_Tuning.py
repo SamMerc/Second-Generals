@@ -1313,21 +1313,9 @@ elif run_mode == 'evaluate':
                 np.linspace(-10, 10, 100),
                 'k--', zorder=3)
     
-    ax_P.scatter(np.median(NN_pred_P[median_idx]), np.median(NN_test_true_P[median_idx]),
-            marker='x', c='black', zorder=3, s=100, linewidths=2)
-    
-    ax_P.scatter(np.median(NN_pred_P[median_minus_1sigma_idx]), np.median(NN_test_true_P[median_minus_1sigma_idx]),
-            marker='o', zorder=3, s=100, linewidths=2, facecolors='none', edgecolors='black')
-    
     ax_T.plot(np.linspace(-3000, 3000, 100),
                 np.linspace(-3000, 3000, 100),
                 'k--', zorder=3, label='Perfect prediction - 1:1 line')
-    
-    ax_T.scatter(np.median(NN_pred_T[median_idx]), np.median(NN_test_true_T[median_idx]),
-            marker='x', c='black', zorder=3, s=100, linewidths=2)
-            
-    ax_T.scatter(np.median(NN_pred_T[median_minus_1sigma_idx]), np.median(NN_test_true_T[median_minus_1sigma_idx]),
-            marker='o', zorder=3, s=100, linewidths=2, facecolors='none', edgecolors='black')
     
     for test_elem in range(n_test):
         r2_gp,   rmse_gp,   me_gp   = compute_stats(NN_test_true_T.numpy(), NN_test_inputs_T.numpy())
