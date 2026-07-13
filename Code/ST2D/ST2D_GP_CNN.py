@@ -108,7 +108,7 @@ NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
 # Variable to show plots or not 
-show_plot = True
+show_plot = False
 
 # CNN architecture
 cnn_hidden_channels = 64   # number of feature maps in residual blocks
@@ -512,7 +512,7 @@ if show_plot:
         plot_model_output = Yh.reshape((IMG_H, IMG_W))
         plot_error_output = err_Yh.reshape((IMG_H, IMG_W))
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True, layout='constrained')
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 12), sharex=True, layout='constrained')
         vmin = np.min(query_output)
         vmax = np.max(query_output)
 
@@ -524,12 +524,16 @@ if show_plot:
         hm2 = sns.heatmap(plot_model_output, ax=ax2)
         cbar = hm2.collections[0].colorbar
         cbar.set_label('Temperature (K)')
+        ax3.set_title('GP Uncertainty')
+        hm3 = sns.heatmap(plot_error_output, ax=ax3)
+        cbar = hm3.collections[0].colorbar
+        cbar.set_label('Uncertainty (K)')
 
-        ax2.set_xticks(np.linspace(0, IMG_W, 5))
-        ax2.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
-        ax2.set_xlabel('Longitude (degrees)')
+        ax3.set_xticks(np.linspace(0, IMG_W, 5))
+        ax3.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
+        ax3.set_xlabel('Longitude (degrees)')
 
-        for ax in [ax1, ax2]:
+        for ax in [ax1, ax2, ax3]:
             ax.set_yticks(np.linspace(0, IMG_H, 5))
             ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
             ax.set_ylabel('Latitude (degrees)')
@@ -592,7 +596,7 @@ data_module = CNNDataModule(
 #### Define optimization block ####
 ###################################
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0,
+    def __init__(self, model, optimizer, learning_rate, out_scaler, weight_decay=0.0,
                  reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0,
                  lr_patience=10, lr_factor=0.5, lr_min=1e-7):
         super().__init__()
@@ -607,6 +611,24 @@ class RegressionModule(pl.LightningModule):
         self.lr_patience      = lr_patience
         self.lr_factor        = lr_factor
         self.lr_min           = lr_min
+
+        # ── Spherical grid spacing for the smoothness penalty ─────────────────
+        # Data comes straight from ExoCAM/CESM NetCDF output (see
+        # Misc/gen_training_ST2D.py — variable 'TS' reshaped to 46x72), which
+        # is CESM's FV dycore grid: a *vertex* grid where row 0 / row IMG_H-1
+        # sit exactly at the poles (-90/+90). cos(lat) is therefore exactly 0
+        # at those rows — handled by excluding pole rows from the longitude
+        # term below (longitude/meridian is undefined at a pole point anyway).
+        self.dlat_rad = np.deg2rad(180.0 / (IMG_H - 1))
+        self.dlon_rad = np.deg2rad(360.0 / IMG_W)
+        lat_deg = torch.linspace(-90.0, 90.0, IMG_H)
+        cos_lat = torch.cos(torch.deg2rad(lat_deg)).clamp(min=0.0)
+        self.register_buffer('cos_lat', cos_lat.view(1, 1, IMG_H, 1))
+
+        # Register scaling properties to un-scale prediction before computing the smoothness penalty.
+        # This is important because the smoothness penalty is computed in physical units (K) and not in scaled units.
+        self.register_buffer('out_mean',  torch.tensor(out_scaler.mean_,  dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
+        self.register_buffer('out_scale', torch.tensor(out_scaler.scale_, dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
 
     def compute_weight_regularization(self):
         if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
@@ -628,10 +650,7 @@ class RegressionModule(pl.LightningModule):
 
     def training_step(self, batch):
         X, y = batch
-        if self.smoothness_coeff > 0:
-            X.requires_grad_(True)
         pred = self(X)
-
         # Base loss
         mse = self.loss_fn(pred, y)
 
@@ -639,16 +658,42 @@ class RegressionModule(pl.LightningModule):
         l1_penalty, l2_penalty = self.compute_weight_regularization()
         loss = mse + l1_penalty + l2_penalty
 
-        # Smoothness penalty
+        # Smoothness penalty: discretized Dirichlet energy on the sphere,
+        # ∫‖∇T‖² dA, over the predicted map — pred is (batch, 1, H, W).
+        # Longitude is periodic (-180 wraps to +180) via torch.roll, and its
+        # gradient is scaled by 1/cos(lat) since meridians converge toward the
+        # poles (arc length shrinks there). Longitude is undefined exactly at
+        # the poles, so that term excludes the pole rows entirely.
         if self.smoothness_coeff > 0:
-            grad_loss = torch.autograd.grad(
-                outputs=mse,
-                inputs=X,
-                create_graph=True,
-                retain_graph=True,
-            )[0]
-            smoothness_penalty = self.smoothness_coeff * torch.mean(grad_loss ** 2)
+            #Switch back to physical units for the smoothness penalty, since the scaling is not uniform across the map
+            pred_phys = pred * self.out_scale + self.out_mean
+
+            dpred_dlat = (pred_phys[:, :, 1:, :] - pred_phys[:, :, :-1, :]) / self.dlat_rad
+
+            pred_interior    = pred_phys[:, :, 1:-1, :]
+            cos_lat_interior = self.cos_lat[:, :, 1:-1, :]
+            dpred_dlon = (
+                torch.roll(pred_interior, shifts=-1, dims=3) - pred_interior
+            ) / (self.dlon_rad * cos_lat_interior)
+
+            # Area element dA ∝ cos(lat) dlat dlon: weight each squared
+            # gradient by cos(lat) (same row used for the gradient scaling and
+            # the area weight — no lat-staggering correction) and take an
+            # area-weighted mean instead of a plain pixel mean. For the
+            # longitude term this cancels one power of the 1/cos² above,
+            # leaving the correct net 1/cos(lat) weighting.
+            lat_weight = 0.5 * (self.cos_lat[:, :, :-1, :] + self.cos_lat[:, :, 1:, :])
+            lat_energy = lat_weight * dpred_dlat ** 2
+            lon_energy = cos_lat_interior * dpred_dlon ** 2
+
+            lat_term = lat_energy.sum() / lat_weight.expand_as(dpred_dlat).sum()
+            lon_term = lon_energy.sum() / cos_lat_interior.expand_as(dpred_dlon).sum()
+
+            smoothness_penalty = self.smoothness_coeff * (lat_term + lon_term)
             loss += smoothness_penalty
+
+            #Log smoothness penalty separately for monitoring
+            self.log('train_smoothness', smoothness_penalty, on_step=True, on_epoch=True, prog_bar=True)
 
         self.log('train_mse',  mse,  on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -699,6 +744,7 @@ lightning_module = RegressionModule(
     model=model,
     optimizer=Adam,
     learning_rate=lr_init,
+    out_scaler=data_module.out_scaler,
     reg_coeff_l1=regularization_coeff_l1,
     reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay,
@@ -769,6 +815,7 @@ else:
         model=model,
         optimizer=Adam,
         learning_rate=lr_init,
+        out_scaler=data_module.out_scaler,
         reg_coeff_l1=regularization_coeff_l1,
         reg_coeff_l2=regularization_coeff_l2,
         weight_decay=weight_decay,
@@ -797,14 +844,23 @@ metrics_df = pd.read_csv(csv_path)
 train_losses = metrics_df[metrics_df['train_mse_epoch'].notna()]['train_mse_epoch'].tolist()
 eval_losses  = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
 
+# Smoothness penalty is only logged when smoothness_coeff > 0 (see training_step)
+plot_smoothness = smoothness_coeff > 0 and 'train_smoothness_epoch' in metrics_df.columns
+if plot_smoothness:
+    smoothness_losses = metrics_df[metrics_df['train_smoothness_epoch'].notna()]['train_smoothness_epoch'].tolist()
+
 
 ##########################
 #### Diagnostic plots ####
 ##########################
 # ── Loss curves ───────────────────────────────────────────────────────────────
-fig, (ax1, ax2) = plt.subplots(
-    2, 1, sharex=True, gridspec_kw={'height_ratios': [3, 1]}, figsize=(10, 6)
+n_rows        = 3 if plot_smoothness else 2
+height_ratios = [3, 1, 1] if plot_smoothness else [3, 1]
+fig, axes = plt.subplots(
+    n_rows, 1, sharex=True, gridspec_kw={'height_ratios': height_ratios},
+    figsize=(10, 8 if plot_smoothness else 6)
 )
+ax1, ax2 = axes[0], axes[1]
 
 actual_epochs = len(eval_losses)
 n_batches = len(train_losses) // actual_epochs
@@ -826,12 +882,25 @@ ax2.plot(x_epoch, diff_epoch, color='C2', linewidth=2, marker='o')
 
 ax1.set_yscale('log')
 ax2.set_yscale('log')
-ax2.set_xlabel("Epoch")
 ax1.set_ylabel("MSE Loss")
 ax2.set_ylabel("Loss Diff.")
 ax1.legend()
 ax1.grid()
 ax2.grid()
+
+if plot_smoothness:
+    ax3 = axes[2]
+    smoothness_epoch = [smoothness_losses[0]] + smoothness_losses[n_batches - 1::n_batches]
+    ax3.plot(x_all, smoothness_losses, alpha=0.3, color='C3', linewidth=0.5)
+    ax3.plot(x_epoch, smoothness_epoch, label="Smoothness Penalty", color='C3', linewidth=2, marker='o')
+    ax3.set_yscale('log')
+    ax3.set_ylabel("Smoothness\nPenalty")
+    ax3.legend()
+    ax3.grid()
+    ax3.set_xlabel("Epoch")
+else:
+    ax2.set_xlabel("Epoch")
+
 plt.subplots_adjust(hspace=0)
 plt.savefig(plot_save_path + '/loss.pdf')
 plt.close()
@@ -906,9 +975,10 @@ for NN_test_idx, (NN_test_input, GP_test_output, GP_test_err,
         plot_gp_pred     = GP_test_output.numpy().reshape((IMG_H, IMG_W))
         plot_res_GP      = GP_res[NN_test_idx, :].reshape((IMG_H, IMG_W))
         plot_res_CNN     = NN_res[NN_test_idx, :].reshape((IMG_H, IMG_W))
+        plot_gp_err      = GP_test_err.numpy().reshape((IMG_H, IMG_W))
 
-        fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(
-            5, 1, figsize=(8, 12), sharex=True, layout='constrained'
+        fig, (ax1, ax2, ax3, ax4, ax5, ax6) = plt.subplots(
+            6, 1, figsize=(8, 14), sharex=True, layout='constrained'
         )
 
         ax1.set_title('Data')
@@ -931,11 +1001,15 @@ for NN_test_idx, (NN_test_input, GP_test_output, GP_test_err,
         hm5 = sns.heatmap(plot_res_CNN, ax=ax5)
         hm5.collections[0].colorbar.set_label('Temperature (K)')
 
-        ax5.set_xticks(np.linspace(0, IMG_W, 5))
-        ax5.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
-        ax5.set_xlabel('Longitude (degrees)')
+        ax6.set_title('GP Uncertainty')
+        hm6 = sns.heatmap(plot_gp_err, ax=ax6)
+        hm6.collections[0].colorbar.set_label('Uncertainty (K)')
 
-        for ax in [ax1, ax2, ax3, ax4, ax5]:
+        ax6.set_xticks(np.linspace(0, IMG_W, 5))
+        ax6.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
+        ax6.set_xlabel('Longitude (degrees)')
+
+        for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
             ax.set_yticks(np.linspace(0, IMG_H, 5))
             ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
             ax.set_ylabel('Latitude (degrees)')
