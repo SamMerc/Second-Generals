@@ -679,7 +679,11 @@ class RegressionModule(pl.LightningModule):
         # poles (arc length shrinks there). Longitude is undefined exactly at
         # the poles, so that term excludes the pole rows entirely.
         smoothness_coeff = self.current_smoothness_coeff()
-        if smoothness_coeff > 0:
+        # Gate on the warmup *target*, not the ramped value — the ramped
+        # value is legitimately 0 during epoch 0, but we still need to
+        # compute/log the (unweighted-by-zero) penalty every epoch so
+        # train_smoothness_epoch stays aligned with train_mse_epoch for plotting.
+        if self.smoothness_coeff_max > 0:
             #Switch back to physical units for the smoothness penalty, since the scaling is not uniform across the map
             pred_phys = pred * self.out_scale + self.out_mean
 
