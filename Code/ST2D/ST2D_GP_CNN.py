@@ -116,14 +116,15 @@ cnn_depth = 7             # number of residual conv blocks
 
 # Optimizer learning rate schedule - ReduceLROnPlateau
 lr_init      = 1e-3   # initial LR — ReduceLROnPlateau will reduce from here
-lr_patience  = 50     # epochs to wait before reducing LR
+lr_patience  = 15     # epochs to wait before reducing LR
 lr_factor    = 0.7    # multiply LR by this when plateauing
 lr_min       = 1e-7   # floor
 
 # Regularization
 regularization_coeff_l1 = 0.0
 regularization_coeff_l2 = 5e-5
-smoothness_coeff = 1e-1
+smoothness_coeff = 1e-3          # target coefficient once warmup is complete
+smoothness_warmup_epochs = 20    # linearly ramp smoothness_coeff from 0 over this many epochs
 weight_decay = 0.0
 
 # Training
@@ -598,13 +599,20 @@ data_module = CNNDataModule(
 class RegressionModule(pl.LightningModule):
     def __init__(self, model, optimizer, learning_rate, out_scaler, weight_decay=0.0,
                  reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0,
+                 smoothness_warmup_epochs=0,
                  lr_patience=10, lr_factor=0.5, lr_min=1e-7):
         super().__init__()
         self.model            = model
         self.learning_rate    = learning_rate
         self.reg_coeff_l1     = reg_coeff_l1
         self.reg_coeff_l2     = reg_coeff_l2
-        self.smoothness_coeff = smoothness_coeff
+        # smoothness_coeff is the *target* value reached after warmup; the
+        # penalty is ramped up from 0 linearly over smoothness_warmup_epochs
+        # so the network fits the residual signal before being regularized
+        # toward smoothness (otherwise the penalty dominates the MSE term
+        # from epoch 0 and the network collapses to a flat/near-zero output).
+        self.smoothness_coeff_max     = smoothness_coeff
+        self.smoothness_warmup_epochs = smoothness_warmup_epochs
         self.weight_decay     = weight_decay
         self.loss_fn          = nn.MSELoss()
         self.optimizer_class  = optimizer
@@ -629,6 +637,12 @@ class RegressionModule(pl.LightningModule):
         # This is important because the smoothness penalty is computed in physical units (K) and not in scaled units.
         self.register_buffer('out_mean',  torch.tensor(out_scaler.mean_,  dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
         self.register_buffer('out_scale', torch.tensor(out_scaler.scale_, dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
+
+    def current_smoothness_coeff(self):
+        if self.smoothness_warmup_epochs <= 0:
+            return self.smoothness_coeff_max
+        ramp = min(1.0, self.current_epoch / self.smoothness_warmup_epochs)
+        return self.smoothness_coeff_max * ramp
 
     def compute_weight_regularization(self):
         if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
@@ -664,7 +678,8 @@ class RegressionModule(pl.LightningModule):
         # gradient is scaled by 1/cos(lat) since meridians converge toward the
         # poles (arc length shrinks there). Longitude is undefined exactly at
         # the poles, so that term excludes the pole rows entirely.
-        if self.smoothness_coeff > 0:
+        smoothness_coeff = self.current_smoothness_coeff()
+        if smoothness_coeff > 0:
             #Switch back to physical units for the smoothness penalty, since the scaling is not uniform across the map
             pred_phys = pred * self.out_scale + self.out_mean
 
@@ -689,11 +704,12 @@ class RegressionModule(pl.LightningModule):
             lat_term = lat_energy.sum() / lat_weight.expand_as(dpred_dlat).sum()
             lon_term = lon_energy.sum() / cos_lat_interior.expand_as(dpred_dlon).sum()
 
-            smoothness_penalty = self.smoothness_coeff * (lat_term + lon_term)
+            smoothness_penalty = smoothness_coeff * (lat_term + lon_term)
             loss += smoothness_penalty
 
-            #Log smoothness penalty separately for monitoring
+            #Log smoothness penalty and its current (ramping) coefficient separately for monitoring
             self.log('train_smoothness', smoothness_penalty, on_step=True, on_epoch=True, prog_bar=True)
+            self.log('smoothness_coeff', smoothness_coeff, on_step=False, on_epoch=True, prog_bar=False)
 
         self.log('train_mse',  mse,  on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -749,6 +765,7 @@ lightning_module = RegressionModule(
     reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay,
     smoothness_coeff=smoothness_coeff,
+    smoothness_warmup_epochs=smoothness_warmup_epochs,
     lr_patience=lr_patience,
     lr_factor=lr_factor,
     lr_min=lr_min,
@@ -820,6 +837,7 @@ else:
         reg_coeff_l2=regularization_coeff_l2,
         weight_decay=weight_decay,
         smoothness_coeff=smoothness_coeff,
+        smoothness_warmup_epochs=smoothness_warmup_epochs,
         lr_patience=lr_patience,
         lr_factor=lr_factor,
         lr_min=lr_min,
