@@ -68,8 +68,8 @@ INPUT_LABELS = [
     r'T$_{eff}$ (K)',
 ]
 
-plot_1 = True
-plot_2 = False
+plot_1 = False
+plot_2 = True
 
 ############################################################
 #### Plot curves, covariance matrices and eigenspectrum ####
@@ -274,7 +274,7 @@ if plot_2:
                             axis=1
                             )
 
-            Yh, err_Yh = ens_CGP(
+            Yh, err_Yh, _ = ens_CGP(
                                 jnp.array(XTr),
                                 jnp.array(YTr),
                                 query_input, 
@@ -284,71 +284,23 @@ if plot_2:
             guess_ST2D[query_idx, :] = Yh
             guess_ST2Derr[query_idx, :] = err_Yh
 
-            #Diagnostic plot
-            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 8), sharex=True, layout='constrained')        
-            
-            # Compute global vmin/vmax across all datasets
-            # vmin = np.min(NN_test_output)
-            # vmax = np.max(NN_test_output)
-            
-            # Plot heatmaps
-            ax1.set_title('Data')
-            hm1 = sns.heatmap(query_output.reshape((46,72)), ax=ax1)#, cbar=False, vmin=vmin, vmax=vmax)
-            cbar = hm1.collections[0].colorbar
-            cbar.set_label('Temperature (K)')
-            ax2.set_title('GP Model')
-            hm2 = sns.heatmap(guess_ST2D[query_idx, :].reshape((46,72)), ax=ax2)#, cbar=False, vmin=vmin, vmax=vmax)
-            cbar = hm2.collections[0].colorbar
-            cbar.set_label('Temperature (K)')
-            ax3.set_title('NN Model')
-            hm3 = sns.heatmap(query_output.reshape((46,72)) - guess_ST2D[query_idx, :].reshape((46,72)), ax=ax3)#, cbar=False, vmin=vmin, vmax=vmax)
-            cbar = hm3.collections[0].colorbar
-            cbar.set_label('Temperature (K)')
-
-            # Shared colorbar (use the last heatmap's mappable)
-            # cbar = fig.colorbar(hm3.get_children()[0], ax=[ax1, ax2, ax3], location='right')
-            # cbar.set_label("Temperature")
-            # Fix longitude ticks
-            ax3.set_xticks(np.linspace(0, 72, 5))
-            ax3.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
-            ax3.set_xlabel('Longitude (degrees)')
-            # Fix latitude ticks
-            for ax in [ax1, ax2, ax3]:
-                ax.set_yticks(np.linspace(0, 46, 5))
-                ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
-                ax.set_ylabel('Latitude (degrees)')
-            plt.suptitle(rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg')
-            plt.show()
-
-    #     #Compute bias and variance for T and P predictions
-    #     bias_T[NNidx] = np.mean(guess_T - raw_outputs_T)
-    #     bias_P[NNidx] = np.mean(guess_P - raw_outputs_P)
-
-    #     var_T[NNidx] = np.mean(guess_Terr**2) #Use the predicted errorbars as a proxy for variance
-    #     var_P[NNidx] = np.mean(guess_Perr**2)
-
-    #     MSE_T[NNidx] = bias_T[NNidx]**2 + var_T[NNidx]
-    #     MSE_P[NNidx] = bias_P[NNidx]**2 + var_P[NNidx]
+        bias = np.mean(guess_ST2D - raw_outputs)
+        var = np.mean(guess_ST2Derr**2)
+        MSE = bias**2 + var
 
     # #Plot bias and variance as a function of N_neighbors
-    # fig, ax = plt.subplots(3, 2, figsize=(8, 6))
-    # ax[0,0].plot(N_neigbors, bias_T, label='Bias T', color='blue')
-    # ax[0,1].plot(N_neigbors, bias_P, label='Bias P', color='orange')
-    # ax[1,0].plot(N_neigbors, var_T, label='Variance T', color='blue', linestyle='--')
-    # ax[1,1].plot(N_neigbors, var_P, label='Variance P', color='orange', linestyle='--')
-    # ax[2,0].plot(N_neigbors, MSE_T, label='MSE T', color='blue')
-    # ax[2,1].plot(N_neigbors, MSE_P, label='MSE P', color='orange')
-    # ax[0,0].set_xlabel('Number of Neighbors')
-    # ax[0,1].set_xlabel('Number of Neighbors')
-    # ax[1,0].set_ylabel('Bias / Variance')
-    # ax[1,1].set_ylabel('Bias / Variance')
-    # ax[0,0].set_title('Bias T')
-    # ax[0,1].set_title('Bias P')
-    # ax[1,0].set_title('Variance T')
-    # ax[1,1].set_title('Variance P')
-    # ax[0,0].legend()
-    # ax[0,1].legend()
-    # ax[1,0].legend()
-    # ax[1,1].legend()
-    # plt.savefig(plot_save_path + 'Bias_Variance.pdf')
-    # plt.show()
+    fig, ax = plt.subplots(3, 1, figsize=(8, 6))
+    ax[0].plot(N_neigbors, bias, label='Bias STD2D', color='orange')
+    ax[1].plot(N_neigbors, var, label='Variance STD2D', color='orange', linestyle='--')
+    ax[2].plot(N_neigbors, MSE, label='MSE STD2D', color='orange')
+    ax[0].set_xlabel('Number of Neighbors')
+    ax[1].set_xlabel('Number of Neighbors')
+    ax[2].set_xlabel('Number of Neighbors')
+    ax[0].set_ylabel('Bias')
+    ax[1].set_ylabel('Variance')
+    ax[2].set_ylabel('MSE')
+    ax[0].legend()
+    ax[1].legend()
+    ax[2].legend()
+    plt.savefig(plot_save_path + 'Bias_Variance.pdf')
+    plt.show()
