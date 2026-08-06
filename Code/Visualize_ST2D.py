@@ -1,10 +1,14 @@
 #############################
 #### Importing libraries ####
 #############################
+import os
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 import numpy as np
 import matplotlib.pyplot as plt
-import os
+import torch
 from tqdm import tqdm
 import seaborn as sns
 import matplotlib.cm as cm
@@ -12,6 +16,7 @@ import matplotlib.colors as mcolors
 import jax.numpy as jnp
 from jax import jit, vmap
 from functools import partial
+torch.set_float32_matmul_precision('high')
 
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
@@ -59,6 +64,12 @@ show_plot = True
 
 #Number of nearest neighbors to choose
 N_neigbors = np.linspace(5, 200, 5, dtype=int).tolist()
+
+#Defining the device
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+num_threads = 96
+torch.set_num_threads(num_threads)
+print(f"Using {device} device with {num_threads} threads")
 
 INPUT_LABELS = [
     r'H$_2$ Pressure (bar)',
@@ -159,14 +170,12 @@ def _mahal_knn_single(X_train, xq, VI, k):
 
 @partial(jit, static_argnames=('k',))
 def _mahal_knn_batch(X_train, X_queries, VI, k):
-    """Batch of query points. X_queries: (D, Q), returns (Q, k)"""
     def single(xq):
         diff = X_train - xq[:, None]
         dists_sq = jnp.sum(diff * (VI @ diff), axis=0)
         return jnp.argsort(dists_sq)[:k]
     return vmap(single)(X_queries.T)
 
-# ── JAX CGP step ──────────────────────────────────────────────────────────────
 @partial(jit, static_argnames=('N_neighbor',))
 def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
     """idxs is always shape (N_neighbor,) — no dynamic shapes."""
@@ -207,7 +216,7 @@ def _cgp_step_fixed(Xens, Yens, idxs, Xq, VI, N_neighbor):
     return idxs_final, Mf, Cxy, Xm, Ym, Yh, cov_Yh
 
 # ── Main function ─────────────────────────────────────────────────────────────
-def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=100):
+def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=1000):
     """
     Parameters:
     Xens_j: array of input features which compose the ensemble. shape:(D, N) 
@@ -228,6 +237,8 @@ def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=100):
     )
     Yh_prev = np.array(Yh_prev.flatten())
 
+    rel_change_history = []
+
     for i in range(max_iter - 1):
         idxs, _, _, _, _, Yh, cov_Yh = _cgp_step_fixed(
             Xens_j, Yens_j, idxs, Xq_j[:, None], VI_j, N_neighbor
@@ -242,6 +253,14 @@ def ens_CGP(Xens_j, Yens_j, Xq, VI_j, N_neighbor, tol=1e-6, max_iter=100):
 
         if rel_change < tol:
             break
+
+        # Oscillation detection: count how many times the current value
+        # has appeared in the full history
+        n_repeats = np.sum(np.isclose(rel_change_history, rel_change, rtol=1e-3))
+        if n_repeats >= 5:
+            break
+
+        rel_change_history.append(rel_change)
 
         Yh_prev = Yh
 
@@ -263,16 +282,8 @@ if plot_2:
         for query_idx, (query_input, query_output) in enumerate(zip(tqdm(raw_inputs), raw_outputs)):
 
             # Define the training data for CGP (all data points except the query point)
-            XTr = np.delete(
-                raw_inputs.T, #shape: (4, N)
-                query_idx,
-                axis=1
-                )
-            YTr = np.delete(
-                            raw_outputs.T,   # shape: (M, N)
-                            query_idx,
-                            axis=1
-                            )
+            XTr = np.delete(raw_inputs.T, query_idx, axis=1)
+            YTr = np.delete(raw_outputs.T, query_idx, axis=1)
 
             Yh, err_Yh, _ = ens_CGP(
                                 jnp.array(XTr),
@@ -284,9 +295,9 @@ if plot_2:
             guess_ST2D[query_idx, :] = Yh
             guess_ST2Derr[query_idx, :] = err_Yh
 
-        bias = np.mean(guess_ST2D - raw_outputs)
-        var = np.mean(guess_ST2Derr**2)
-        MSE = bias**2 + var
+        bias[NNidx] = np.mean(guess_ST2D - raw_outputs)
+        var[NNidx] = np.mean(guess_ST2Derr**2)
+        MSE[NNidx] = bias[NNidx]**2 + var[NNidx]
 
     # #Plot bias and variance as a function of N_neighbors
     fig, ax = plt.subplots(3, 1, figsize=(8, 6))
