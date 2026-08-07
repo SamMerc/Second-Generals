@@ -295,6 +295,60 @@ if plot_2:
             guess_ST2D[query_idx, :] = Yh
             guess_ST2Derr[query_idx, :] = err_Yh
 
+            # Diagnostic plot
+            if show_plot:
+                IMG_H, IMG_W = 46, 72
+
+                data_map  = query_output.reshape((IMG_H, IMG_W))
+                model_map = guess_ST2D[query_idx, :].reshape((IMG_H, IMG_W))
+                resid_map = data_map - model_map
+
+                # Gradient of the GP prediction: treat the lat/lon grid as a
+                # plain x-y grid, wrapping edges around to the opposite side
+                # of the map (same convention used for the CNN smoothness
+                # penalty in Code/ST2D/ST2D_GP_CNN.py).
+                dSdx = np.roll(model_map, -1, axis=1) - model_map   # d/dx, periodic in longitude
+                dSdy = np.roll(model_map, -1, axis=0) - model_map   # d/dy, periodic in latitude
+
+                fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(
+                    5, 1, figsize=(8, 13), sharex=True, layout='constrained'
+                )
+
+                ax1.set_title('Data')
+                hm1 = sns.heatmap(data_map, ax=ax1)
+                hm1.collections[0].colorbar.set_label('Temperature (K)')
+
+                ax2.set_title('GP Model')
+                hm2 = sns.heatmap(model_map, ax=ax2)
+                hm2.collections[0].colorbar.set_label('Temperature (K)')
+
+                ax3.set_title('Residual (Data - GP Model)')
+                hm3 = sns.heatmap(resid_map, ax=ax3)
+                hm3.collections[0].colorbar.set_label('Temperature (K)')
+
+                ax4.set_title(r'GP Model $\partial S/\partial x$')
+                hm4 = sns.heatmap(dSdx, ax=ax4, cmap='coolwarm', center=0)
+                hm4.collections[0].colorbar.set_label('Temperature Gradient (K)')
+
+                ax5.set_title(r'GP Model $\partial S/\partial y$')
+                hm5 = sns.heatmap(dSdy, ax=ax5, cmap='coolwarm', center=0)
+                hm5.collections[0].colorbar.set_label('Temperature Gradient (K)')
+
+                ax5.set_xticks(np.linspace(0, IMG_W, 5))
+                ax5.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
+                ax5.set_xlabel('Longitude (degrees)')
+
+                for ax in [ax1, ax2, ax3, ax4, ax5]:
+                    ax.set_yticks(np.linspace(0, IMG_H, 5))
+                    ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
+                    ax.set_ylabel('Latitude (degrees)')
+
+                plt.suptitle(
+                    rf'H$_2$ : {query_input[0]} bar, CO$_2$ : {query_input[1]} bar, '
+                    rf'LoD : {query_input[2]:.0f} days, Obliquity : {query_input[3]} deg'
+                )
+                plt.show()
+
         bias[NNidx] = np.mean(guess_ST2D - raw_outputs)
         var[NNidx] = np.mean(guess_ST2Derr**2)
         MSE[NNidx] = bias[NNidx]**2 + var[NNidx]

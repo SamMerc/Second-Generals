@@ -123,8 +123,7 @@ lr_min       = 1e-7   # floor
 # Regularization
 regularization_coeff_l1 = 0.0
 regularization_coeff_l2 = 5e-5
-smoothness_coeff = 1e-3          # target coefficient once warmup is complete
-smoothness_warmup_epochs = 20    # linearly ramp smoothness_coeff from 0 over this many epochs
+smoothness_coeff = 1e-3   # weight on the gradient-magnitude smoothness penalty
 weight_decay = 0.0
 
 # Training
@@ -597,22 +596,17 @@ data_module = CNNDataModule(
 #### Define optimization block ####
 ###################################
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate, out_scaler, weight_decay=0.0,
-                 reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0,
-                 smoothness_warmup_epochs=0,
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0,
+                 reg_coeff_l1=0.0, reg_coeff_l2=0.0,
+                 smoothness_coeff=0.0, out_scaler=None, in_scaler_pred=None, n_phys=None,
                  lr_patience=10, lr_factor=0.5, lr_min=1e-7):
         super().__init__()
         self.model            = model
         self.learning_rate    = learning_rate
         self.reg_coeff_l1     = reg_coeff_l1
         self.reg_coeff_l2     = reg_coeff_l2
-        # smoothness_coeff is the *target* value reached after warmup; the
-        # penalty is ramped up from 0 linearly over smoothness_warmup_epochs
-        # so the network fits the residual signal before being regularized
-        # toward smoothness (otherwise the penalty dominates the MSE term
-        # from epoch 0 and the network collapses to a flat/near-zero output).
-        self.smoothness_coeff_max     = smoothness_coeff
-        self.smoothness_warmup_epochs = smoothness_warmup_epochs
+        self.smoothness_coeff = smoothness_coeff
+        self.n_phys           = n_phys
         self.weight_decay     = weight_decay
         self.loss_fn          = nn.MSELoss()
         self.optimizer_class  = optimizer
@@ -620,29 +614,13 @@ class RegressionModule(pl.LightningModule):
         self.lr_factor        = lr_factor
         self.lr_min           = lr_min
 
-        # ── Spherical grid spacing for the smoothness penalty ─────────────────
-        # Data comes straight from ExoCAM/CESM NetCDF output (see
-        # Misc/gen_training_ST2D.py — variable 'TS' reshaped to 46x72), which
-        # is CESM's FV dycore grid: a *vertex* grid where row 0 / row IMG_H-1
-        # sit exactly at the poles (-90/+90). cos(lat) is therefore exactly 0
-        # at those rows — handled by excluding pole rows from the longitude
-        # term below (longitude/meridian is undefined at a pole point anyway).
-        self.dlat_rad = np.deg2rad(180.0 / (IMG_H - 1))
-        self.dlon_rad = np.deg2rad(360.0 / IMG_W)
-        lat_deg = torch.linspace(-90.0, 90.0, IMG_H)
-        cos_lat = torch.cos(torch.deg2rad(lat_deg)).clamp(min=0.0)
-        self.register_buffer('cos_lat', cos_lat.view(1, 1, IMG_H, 1))
-
-        # Register scaling properties to un-scale prediction before computing the smoothness penalty.
-        # This is important because the smoothness penalty is computed in physical units (K) and not in scaled units.
-        self.register_buffer('out_mean',  torch.tensor(out_scaler.mean_,  dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
-        self.register_buffer('out_scale', torch.tensor(out_scaler.scale_, dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
-
-    def current_smoothness_coeff(self):
-        if self.smoothness_warmup_epochs <= 0:
-            return self.smoothness_coeff_max
-        ramp = min(1.0, self.current_epoch / self.smoothness_warmup_epochs)
-        return self.smoothness_coeff_max * ramp
+        # Buffers to un-scale the predicted residual and the GP-prediction
+        # input channel back to physical units (K), so the smoothness penalty
+        # is computed on the reconstructed temperature map S = GP_pred + residual.
+        self.register_buffer('out_mean',      torch.tensor(out_scaler.mean_,     dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
+        self.register_buffer('out_scale',     torch.tensor(out_scaler.scale_,    dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
+        self.register_buffer('gp_pred_mean',  torch.tensor(in_scaler_pred.mean_, dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
+        self.register_buffer('gp_pred_scale', torch.tensor(in_scaler_pred.scale_, dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
 
     def compute_weight_regularization(self):
         if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
@@ -672,48 +650,30 @@ class RegressionModule(pl.LightningModule):
         l1_penalty, l2_penalty = self.compute_weight_regularization()
         loss = mse + l1_penalty + l2_penalty
 
-        # Smoothness penalty: discretized Dirichlet energy on the sphere,
-        # ∫‖∇T‖² dA, over the predicted map — pred is (batch, 1, H, W).
-        # Longitude is periodic (-180 wraps to +180) via torch.roll, and its
-        # gradient is scaled by 1/cos(lat) since meridians converge toward the
-        # poles (arc length shrinks there). Longitude is undefined exactly at
-        # the poles, so that term excludes the pole rows entirely.
-        smoothness_coeff = self.current_smoothness_coeff()
-        # Gate on the warmup *target*, not the ramped value — the ramped
-        # value is legitimately 0 during epoch 0, but we still need to
-        # compute/log the (unweighted-by-zero) penalty every epoch so
-        # train_smoothness_epoch stays aligned with train_mse_epoch for plotting.
-        if self.smoothness_coeff_max > 0:
-            #Switch back to physical units for the smoothness penalty, since the scaling is not uniform across the map
-            pred_phys = pred * self.out_scale + self.out_mean
+        # Smoothness penalty on the reconstructed temperature map
+        # S = GP_pred + CNN residual, treating the lat/lon grid as a plain
+        # x-y grid with circular wrap-around on both axes (edge cells look
+        # across the map to their neighbor on the opposite side).
+        if self.smoothness_coeff > 0:
+            residual_phys = pred * self.out_scale + self.out_mean
 
-            dpred_dlat = (pred_phys[:, :, 1:, :] - pred_phys[:, :, :-1, :]) / self.dlat_rad
+            gp_pred_scaled = X[:, self.n_phys:self.n_phys + 1, :, :]
+            gp_pred_phys   = gp_pred_scaled * self.gp_pred_scale + self.gp_pred_mean
 
-            pred_interior    = pred_phys[:, :, 1:-1, :]
-            cos_lat_interior = self.cos_lat[:, :, 1:-1, :]
-            dpred_dlon = (
-                torch.roll(pred_interior, shifts=-1, dims=3) - pred_interior
-            ) / (self.dlon_rad * cos_lat_interior)
+            S = gp_pred_phys + residual_phys   # (batch, 1, H, W)
 
-            # Area element dA ∝ cos(lat) dlat dlon: weight each squared
-            # gradient by cos(lat) (same row used for the gradient scaling and
-            # the area weight — no lat-staggering correction) and take an
-            # area-weighted mean instead of a plain pixel mean. For the
-            # longitude term this cancels one power of the 1/cos² above,
-            # leaving the correct net 1/cos(lat) weighting.
-            lat_weight = 0.5 * (self.cos_lat[:, :, :-1, :] + self.cos_lat[:, :, 1:, :])
-            lat_energy = lat_weight * dpred_dlat ** 2
-            lon_energy = cos_lat_interior * dpred_dlon ** 2
+            dSdx = torch.roll(S, shifts=-1, dims=3) - S   # d/dx, periodic in longitude
+            dSdy = torch.roll(S, shifts=-1, dims=2) - S   # d/dy, periodic in latitude
 
-            lat_term = lat_energy.sum() / lat_weight.expand_as(dpred_dlat).sum()
-            lon_term = lon_energy.sum() / cos_lat_interior.expand_as(dpred_dlon).sum()
+            # Gradient magnitude at each pixel: [dSdx, dSdy] · [dSdx, dSdy]^T = dSdx^2 + dSdy^2
+            grad_mag_sq = dSdx ** 2 + dSdy ** 2
 
-            smoothness_penalty = smoothness_coeff * (lat_term + lon_term)
+            # L2 norm of the whole gradient field per sample, then averaged over the batch.
+            field_norm = torch.sqrt(grad_mag_sq.sum(dim=(1, 2, 3)))   # (batch,)
+            smoothness_penalty = self.smoothness_coeff * field_norm.mean()
             loss += smoothness_penalty
 
-            #Log smoothness penalty and its current (ramping) coefficient separately for monitoring
             self.log('train_smoothness', smoothness_penalty, on_step=True, on_epoch=True, prog_bar=True)
-            self.log('smoothness_coeff', smoothness_coeff, on_step=False, on_epoch=True, prog_bar=False)
 
         self.log('train_mse',  mse,  on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -764,12 +724,13 @@ lightning_module = RegressionModule(
     model=model,
     optimizer=Adam,
     learning_rate=lr_init,
-    out_scaler=data_module.out_scaler,
     reg_coeff_l1=regularization_coeff_l1,
     reg_coeff_l2=regularization_coeff_l2,
-    weight_decay=weight_decay,
     smoothness_coeff=smoothness_coeff,
-    smoothness_warmup_epochs=smoothness_warmup_epochs,
+    out_scaler=data_module.out_scaler,
+    in_scaler_pred=data_module.in_scaler_pred,
+    n_phys=D,
+    weight_decay=weight_decay,
     lr_patience=lr_patience,
     lr_factor=lr_factor,
     lr_min=lr_min,
@@ -836,12 +797,13 @@ else:
         model=model,
         optimizer=Adam,
         learning_rate=lr_init,
-        out_scaler=data_module.out_scaler,
         reg_coeff_l1=regularization_coeff_l1,
         reg_coeff_l2=regularization_coeff_l2,
-        weight_decay=weight_decay,
         smoothness_coeff=smoothness_coeff,
-        smoothness_warmup_epochs=smoothness_warmup_epochs,
+        out_scaler=data_module.out_scaler,
+        in_scaler_pred=data_module.in_scaler_pred,
+        n_phys=D,
+        weight_decay=weight_decay,
         lr_patience=lr_patience,
         lr_factor=lr_factor,
         lr_min=lr_min,
