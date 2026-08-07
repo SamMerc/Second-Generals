@@ -8,6 +8,9 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+import re
 import torch
 from torch.optim import Adam
 import torch.optim.lr_scheduler as lr_scheduler
@@ -747,6 +750,19 @@ early_stopping = EarlyStopping(
     verbose=True,
 )
 
+# Periodic checkpoints (separate from the best-model checkpoint above), used
+# later to replay the gradient-ECDF diagnostic at different points in training.
+epoch_ckpt_dir = model_save_path + 'epoch_ckpts/'
+check_and_make_dir(epoch_ckpt_dir)
+epoch_checkpoint_every = 10   # save a checkpoint every N epochs
+epoch_checkpoint = ModelCheckpoint(
+    dirpath=epoch_ckpt_dir,
+    filename='epoch={epoch:04d}',
+    auto_insert_metric_name=False,
+    every_n_epochs=epoch_checkpoint_every,
+    save_top_k=-1,   # keep every checkpoint matching every_n_epochs, not just the best
+)
+
 trainer = Trainer(
     max_epochs=n_epochs,
     logger=logger,
@@ -759,6 +775,7 @@ trainer = Trainer(
             monitor='valid_loss',
             mode='min',
         ),
+        epoch_checkpoint,
         early_stopping,
     ],
     enable_progress_bar=True,
@@ -1045,3 +1062,122 @@ fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
 
 plt.savefig(plot_save_path + '/res_GP_CNN.pdf', bbox_inches='tight')
 plt.close()
+
+
+####################################################################
+#### Gradient ECDF: true vs. predicted maps, across checkpoints ####
+####################################################################
+def _periodic_gradients(maps):
+    """maps: (N, H, W) → dS/dx, dS/dy, wrapping edges to the opposite side of the map."""
+    dSdx = np.roll(maps, -1, axis=2) - maps   # d/dx, periodic in longitude
+    dSdy = np.roll(maps, -1, axis=1) - maps   # d/dy, periodic in latitude
+    return dSdx, dSdy
+
+
+def _ecdf(values):
+    x = np.sort(values)
+    y = np.arange(1, len(x) + 1) / len(x)
+    return x, y
+
+
+# ── True-map gradients: fixed reference, computed once from the test set ─────
+true_maps = NN_test_true.numpy().reshape(-1, IMG_H, IMG_W)
+dSdx_true, dSdy_true = _periodic_gradients(true_maps)
+mag_true = np.sqrt(dSdx_true ** 2 + dSdy_true ** 2)
+
+gradient_fields_true = {
+    'dSdx':      dSdx_true.ravel(),
+    'dSdy':      dSdy_true.ravel(),
+    'magnitude': mag_true.ravel(),
+}
+
+# ── Locate periodic checkpoints, sorted by epoch ──────────────────────────────
+epoch_ckpt_paths = sorted(
+    glob.glob(epoch_ckpt_dir + 'epoch=*.ckpt'),
+    key=lambda p: int(re.search(r'epoch=(\d+)', p).group(1)),
+)
+
+if not epoch_ckpt_paths:
+    print('No periodic checkpoints found — skipping gradient ECDF diagnostic.')
+else:
+    diag_model = ResidualCNN(
+        input_channels=input_channels,
+        hidden_channels=cnn_hidden_channels,
+        output_channels=output_channels,
+        depth=cnn_depth,
+        img_height=IMG_H,
+        img_width=IMG_W,
+    )
+
+    epochs = []
+    gradient_fields_pred = {'dSdx': [], 'dSdy': [], 'magnitude': []}
+
+    for ckpt_path in tqdm(epoch_ckpt_paths, desc='Replaying checkpoints for gradient ECDF'):
+        epoch_num = int(re.search(r'epoch=(\d+)', ckpt_path).group(1))
+
+        ckpt_module = RegressionModule.load_from_checkpoint(
+            ckpt_path,
+            map_location='cpu',
+            model=diag_model,
+            optimizer=Adam,
+            learning_rate=lr_init,
+            reg_coeff_l1=regularization_coeff_l1,
+            reg_coeff_l2=regularization_coeff_l2,
+            smoothness_coeff=smoothness_coeff,
+            out_scaler=data_module.out_scaler,
+            in_scaler_pred=data_module.in_scaler_pred,
+            n_phys=D,
+            weight_decay=weight_decay,
+            lr_patience=lr_patience,
+            lr_factor=lr_factor,
+            lr_min=lr_min,
+        )
+        ckpt_module.eval()
+
+        with torch.no_grad():
+            residual_pred   = ckpt_module(data_module.test_inputs)
+            gp_pred_scaled  = data_module.test_inputs[:, ckpt_module.n_phys:ckpt_module.n_phys + 1, :, :]
+            residual_phys   = residual_pred * ckpt_module.out_scale + ckpt_module.out_mean
+            gp_pred_phys    = gp_pred_scaled * ckpt_module.gp_pred_scale + ckpt_module.gp_pred_mean
+            S_pred          = gp_pred_phys + residual_phys   # (N_test, 1, H, W)
+
+        pred_maps = S_pred.squeeze(1).numpy()   # (N_test, H, W)
+        dSdx_pred, dSdy_pred = _periodic_gradients(pred_maps)
+        mag_pred = np.sqrt(dSdx_pred ** 2 + dSdy_pred ** 2)
+
+        epochs.append(epoch_num)
+        gradient_fields_pred['dSdx'].append(dSdx_pred.ravel())
+        gradient_fields_pred['dSdy'].append(dSdy_pred.ravel())
+        gradient_fields_pred['magnitude'].append(mag_pred.ravel())
+
+    ecdf_cmap = plt.get_cmap('viridis')
+    ecdf_norm = mcolors.Normalize(vmin=min(epochs), vmax=max(epochs))
+
+    field_titles = {
+        'dSdx':      r'$\partial S/\partial x$',
+        'dSdy':      r'$\partial S/\partial y$',
+        'magnitude': r'$|\nabla S|$',
+    }
+
+    for field_key, field_title in field_titles.items():
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        for epoch_num, values in zip(epochs, gradient_fields_pred[field_key]):
+            x, y = _ecdf(values)
+            ax.plot(x, y, color=ecdf_cmap(ecdf_norm(epoch_num)), alpha=0.8, linewidth=1)
+
+        x_true, y_true = _ecdf(gradient_fields_true[field_key])
+        ax.plot(x_true, y_true, color='black', linewidth=2, label='True')
+
+        sm = cm.ScalarMappable(cmap=ecdf_cmap, norm=ecdf_norm)
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, label='Epoch')
+
+        ax.set_xlabel(f'{field_title} (K)')
+        ax.set_ylabel('Empirical CDF')
+        ax.set_title(f'{field_title} — Predicted (by epoch) vs. True')
+        ax.legend()
+        ax.grid()
+
+        plt.savefig(plot_save_path + f'/ecdf_{field_key}.pdf')
+        plt.close()
