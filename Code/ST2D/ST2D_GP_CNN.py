@@ -48,11 +48,11 @@ raw_data3000 = np.loadtxt(base_dir + 'Data/bt-3000k/training_data_ST2D.csv', del
 raw_data4500 = np.loadtxt(base_dir + 'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 
 # Path to store model
-model_save_path = base_dir + 'Model_Storage/GP_ST_ResCNN/'
+model_save_path = base_dir + 'Model_Storage/GP_ST_ResCNN_reworkedsmoothness_BS128/'
 check_and_make_dir(model_save_path)
 
 # Path to store plots
-plot_save_path = base_dir + 'Plots/GP_ST_ResCNN/'
+plot_save_path = base_dir + 'Plots/GP_ST_ResCNN_reworkedsmoothness_BS128/'
 check_and_make_dir(plot_save_path)
 
 #Last 51 columns are the temperature/pressure values, 
@@ -130,10 +130,10 @@ smoothness_coeff = 1e-3   # weight on the gradient-magnitude smoothness penalty
 weight_decay = 0.0
 
 # Training
-batch_size = 32
+batch_size = 128
 n_epochs = 1000
 early_stopping_patience = 50
-run_mode = 'use'
+run_mode = 'load'
 
 
 ###############################################
@@ -794,9 +794,11 @@ if run_mode == 'use':
     best_model_path = trainer.checkpoint_callback.best_model_path
     print(f"Best model path: {best_model_path}")
 
-    # Save best path for later loading
+    # Save just the filename (not the absolute path) so best_ckpt_path.txt
+    # stays valid when model_save_path is copied to a different machine
+    # (e.g. training on a GPU box, then loading locally).
     with open(model_save_path + 'best_ckpt_path.txt', 'w') as f:
-        f.write(best_model_path)
+        f.write(os.path.basename(best_model_path))
 
     finish_time_s    = time() - t0
     finish_time_min  = finish_time_s / 60
@@ -807,7 +809,10 @@ if run_mode == 'use':
 
 else:
     with open(model_save_path + 'best_ckpt_path.txt', 'r') as f:
-        best_ckpt_path = f.read().strip()
+        # os.path.basename handles both the new filename-only format and
+        # older files that still hold a full (possibly remote) absolute path.
+        best_ckpt_filename = os.path.basename(f.read().strip())
+    best_ckpt_path = model_save_path + best_ckpt_filename
 
     lightning_module = RegressionModule.load_from_checkpoint(
         best_ckpt_path,
