@@ -1164,25 +1164,71 @@ else:
         'magnitude': r'$|\nabla S|$',
     }
 
+    # Equi-probability cuts (quantile residual, left panel) and equi-gradient
+    # cuts (CDF residual, bottom panel) are each evaluated on a fixed grid
+    # shared across all epochs, via linear interpolation of the (huge-N)
+    # empirical CDF / quantile functions returned by _ecdf.
+    prob_grid = np.linspace(0.001, 0.999, 200)
+
     for field_key, field_title in field_titles.items():
-        fig, ax = plt.subplots(figsize=(8, 6))
+
+        x_true, y_true = _ecdf(np.abs(gradient_fields_true[field_key]))
+        quantile_true = np.interp(prob_grid, y_true, x_true)
+
+        all_abs_values = np.concatenate(
+            [np.abs(gradient_fields_true[field_key])]
+            + [np.abs(v) for v in gradient_fields_pred[field_key]]
+        )
+        positive_values = all_abs_values[all_abs_values > 0]
+        value_grid = np.logspace(
+            np.log10(positive_values.min()), np.log10(positive_values.max()), 200
+        )
+        ecdf_true_on_grid = np.interp(value_grid, x_true, y_true)
+
+        fig = plt.figure(figsize=(10, 8))
+        gs = fig.add_gridspec(
+            2, 2, width_ratios=(1, 4), height_ratios=(4, 1),
+            wspace=0.08, hspace=0.08,
+        )
+        ax      = fig.add_subplot(gs[0, 1])
+        ax_left = fig.add_subplot(gs[0, 0], sharey=ax)
+        ax_bot  = fig.add_subplot(gs[1, 1], sharex=ax)
 
         for epoch_num, values in zip(epochs, gradient_fields_pred[field_key]):
-            x, y = _ecdf(values)
-            ax.plot(x, y, color=ecdf_cmap(ecdf_norm(epoch_num)), alpha=0.8, linewidth=1)
+            x, y = _ecdf(np.abs(values))
+            color = ecdf_cmap(ecdf_norm(epoch_num))
+            ax.plot(x, y, color=color, alpha=0.8, linewidth=1)
 
-        x_true, y_true = _ecdf(gradient_fields_true[field_key])
+            # Equi-probability cut: quantile(epoch) - quantile(true), at fixed probability
+            quantile_epoch = np.interp(prob_grid, y, x)
+            ax_left.plot(quantile_epoch - quantile_true, prob_grid, color=color, alpha=0.8, linewidth=1)
+
+            # Equi-gradient cut: CDF(epoch) - CDF(true), at fixed gradient value
+            ecdf_epoch_on_grid = np.interp(value_grid, x, y)
+            ax_bot.plot(value_grid, ecdf_epoch_on_grid - ecdf_true_on_grid, color=color, alpha=0.8, linewidth=1)
+
         ax.plot(x_true, y_true, color='black', linewidth=2, label='True')
+        ax_left.axvline(0, color='black', linewidth=2)
+        ax_bot.axhline(0, color='black', linewidth=2)
 
         sm = cm.ScalarMappable(cmap=ecdf_cmap, norm=ecdf_norm)
         sm.set_array([])
-        plt.colorbar(sm, ax=ax, label='Epoch')
+        fig.colorbar(sm, ax=[ax, ax_left, ax_bot], label='Epoch', fraction=0.05, pad=0.02)
 
-        ax.set_xlabel(f'{field_title} (K)')
-        ax.set_ylabel('Empirical CDF')
+        ax.set_xscale('log')
+        ax_bot.set_xscale('log')
+        ax.tick_params(labelleft=False, labelbottom=False)
         ax.set_title(f'{field_title} — Predicted (by epoch) vs. True')
         ax.legend()
         ax.grid()
+
+        ax_left.set_ylabel('Empirical CDF')
+        ax_left.set_xlabel(f'Residual {field_title} (K)')
+        ax_left.grid()
+
+        ax_bot.set_xlabel(f'{field_title} (K)')
+        ax_bot.set_ylabel('Residual CDF')
+        ax_bot.grid()
 
         plt.savefig(plot_save_path + f'/ecdf_{field_key}.pdf')
         plt.close()
