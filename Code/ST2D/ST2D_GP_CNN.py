@@ -1096,6 +1096,17 @@ gradient_fields_true = {
     'magnitude': mag_true.ravel(),
 }
 
+# ── ens-CGP-map gradients: fixed reference, GP prediction alone (no CNN residual) ─
+gp_maps = NN_test_inputs_pred.numpy().reshape(-1, IMG_H, IMG_W)
+dSdx_gp, dSdy_gp = _periodic_gradients(gp_maps)
+mag_gp = np.sqrt(dSdx_gp ** 2 + dSdy_gp ** 2)
+
+gradient_fields_gp = {
+    'dSdx':      dSdx_gp.ravel(),
+    'dSdy':      dSdy_gp.ravel(),
+    'magnitude': mag_gp.ravel(),
+}
+
 # ── Locate periodic checkpoints, sorted by epoch ──────────────────────────────
 epoch_ckpt_paths = sorted(
     glob.glob(epoch_ckpt_dir + 'epoch=*.ckpt'),
@@ -1175,8 +1186,11 @@ else:
         x_true, y_true = _ecdf(np.abs(gradient_fields_true[field_key]))
         quantile_true = np.interp(prob_grid, y_true, x_true)
 
+        x_gp, y_gp = _ecdf(np.abs(gradient_fields_gp[field_key]))
+        quantile_gp = np.interp(prob_grid, y_gp, x_gp)
+
         all_abs_values = np.concatenate(
-            [np.abs(gradient_fields_true[field_key])]
+            [np.abs(gradient_fields_true[field_key]), np.abs(gradient_fields_gp[field_key])]
             + [np.abs(v) for v in gradient_fields_pred[field_key]]
         )
         positive_values = all_abs_values[all_abs_values > 0]
@@ -1184,6 +1198,7 @@ else:
             np.log10(positive_values.min()), np.log10(positive_values.max()), 200
         )
         ecdf_true_on_grid = np.interp(value_grid, x_true, y_true)
+        ecdf_gp_on_grid   = np.interp(value_grid, x_gp,   y_gp)
 
         fig = plt.figure(figsize=(10, 8))
         gs = fig.add_gridspec(
@@ -1208,8 +1223,13 @@ else:
             ax_bot.plot(value_grid, ecdf_epoch_on_grid - ecdf_true_on_grid, color=color, alpha=0.8, linewidth=1)
 
         ax.plot(x_true, y_true, color='black', linewidth=2, label='True')
+        ax.plot(x_gp, y_gp, color='tab:red', linewidth=2, linestyle='--', label='ens-CGP')
         ax_left.axvline(0, color='black', linewidth=2)
         ax_bot.axhline(0, color='black', linewidth=2)
+
+        # ens-CGP-vs-true cuts, same fixed reference used for the per-epoch cuts
+        ax_left.plot(quantile_gp - quantile_true, prob_grid, color='tab:red', linewidth=2, linestyle='--')
+        ax_bot.plot(value_grid, ecdf_gp_on_grid - ecdf_true_on_grid, color='tab:red', linewidth=2, linestyle='--')
 
         sm = cm.ScalarMappable(cmap=ecdf_cmap, norm=ecdf_norm)
         sm.set_array([])
@@ -1232,3 +1252,89 @@ else:
 
         plt.savefig(plot_save_path + f'/ecdf_{field_key}.pdf')
         plt.close()
+
+
+##########################################################
+#### Periodogram: ens-CGP vs. ens-CGP + NN, true maps ####
+##########################################################
+def _radial_periodogram(maps, dy_deg, dx_deg, n_bins=25):
+    """
+    maps: (N, H, W) physical-space maps, treated as doubly periodic — same
+    circular wrap-around convention used elsewhere in this script for the
+    lat/lon grid (see the smoothness penalty and _periodic_gradients above).
+
+    Returns:
+      k_bin_centers : (n_bins,) spatial-frequency bin centers, cycles/degree
+      radial_power  : (N, n_bins) power spectral density per map, per bin
+    """
+    N_maps, H, W = maps.shape
+
+    # Remove per-map mean (DC component) before transforming
+    centered = maps - maps.mean(axis=(1, 2), keepdims=True)
+
+    fft2  = np.fft.fft2(centered, axes=(1, 2))
+    power = (np.abs(fft2) ** 2) / (H * W)
+    power = np.fft.fftshift(power, axes=(1, 2))
+
+    ky = np.fft.fftshift(np.fft.fftfreq(H, d=dy_deg))   # cycles / degree latitude
+    kx = np.fft.fftshift(np.fft.fftfreq(W, d=dx_deg))   # cycles / degree longitude
+    KX, KY = np.meshgrid(kx, ky)
+    k_radius = np.sqrt(KX ** 2 + KY ** 2)
+
+    # Cap bins at the smaller Nyquist limit of the two axes, so every bin is
+    # backed by data from both axes.
+    k_max = min(kx.max(), ky.max())
+    k_bin_edges   = np.linspace(0, k_max, n_bins + 1)
+    k_bin_centers = 0.5 * (k_bin_edges[:-1] + k_bin_edges[1:])
+    bin_idx = np.digitize(k_radius.ravel(), k_bin_edges) - 1
+
+    power_flat    = power.reshape(N_maps, -1)
+    radial_power  = np.full((N_maps, n_bins), np.nan)
+    for b in range(n_bins):
+        mask = bin_idx == b
+        if np.any(mask):
+            radial_power[:, b] = power_flat[:, mask].mean(axis=1)
+
+    return k_bin_centers, radial_power
+
+
+dy_deg = 180.0 / IMG_H   # degrees per latitude pixel
+dx_deg = 360.0 / IMG_W   # degrees per longitude pixel
+
+# ── Reconstruct the final (best) model's full prediction over the test set ────
+with torch.no_grad():
+    residual_pred_best  = lightning_module(data_module.test_inputs)
+    gp_pred_scaled_best = data_module.test_inputs[:, lightning_module.n_phys:lightning_module.n_phys + 1, :, :]
+    residual_phys_best  = residual_pred_best * lightning_module.out_scale + lightning_module.out_mean
+    gp_pred_phys_best   = gp_pred_scaled_best * lightning_module.gp_pred_scale + lightning_module.gp_pred_mean
+    S_pred_best = gp_pred_phys_best + residual_phys_best
+
+cnn_maps = S_pred_best.squeeze(1).numpy()   # (N_test, H, W)
+
+k_bins, power_true = _radial_periodogram(true_maps, dy_deg, dx_deg)
+_,      power_gp   = _radial_periodogram(gp_maps,   dy_deg, dx_deg)
+_,      power_cnn  = _radial_periodogram(cnn_maps,  dy_deg, dx_deg)
+
+fig, ax = plt.subplots(figsize=(8, 6))
+
+for power, color, label in [
+    (power_true, 'black',    'True'),
+    (power_gp,   'tab:red',  'ens-CGP'),
+    (power_cnn,  'tab:blue', 'ens-CGP + NN'),
+]:
+    mean_power = np.nanmean(power, axis=0)
+    lo_power   = np.nanpercentile(power, 16, axis=0)
+    hi_power   = np.nanpercentile(power, 84, axis=0)
+    ax.plot(k_bins, mean_power, color=color, linewidth=2, label=label)
+    ax.fill_between(k_bins, lo_power, hi_power, color=color, alpha=0.15)
+
+ax.set_xscale('log')
+ax.set_yscale('log')
+ax.set_xlabel('Spatial frequency (cycles / degree)')
+ax.set_ylabel('Power spectral density')
+ax.set_title('Radially-averaged periodogram of test-set temperature maps\n(shaded band: 16th-84th percentile across maps)')
+ax.legend()
+ax.grid(which='both', alpha=0.3)
+
+plt.savefig(plot_save_path + '/periodogram.pdf', bbox_inches='tight')
+plt.close()
