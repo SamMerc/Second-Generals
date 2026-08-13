@@ -1302,6 +1302,12 @@ dy_deg = 180.0 / IMG_H   # degrees per latitude pixel
 dx_deg = 360.0 / IMG_W   # degrees per longitude pixel
 
 # ── Reconstruct the final (best) model's full prediction over the test set ────
+# The Trainer leaves lightning_module's own buffers (out_scale, out_mean, ...)
+# on cuda:0 even though model.cpu() above moved the inner nn.Module to CPU —
+# those buffers belong to lightning_module, not to model, so move it too.
+lightning_module.cpu()
+lightning_module.eval()
+
 with torch.no_grad():
     residual_pred_best  = lightning_module(data_module.test_inputs)
     gp_pred_scaled_best = data_module.test_inputs[:, lightning_module.n_phys:lightning_module.n_phys + 1, :, :]
