@@ -654,9 +654,10 @@ class RegressionModule(pl.LightningModule):
         loss = mse + l1_penalty + l2_penalty
 
         # Smoothness penalty on the reconstructed temperature map
-        # S = GP_pred + CNN residual, treating the lat/lon grid as a plain
-        # x-y grid with circular wrap-around on both axes (edge cells look
-        # across the map to their neighbor on the opposite side).
+        # S = GP_pred + CNN residual. Longitude is genuinely periodic (edge
+        # cells wrap to their neighbor on the opposite side of the map), but
+        # latitude is not — the two poles are distinct physical points, not
+        # neighbors, so dS/dy uses a plain forward difference with no wrap.
         if self.smoothness_coeff > 0:
             residual_phys = pred * self.out_scale + self.out_mean
 
@@ -666,13 +667,13 @@ class RegressionModule(pl.LightningModule):
             S = gp_pred_phys + residual_phys   # (batch, 1, H, W)
 
             dSdx = torch.roll(S, shifts=-1, dims=3) - S   # d/dx, periodic in longitude
-            dSdy = torch.roll(S, shifts=-1, dims=2) - S   # d/dy, periodic in latitude
+            dSdy = S[:, :, 1:, :] - S[:, :, :-1, :]        # d/dy, no pole wrap-around → (batch, 1, H-1, W)
 
-            # Gradient magnitude at each pixel: [dSdx, dSdy] · [dSdx, dSdy]^T = dSdx^2 + dSdy^2
-            grad_mag_sq = dSdx ** 2 + dSdy ** 2
-
-            # L2 norm of the whole gradient field per sample, then averaged over the batch.
-            field_norm = torch.sqrt(grad_mag_sq.sum(dim=(1, 2, 3)))   # (batch,)
+            # L2 norm of the whole gradient field per sample: dSdx and dSdy
+            # live on different-sized grids (dSdy has no row at the last
+            # pole boundary), so sum their squares separately before adding.
+            sum_sq = dSdx.pow(2).sum(dim=(1, 2, 3)) + dSdy.pow(2).sum(dim=(1, 2, 3))
+            field_norm = torch.sqrt(sum_sq)   # (batch,)
             smoothness_penalty = self.smoothness_coeff * field_norm.mean()
             loss += smoothness_penalty
 
@@ -1072,10 +1073,16 @@ plt.close()
 ####################################################################
 #### Gradient ECDF: true vs. predicted maps, across checkpoints ####
 ####################################################################
-def _periodic_gradients(maps):
-    """maps: (N, H, W) → dS/dx, dS/dy, wrapping edges to the opposite side of the map."""
-    dSdx = np.roll(maps, -1, axis=2) - maps   # d/dx, periodic in longitude
-    dSdy = np.roll(maps, -1, axis=1) - maps   # d/dy, periodic in latitude
+def _gradients(maps):
+    """
+    maps: (N, H, W) → dS/dx, dS/dy.
+    Longitude wraps (periodic, edge cells look across the map to the
+    opposite side); latitude does not — the two poles are distinct physical
+    points, not neighbors, so dS/dy is a plain forward difference and comes
+    out with one fewer row (H-1) than dSdx.
+    """
+    dSdx = np.roll(maps, -1, axis=2) - maps     # (N, H,   W), periodic in longitude
+    dSdy = maps[:, 1:, :] - maps[:, :-1, :]      # (N, H-1, W), no pole wrap-around
     return dSdx, dSdy
 
 
@@ -1086,9 +1093,11 @@ def _ecdf(values):
 
 
 # ── True-map gradients: fixed reference, computed once from the test set ─────
+# 'magnitude' combines dSdx and dSdy, so it's only defined where both
+# components are — crop dSdx's last (pole) row to match dSdy's H-1 rows.
 true_maps = NN_test_true.numpy().reshape(-1, IMG_H, IMG_W)
-dSdx_true, dSdy_true = _periodic_gradients(true_maps)
-mag_true = np.sqrt(dSdx_true ** 2 + dSdy_true ** 2)
+dSdx_true, dSdy_true = _gradients(true_maps)
+mag_true = np.sqrt(dSdx_true[:, :-1, :] ** 2 + dSdy_true ** 2)
 
 gradient_fields_true = {
     'dSdx':      dSdx_true.ravel(),
@@ -1098,8 +1107,8 @@ gradient_fields_true = {
 
 # ── ens-CGP-map gradients: fixed reference, GP prediction alone (no CNN residual) ─
 gp_maps = NN_test_inputs_pred.numpy().reshape(-1, IMG_H, IMG_W)
-dSdx_gp, dSdy_gp = _periodic_gradients(gp_maps)
-mag_gp = np.sqrt(dSdx_gp ** 2 + dSdy_gp ** 2)
+dSdx_gp, dSdy_gp = _gradients(gp_maps)
+mag_gp = np.sqrt(dSdx_gp[:, :-1, :] ** 2 + dSdy_gp ** 2)
 
 gradient_fields_gp = {
     'dSdx':      dSdx_gp.ravel(),
@@ -1158,8 +1167,8 @@ else:
             S_pred          = gp_pred_phys + residual_phys   # (N_test, 1, H, W)
 
         pred_maps = S_pred.squeeze(1).numpy()   # (N_test, H, W)
-        dSdx_pred, dSdy_pred = _periodic_gradients(pred_maps)
-        mag_pred = np.sqrt(dSdx_pred ** 2 + dSdy_pred ** 2)
+        dSdx_pred, dSdy_pred = _gradients(pred_maps)
+        mag_pred = np.sqrt(dSdx_pred[:, :-1, :] ** 2 + dSdy_pred ** 2)
 
         epochs.append(epoch_num)
         gradient_fields_pred['dSdx'].append(dSdx_pred.ravel())
@@ -1259,9 +1268,13 @@ else:
 ##########################################################
 def _radial_periodogram(maps, dy_deg, dx_deg, n_bins=25):
     """
-    maps: (N, H, W) physical-space maps, treated as doubly periodic — same
-    circular wrap-around convention used elsewhere in this script for the
-    lat/lon grid (see the smoothness penalty and _periodic_gradients above).
+    maps: (N, H, W) physical-space maps.
+    Longitude (W) is genuinely periodic, so the FFT along that axis needs no
+    windowing. Latitude (H) is not — the two poles are distinct physical
+    points, not neighbors — so a Hann window is applied along that axis only,
+    to avoid spectral leakage from the artificial edge discontinuity a bare
+    FFT would otherwise introduce (see _gradients above for the same
+    latitude/longitude distinction in the gradient ECDF diagnostic).
 
     Returns:
       k_bin_centers : (n_bins,) spatial-frequency bin centers, cycles/degree
@@ -1272,8 +1285,16 @@ def _radial_periodogram(maps, dy_deg, dx_deg, n_bins=25):
     # Remove per-map mean (DC component) before transforming
     centered = maps - maps.mean(axis=(1, 2), keepdims=True)
 
-    fft2  = np.fft.fft2(centered, axes=(1, 2))
-    power = (np.abs(fft2) ** 2) / (H * W)
+    # Hann taper along latitude only; longitude is left untapered since it's
+    # genuinely periodic. Normalize by the window's power (not H*W) so the
+    # taper doesn't bias the overall power level.
+    win_lat  = np.hanning(H)                     # (H,)
+    win2d    = win_lat[:, None] * np.ones((1, W))  # (H, W)
+    windowed = centered * win2d[None, :, :]
+    win_power = np.sum(win2d ** 2)
+
+    fft2  = np.fft.fft2(windowed, axes=(1, 2))
+    power = (np.abs(fft2) ** 2) / win_power
     power = np.fft.fftshift(power, axes=(1, 2))
 
     ky = np.fft.fftshift(np.fft.fftfreq(H, d=dy_deg))   # cycles / degree latitude
