@@ -698,8 +698,16 @@ class RegressionModule(pl.LightningModule):
 
                 # Gradient magnitude, only where both components are defined
                 # (crop dSdx's last, pole-adjacent row to match dSdy's extent).
-                mag_pred = torch.sqrt(dSdx_pred[:, :, :-1, :] ** 2 + dSdy_pred ** 2)
-                mag_true = torch.sqrt(dSdx_true[:, :, :-1, :] ** 2 + dSdy_true ** 2)
+                # +1e-10 inside the sqrt: dSdx is exactly 0 at the north-pole
+                # row for ~100% of maps (the pole is a single point duplicated
+                # across all longitude cells — see the earlier pole-degeneracy
+                # analysis), so whenever dSdy also lands on exactly 0 there,
+                # sqrt's backward pass is inf/NaN at x=0 and poisons training
+                # from step one. 1e-10 is far below the smallest real nonzero
+                # squared gradient in this dataset (~2e-10), so it only
+                # guards the singularity without biasing genuine values.
+                mag_pred = torch.sqrt(dSdx_pred[:, :, :-1, :] ** 2 + dSdy_pred ** 2 + 1e-10)
+                mag_true = torch.sqrt(dSdx_true[:, :, :-1, :] ** 2 + dSdy_true ** 2 + 1e-10)
 
                 # 1-Wasserstein distance between the batch's pooled |∇S|
                 # distributions: for two empirical distributions with equal
