@@ -52,9 +52,9 @@ base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 raw_data3000 = np.loadtxt(base_dir + 'Data/bt-3000k/training_data_ST2D.csv', delimiter=',')
 raw_data4500 = np.loadtxt(base_dir + 'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 
-model_save_path = base_dir + 'Model_Storage/ST_Hyperparam_tuning_LRinit_CNNdepth_CNNchannels_L2_BS_SC/'
+model_save_path = base_dir + 'Model_Storage/ST_Hyperparam_tuning_LRinit_CNNdepth_CNNchannels_L2_BS_WC/'
 check_and_make_dir(model_save_path)
-plot_save_path = base_dir + 'Plots/ST_Hyperparam_tuning_LRinit_CNNdepth_CNNchannels_L2_BS_SC/'
+plot_save_path = base_dir + 'Plots/ST_Hyperparam_tuning_LRinit_CNNdepth_CNNchannels_L2_BS_WC/'
 check_and_make_dir(plot_save_path)
 
 inputs_3000 = np.hstack([raw_data3000[:, :4], np.full((len(raw_data3000), 1), 3000.0)])
@@ -91,18 +91,25 @@ plot_res_summary = False
 #############################
 #### run_mode selection  ####
 #############################
-run_mode = 'evaluate'   # 'search1' | 'search2' | 'train' | 'evaluate'
+run_mode = 'evaluate'   # 'search' | 'train' | 'evaluate'
+
+## ── Fixed (untuned) loss-term coefficient ─────────────────────────────────────
+## smoothness_coeff is no longer part of the search space; the Wasserstein
+## term (which is tuned) targets the same under/overshoot behavior more
+## directly. Kept fixed here at the value ST2D_GP_CNN.py currently trains with.
+SEARCH_SMOOTHNESS_COEFF = 0.0
 
 ## ── Parameters for 'train' and 'evaluate' modes ──────────────────────────────
-## After Stage 2 completes, paste the best params here and switch run_mode
+## After the search completes, paste the best params here and switch run_mode
 ## to 'train', then to 'evaluate'.
 FINAL_PARAMS = {
-    'lr_init'          : 0.00010175170875090105,
-    'cnn_depth'        : 10,
-    'cnn_channels'     : 128,
-    'reg_l2'           : 4.231195487398746e-06,
-    'smoothness_coeff' : 0.01,
-    'batch_size'       : 64,
+    'lr_init'           : 0.00010175170875090105,
+    'cnn_depth'         : 10,
+    'cnn_channels'      : 128,
+    'reg_l2'            : 4.231195487398746e-06,
+    'smoothness_coeff'  : SEARCH_SMOOTHNESS_COEFF,
+    'wasserstein_coeff' : 0.0,
+    'batch_size'        : 64,
 }
 FINAL_PARTITION_SEED = 4
 FINAL_BATCH_SEED     = 5
@@ -308,19 +315,31 @@ class CNNDataModule(pl.LightningDataModule):
 class RegressionModule(pl.LightningModule):
     def __init__(self, model, optimizer, learning_rate, weight_decay=0.0,
                  reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0,
-                 lr_patience=10, lr_factor=0.5, lr_min=1e-7):
+                 wasserstein_coeff=0.0, out_scaler=None, in_scaler_pred=None,
+                 n_phys=None, lr_patience=10, lr_factor=0.5, lr_min=1e-7):
         super().__init__()
-        self.model            = model
-        self.learning_rate    = learning_rate
-        self.reg_coeff_l1     = reg_coeff_l1
-        self.reg_coeff_l2     = reg_coeff_l2
-        self.smoothness_coeff = smoothness_coeff
-        self.weight_decay     = weight_decay
-        self.loss_fn          = nn.MSELoss()
-        self.optimizer_class  = optimizer
-        self.lr_patience      = lr_patience
-        self.lr_factor        = lr_factor
-        self.lr_min           = lr_min
+        self.model             = model
+        self.learning_rate     = learning_rate
+        self.reg_coeff_l1      = reg_coeff_l1
+        self.reg_coeff_l2      = reg_coeff_l2
+        self.smoothness_coeff  = smoothness_coeff
+        self.wasserstein_coeff = wasserstein_coeff
+        self.n_phys            = n_phys
+        self.weight_decay      = weight_decay
+        self.loss_fn           = nn.MSELoss()
+        self.optimizer_class   = optimizer
+        self.lr_patience       = lr_patience
+        self.lr_factor         = lr_factor
+        self.lr_min            = lr_min
+
+        # Buffers to un-scale the predicted residual and the GP-prediction
+        # input channel back to physical units (K), so the smoothness /
+        # Wasserstein penalties are computed on the reconstructed
+        # temperature map S = GP_pred + residual.
+        self.register_buffer('out_mean',      torch.tensor(out_scaler.mean_,      dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
+        self.register_buffer('out_scale',     torch.tensor(out_scaler.scale_,     dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
+        self.register_buffer('gp_pred_mean',  torch.tensor(in_scaler_pred.mean_,  dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
+        self.register_buffer('gp_pred_scale', torch.tensor(in_scaler_pred.scale_, dtype=torch.float32).view(1, 1, IMG_H, IMG_W))
 
     def compute_weight_regularization(self):
         if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
@@ -339,21 +358,55 @@ class RegressionModule(pl.LightningModule):
 
     def training_step(self, batch):
         X, y = batch
-        if self.smoothness_coeff > 0:
-            X.requires_grad_(True)
         pred = self(X)
         mse = self.loss_fn(pred, y)
         l1_penalty, l2_penalty = self.compute_weight_regularization()
         loss = mse + l1_penalty + l2_penalty
-        if self.smoothness_coeff > 0:
-            grad_mse = torch.autograd.grad(
-                outputs=mse,
-                inputs=X,
-                create_graph=True,
-                retain_graph=True,
-            )[0]
-            smoothness_penalty = self.smoothness_coeff * torch.mean(grad_mse ** 2)
-            loss += smoothness_penalty
+
+        # Reconstruct S = GP_pred + residual, in physical units (K).
+        # Longitude is periodic; latitude is not (the poles are distinct
+        # physical points, not neighbors), so dS/dy is a plain forward
+        # difference with no wrap — mirrors ST2D_GP_CNN.py.
+        if self.smoothness_coeff > 0 or self.wasserstein_coeff > 0:
+            gp_pred_scaled = X[:, self.n_phys:self.n_phys + 1, :, :]
+            gp_pred_phys   = gp_pred_scaled * self.gp_pred_scale + self.gp_pred_mean
+
+            residual_phys_pred = pred * self.out_scale + self.out_mean
+            S_pred = gp_pred_phys + residual_phys_pred
+
+            dSdx_pred = torch.roll(S_pred, shifts=-1, dims=3) - S_pred
+            dSdy_pred = S_pred[:, :, 1:, :] - S_pred[:, :, :-1, :]
+
+            if self.smoothness_coeff > 0:
+                sum_sq = dSdx_pred.pow(2).sum(dim=(1, 2, 3)) + dSdy_pred.pow(2).sum(dim=(1, 2, 3))
+                field_norm = torch.sqrt(sum_sq)
+                smoothness_penalty = self.smoothness_coeff * field_norm.mean()
+                loss += smoothness_penalty
+
+                self.log('train_smoothness', smoothness_penalty, on_step=True, on_epoch=True, prog_bar=True)
+
+            if self.wasserstein_coeff > 0:
+                residual_phys_true = y * self.out_scale + self.out_mean
+                S_true = gp_pred_phys + residual_phys_true
+
+                dSdx_true = torch.roll(S_true, shifts=-1, dims=3) - S_true
+                dSdy_true = S_true[:, :, 1:, :] - S_true[:, :, :-1, :]
+
+                # +1e-10: guards the sqrt backward pass against the exact-0
+                # pole-row gradients without biasing genuine nonzero values
+                # (see ST2D_GP_CNN.py for the full analysis).
+                mag_pred = torch.sqrt(dSdx_pred[:, :, :-1, :] ** 2 + dSdy_pred ** 2 + 1e-10)
+                mag_true = torch.sqrt(dSdx_true[:, :, :-1, :] ** 2 + dSdy_true ** 2 + 1e-10)
+
+                mag_pred_sorted = torch.sort(mag_pred.reshape(-1)).values
+                mag_true_sorted = torch.sort(mag_true.reshape(-1)).values
+                wasserstein_dist = torch.mean(torch.abs(mag_pred_sorted - mag_true_sorted))
+
+                wasserstein_penalty = self.wasserstein_coeff * wasserstein_dist
+                loss += wasserstein_penalty
+
+                self.log('train_wasserstein', wasserstein_penalty, on_step=True, on_epoch=True, prog_bar=True)
+
         self.log('train_mse',  mse,  on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
@@ -472,36 +525,42 @@ def build_data_module(partition_seed, batch_size, batch_seed=5):
 
 
 ##################################
-#### run_mode: search1 ############
+#### run_mode: search ############
 ##################################
-if run_mode == 'search1':
+if run_mode == 'search':
 
-    PARTITION_SEEDS = [4]           # Stage 1: single seed
+    # Every trial trains across all of these partition seeds and is scored on
+    # the mean validation loss — robustness to the train/valid/test split is
+    # baked into the objective directly, rather than checked in a second pass
+    # over the top candidates from a single-seed search.
+    PARTITION_SEEDS = [4, 7, 13, 42, 99]
 
-    SEARCH_BATCH_SEED  = 5
-    SEARCH_NN_SEED     = 6
-    SEARCH_LR_PATIENCE = 50
-    SEARCH_LR_FACTOR   = 0.7
-    SEARCH_LR_MIN      = 1e-7
-    SEARCH_N_EPOCHS    = 1000
-    SEARCH_ES_PATIENCE = 50   # tighter patience for faster search
+    SEARCH_BATCH_SEED    = 5
+    SEARCH_NN_SEED       = 6
+    SEARCH_SAMPLER_SEED  = 8
+    SEARCH_LR_PATIENCE   = 50
+    SEARCH_LR_FACTOR     = 0.7
+    SEARCH_LR_MIN        = 1e-7
+    SEARCH_N_EPOCHS      = 1000
+    SEARCH_ES_PATIENCE   = 50   # tighter patience for faster search
+    SEARCH_N_TRIALS      = 20   # GP-based BO is far more sample-efficient than TPE
 
     def print_trial_summary(study, trial):
         if trial.value is None:
             return
         print(f'\n--- Trial {trial.number} finished ---')
-        print(f'  Value (mean val loss): {trial.value:.6f}')
+        print(f'  Value (mean val loss across {len(PARTITION_SEEDS)} seeds): {trial.value:.6f}')
         print(f'  Params: {trial.params}')
         print(f'  Best so far: {study.best_value:.6f} (trial {study.best_trial.number})')
         print(f'  Trials completed: {len([t for t in study.trials if t.value is not None])}')
 
     def objective(trial):
-        lr_init          = trial.suggest_float('lr_init',    1e-4, 1e-2, log=True)
-        cnn_depth        = trial.suggest_categorical('cnn_depth',    [4, 7, 10, 14])
-        cnn_channels     = trial.suggest_categorical('cnn_channels', [32, 64, 128])
-        reg_l2           = trial.suggest_float('reg_l2',     1e-6, 1e-3, log=True)
-        smoothness_coeff = trial.suggest_categorical('smoothness_coeff', [0.0, 1e-2, 1e-1, 1.0])
-        batch_size       = trial.suggest_categorical('batch_size', [16, 32, 64])
+        lr_init           = trial.suggest_float('lr_init',    1e-4, 1e-2, log=True)
+        reg_l2            = trial.suggest_float('reg_l2',     1e-6, 1e-3, log=True)
+        wasserstein_coeff = trial.suggest_float('wasserstein_coeff', 1e-4, 1e-1, log=True)
+        cnn_depth         = trial.suggest_categorical('cnn_depth',    [4, 7, 10, 14])
+        cnn_channels      = trial.suggest_categorical('cnn_channels', [32, 64, 128])
+        batch_size        = trial.suggest_categorical('batch_size', [64, 128, 256])
 
         val_losses = []
 
@@ -526,12 +585,20 @@ if run_mode == 'search1':
                 reg_coeff_l1=0.0,
                 reg_coeff_l2=reg_l2,
                 weight_decay=0.0,
-                smoothness_coeff=smoothness_coeff,
+                smoothness_coeff=SEARCH_SMOOTHNESS_COEFF,
+                wasserstein_coeff=wasserstein_coeff,
+                out_scaler=_data_module.out_scaler,
+                in_scaler_pred=_data_module.in_scaler_pred,
+                n_phys=D,
                 lr_patience=SEARCH_LR_PATIENCE,
                 lr_factor=SEARCH_LR_FACTOR,
                 lr_min=SEARCH_LR_MIN,
             )
 
+            # Fresh pruning callback per seed: each seed's epoch curve is
+            # compared against other trials' curves at the same (per-seed)
+            # step, so a config that looks bad partway through any one seed
+            # gets pruned before burning time on the remaining seeds.
             pruning_callback = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
             early_stopping   = EarlyStopping(monitor='valid_loss', patience=SEARCH_ES_PATIENCE, mode='min')
             checkpoint       = ModelCheckpoint(
@@ -568,17 +635,20 @@ if run_mode == 'search1':
         interval_steps=10,
     )
 
+    sampler = optuna.samplers.GPSampler(seed=SEARCH_SAMPLER_SEED)
+
     study = optuna.create_study(
         direction='minimize',
+        sampler=sampler,
         pruner=pruner,
-        storage=f'sqlite:///{model_save_path}optuna_study_stage1.db',
-        study_name='st_map_cnn_stage1',
+        storage=f'sqlite:///{model_save_path}optuna_study.db',
+        study_name='st_map_cnn',
         load_if_exists=True,
     )
 
     study.optimize(
         objective,
-        n_trials=50,
+        n_trials=SEARCH_N_TRIALS,
         timeout=None,
         gc_after_trial=True,
         callbacks=[print_trial_summary],
@@ -593,16 +663,18 @@ if run_mode == 'search1':
         print(f'  {k}: {v}')
 
     results_df = study.trials_dataframe()
-    results_df.to_csv(model_save_path + 'optuna_results_stage1.csv', index=False)
-    print(f'\nFull results saved to {model_save_path}optuna_results_stage1.csv')
+    results_df.to_csv(model_save_path + 'optuna_results.csv', index=False)
+    print(f'\nFull results saved to {model_save_path}optuna_results.csv')
 
     print('\nTop 10 trials:')
     top10 = results_df[results_df['value'].notna()].sort_values('value').head(10)[[
         'number', 'value', 'params_lr_init', 'params_cnn_depth',
-        'params_cnn_channels', 'params_reg_l2', 'params_smoothness_coeff',
+        'params_cnn_channels', 'params_reg_l2', 'params_wasserstein_coeff',
         'params_batch_size',
     ]]
     print(top10.to_string(index=False))
+    print(f'\nPaste these into FINAL_PARAMS (smoothness_coeff stays fixed at '
+          f'SEARCH_SMOOTHNESS_COEFF={SEARCH_SMOOTHNESS_COEFF}) and set run_mode = "train"')
 
     # ── Clean up checkpoints from non-best trials ─────────────────────────────
     best_trial_number = study.best_trial.number
@@ -614,182 +686,6 @@ if run_mode == 'search1':
             if os.path.exists(trial_dir):
                 shutil.rmtree(trial_dir)
     print(f'\nCheckpoints from non-best trials removed. Best trial ({best_trial_number}) kept.')
-
-
-##################################
-#### run_mode: search2 ###########
-##################################
-elif run_mode == 'search2':
-
-    STAGE2_PARTITION_SEEDS = [4, 7, 13, 42, 99]
-    STAGE2_BATCH_SEED      = 5
-    STAGE2_NN_SEED         = 6
-    STAGE2_LR_PATIENCE     = 50
-    STAGE2_LR_FACTOR       = 0.7
-    STAGE2_LR_MIN          = 1e-7
-    STAGE2_N_EPOCHS        = 1000
-    STAGE2_ES_PATIENCE     = 100   # relaxed vs Stage 1 for fairer comparison
-    STAGE2_TOP_N           = 10
-
-    # ── Load Stage 1 results ──────────────────────────────────────────────────
-    stage1_csv = model_save_path + 'optuna_results_stage1.csv'
-    assert os.path.exists(stage1_csv), f'Stage 1 results not found at {stage1_csv}'
-
-    results_df = pd.read_csv(stage1_csv)
-
-    # Keep only completed (non-pruned) trials
-    completed = results_df[results_df['value'].notna()].copy()
-    top_configs = completed.sort_values('value').head(STAGE2_TOP_N).reset_index(drop=True)
-
-    print(f'\n=== Stage 2: Robustness evaluation of top {STAGE2_TOP_N} configs ===')
-    print(f'Partition seeds: {STAGE2_PARTITION_SEEDS}')
-    print(top_configs[[
-        'number', 'value', 'params_lr_init', 'params_cnn_depth',
-        'params_cnn_channels', 'params_reg_l2', 'params_smoothness_coeff',
-        'params_batch_size',
-    ]].to_string(index=False))
-
-    stage2_results = []
-
-    #Optuna logging
-    stage2_study = optuna.create_study(
-        direction='minimize',
-        storage=f'sqlite:///{model_save_path}optuna_study_stage2.db',
-        study_name='st_map_cnn_stage2',
-        load_if_exists=True,
-    )
-
-    for rank, row in top_configs.iterrows():
-        trial_num        = int(row['number'])
-        lr_init          = float(row['params_lr_init'])
-        cnn_depth        = int(row['params_cnn_depth'])
-        cnn_channels     = int(row['params_cnn_channels'])
-        reg_l2           = float(row['params_reg_l2'])
-        smoothness_coeff = float(row['params_smoothness_coeff'])
-        batch_size       = int(row['params_batch_size'])
-
-        print(f'\n--- Stage 2 | Rank {rank+1} | Stage-1 trial {trial_num} ---')
-        print(f'  lr={lr_init:.2e}, depth={cnn_depth}, channels={cnn_channels}, '
-              f'l2={reg_l2:.2e}, smooth={smoothness_coeff:.2e}, bs={batch_size}')
-
-        seed_val_losses = []
-
-        for p_seed in STAGE2_PARTITION_SEEDS:
-
-            data_module, _ = build_data_module(p_seed, batch_size, STAGE2_BATCH_SEED)
-
-            pl.seed_everything(STAGE2_NN_SEED, workers=True)
-            _model = ResidualCNN(
-                input_channels=D + 2,
-                hidden_channels=cnn_channels,
-                output_channels=1,
-                depth=cnn_depth,
-                img_height=IMG_H,
-                img_width=IMG_W,
-            )
-
-            _lightning_module = RegressionModule(
-                model=_model,
-                optimizer=Adam,
-                learning_rate=lr_init,
-                reg_coeff_l1=0.0,
-                reg_coeff_l2=reg_l2,
-                weight_decay=0.0,
-                smoothness_coeff=smoothness_coeff,
-                lr_patience=STAGE2_LR_PATIENCE,
-                lr_factor=STAGE2_LR_FACTOR,
-                lr_min=STAGE2_LR_MIN,
-            )
-
-            ckpt_dir = model_save_path + f'stage2_trial{trial_num}_seed{p_seed}/'
-            checkpoint_cb = ModelCheckpoint(
-                dirpath=ckpt_dir, monitor='valid_loss', mode='min', save_top_k=1,
-            )
-            early_stopping = EarlyStopping(
-                monitor='valid_loss', patience=STAGE2_ES_PATIENCE, mode='min',
-            )
-
-            trainer = Trainer(
-                max_epochs=STAGE2_N_EPOCHS,
-                callbacks=[checkpoint_cb, early_stopping],
-                enable_progress_bar=False,
-                logger=False,
-                deterministic=True,
-                enable_checkpointing=True,
-            )
-
-            trainer.fit(_lightning_module, datamodule=data_module)
-
-            best_val = checkpoint_cb.best_model_score
-            val_loss = best_val.item() if best_val is not None else float('nan')
-            seed_val_losses.append(val_loss)
-            print(f'  seed={p_seed}  ->  val_loss={val_loss:.6f}')
-
-        mean_loss  = float(np.nanmean(seed_val_losses))
-        std_loss   = float(np.nanstd(seed_val_losses))
-        worst_loss = float(np.nanmax(seed_val_losses))
-
-        # After the per-seed loop for each config:
-        trial = stage2_study.ask()
-        trial.suggest_float('lr_init',  lr_init,    lr_init)
-        trial.suggest_int(  'nn_depth', cnn_depth,   cnn_depth)
-        trial.suggest_int(  'nn_width', cnn_channels,   cnn_channels)
-        trial.suggest_float('reg_l2',   reg_l2,     reg_l2)
-        trial.suggest_float('smoothness_coeff',   smoothness_coeff,     smoothness_coeff)
-        trial.suggest_int(  'batch_size', batch_size, batch_size)
-        stage2_study.tell(trial, mean_loss)
-        
-        print(f'  => mean={mean_loss:.6f}  std={std_loss:.6f}  worst={worst_loss:.6f}')
-
-        stage2_results.append({
-            'stage1_trial'    : trial_num,
-            'stage1_val_loss' : float(row['value']),
-            'mean_val_loss'   : mean_loss,
-            'std_val_loss'    : std_loss,
-            'worst_val_loss'  : worst_loss,
-            'lr_init'         : lr_init,
-            'cnn_depth'       : cnn_depth,
-            'cnn_channels'    : cnn_channels,
-            'reg_l2'          : reg_l2,
-            'smoothness_coeff': smoothness_coeff,
-            'batch_size'      : batch_size,
-            'per_seed_losses' : seed_val_losses,
-        })
-
-    # ── Rank and save ─────────────────────────────────────────────────────────
-    stage2_df = pd.DataFrame(stage2_results).sort_values('mean_val_loss').reset_index(drop=True)
-    stage2_df.to_csv(model_save_path + 'stage2_results.csv', index=False)
-
-    print('\n=== Stage 2 Complete ===')
-    print('Rankings by mean val loss across seeds:')
-    print(stage2_df[[
-        'stage1_trial', 'stage1_val_loss', 'mean_val_loss', 'std_val_loss',
-        'worst_val_loss', 'lr_init', 'cnn_depth', 'cnn_channels',
-        'reg_l2', 'smoothness_coeff', 'batch_size',
-    ]].to_string(index=False))
-
-    best = stage2_df.iloc[0]
-    print(f'\nBest Stage-2 config (Stage-1 trial {int(best["stage1_trial"])}) :')
-    print(f'  mean_val_loss    = {best["mean_val_loss"]:.6f}  (std={best["std_val_loss"]:.6f})')
-    print(f'  lr_init          : {best["lr_init"]}')
-    print(f'  cnn_depth        : {int(best["cnn_depth"])}')
-    print(f'  cnn_channels     : {int(best["cnn_channels"])}')
-    print(f'  reg_l2           : {best["reg_l2"]}')
-    print(f'  smoothness_coeff : {best["smoothness_coeff"]}')
-    print(f'  batch_size       : {int(best["batch_size"])}')
-    print(f'\nPaste these into FINAL_PARAMS and set run_mode = "train"')
-    print(f'Full results saved to {model_save_path}stage2_results.csv')
-
-    # ── Clean up non-best checkpoints ────────────────────────────────────────
-    best_trial_num = int(best['stage1_trial'])
-    for row in stage2_results:
-        if row['stage1_trial'] == best_trial_num:
-            continue
-        for p_seed in STAGE2_PARTITION_SEEDS:
-            ckpt_dir = model_save_path + f'stage2_trial{int(row["stage1_trial"])}_seed{p_seed}/'
-            if os.path.exists(ckpt_dir):
-                shutil.rmtree(ckpt_dir)
-    print(f'Checkpoints from non-best Stage-2 configs removed.')
 
 
 ##################################
@@ -826,6 +722,10 @@ elif run_mode == 'train':
         reg_coeff_l2=p['reg_l2'],
         weight_decay=0.0,
         smoothness_coeff=p['smoothness_coeff'],
+        wasserstein_coeff=p['wasserstein_coeff'],
+        out_scaler=data_module.out_scaler,
+        in_scaler_pred=data_module.in_scaler_pred,
+        n_phys=D,
         lr_patience=FINAL_LR_PATIENCE,
         lr_factor=FINAL_LR_FACTOR,
         lr_min=FINAL_LR_MIN,
@@ -876,6 +776,15 @@ elif run_mode == 'evaluate':
         best_ckpt_path = f.read().strip()
 
     p = FINAL_PARAMS
+
+    # ── Rebuild data module with same partition seed ───────────────────────────
+    # Built before the RegressionModule below because its scalers are needed
+    # to construct the module (their fitted values get overwritten by the
+    # checkpoint's saved buffers on load, but the buffers must exist first).
+    data_module, test_idx = build_data_module(
+        FINAL_PARTITION_SEED, p['batch_size'], FINAL_BATCH_SEED
+    )
+
     _nn_rng = torch.Generator()
     _nn_rng.manual_seed(FINAL_NN_SEED)
     _model = ResidualCNN(
@@ -897,6 +806,10 @@ elif run_mode == 'evaluate':
         reg_coeff_l2=p['reg_l2'],
         weight_decay=0.0,
         smoothness_coeff=p['smoothness_coeff'],
+        wasserstein_coeff=p['wasserstein_coeff'],
+        out_scaler=data_module.out_scaler,
+        in_scaler_pred=data_module.in_scaler_pred,
+        n_phys=D,
         lr_patience=FINAL_LR_PATIENCE,
         lr_factor=FINAL_LR_FACTOR,
         lr_min=FINAL_LR_MIN,
@@ -905,11 +818,6 @@ elif run_mode == 'evaluate':
     model = lightning_module.model
     model.cpu()
     model.eval()
-
-    # ── Rebuild data module with same partition seed ───────────────────────────
-    data_module, test_idx = build_data_module(
-        FINAL_PARTITION_SEED, p['batch_size'], FINAL_BATCH_SEED
-    )
 
     saved_test_idx = np.load(model_save_path + 'test_idx.npy')
     assert np.array_equal(np.array(test_idx), saved_test_idx), \

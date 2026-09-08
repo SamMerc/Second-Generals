@@ -86,7 +86,7 @@ print(f"Using {device} device with {num_threads} threads")
 #############################
 #### run_mode selection  ####
 #############################
-run_mode = 'evaluate'   # 'search1' | 'search2' | 'train' | 'evaluate'
+run_mode = 'evaluate'   # 'search' | 'train' | 'evaluate'
 
 ## ── Parameters for 'train' and 'evaluate' modes ──────────────────────────────
 ## After the Optuna search completes, paste the best params here and switch
@@ -473,25 +473,31 @@ def build_data_module(partition_seed, batch_size, batch_seed=5):
 
 
 ##################################
-#### run_mode: search1 ############
+#### run_mode: search ############
 ##################################
-if run_mode == 'search1':
+if run_mode == 'search':
 
-    PARTITION_SEEDS = [4]           # Stage 1: single seed
+    # Every trial trains across all of these partition seeds and is scored on
+    # the mean validation loss — robustness to the train/valid/test split is
+    # baked into the objective directly, rather than checked in a second pass
+    # over the top candidates from a single-seed search.
+    PARTITION_SEEDS = [4, 7, 13, 42, 99]
 
-    SEARCH_BATCH_SEED  = 5
-    SEARCH_NN_SEED     = 6
-    SEARCH_LR_PATIENCE = 50
-    SEARCH_LR_FACTOR   = 0.7
-    SEARCH_LR_MIN      = 1e-7
-    SEARCH_N_EPOCHS    = 5000
-    SEARCH_ES_PATIENCE = 100   # tighter patience for faster search
+    SEARCH_BATCH_SEED   = 5
+    SEARCH_NN_SEED       = 6
+    SEARCH_SAMPLER_SEED  = 8
+    SEARCH_LR_PATIENCE    = 50
+    SEARCH_LR_FACTOR      = 0.7
+    SEARCH_LR_MIN         = 1e-7
+    SEARCH_N_EPOCHS       = 5000
+    SEARCH_ES_PATIENCE    = 100   # tighter patience for faster search
+    SEARCH_N_TRIALS       = 20    # GP-based BO is far more sample-efficient than TPE
 
     def print_trial_summary(study, trial):
         if trial.value is None:
             return   # pruned trial — skip
         print(f'\n--- Trial {trial.number} finished ---')
-        print(f'  Value (mean val loss): {trial.value:.6f}')
+        print(f'  Value (mean val loss across {len(PARTITION_SEEDS)} seeds): {trial.value:.6f}')
         print(f'  Params: {trial.params}')
         print(f'  Best so far: {study.best_value:.6f} (trial {study.best_trial.number})')
         print(f'  Trials completed: {len([t for t in study.trials if t.value is not None])}')
@@ -526,6 +532,10 @@ if run_mode == 'search1':
                 lr_min=SEARCH_LR_MIN,
             )
 
+            # Fresh pruning callback per seed: each seed's epoch curve is
+            # compared against other trials' curves at the same (per-seed)
+            # step, so a config that looks bad partway through any one seed
+            # gets pruned before burning time on the remaining seeds.
             pruning_callback = PyTorchLightningPruningCallback(trial, monitor='valid_loss')
             early_stopping   = EarlyStopping(monitor='valid_loss', patience=SEARCH_ES_PATIENCE, mode='min')
             checkpoint       = ModelCheckpoint(
@@ -562,17 +572,20 @@ if run_mode == 'search1':
         interval_steps=10,
     )
 
+    sampler = optuna.samplers.GPSampler(seed=SEARCH_SAMPLER_SEED)
+
     study = optuna.create_study(
         direction='minimize',
+        sampler=sampler,
         pruner=pruner,
-        storage=f'sqlite:///{model_save_path}optuna_study_stage1.db',
-        study_name='tp_profile_nn_stage1',
+        storage=f'sqlite:///{model_save_path}optuna_study.db',
+        study_name='tp_profile_nn',
         load_if_exists=True,
     )
 
     study.optimize(
         objective,
-        n_trials=50,
+        n_trials=SEARCH_N_TRIALS,
         timeout=None,
         gc_after_trial=True,
         callbacks=[print_trial_summary],
@@ -587,15 +600,16 @@ if run_mode == 'search1':
         print(f'  {k}: {v}')
 
     results_df = study.trials_dataframe()
-    results_df.to_csv(model_save_path + 'optuna_results_stage1.csv', index=False)
-    print(f'\nFull results saved to {model_save_path}optuna_results_stage1.csv')
+    results_df.to_csv(model_save_path + 'optuna_results.csv', index=False)
+    print(f'\nFull results saved to {model_save_path}optuna_results.csv')
 
     print('\nTop 10 trials:')
-    top10 = results_df.sort_values('value').head(10)[[
+    top10 = results_df[results_df['value'].notna()].sort_values('value').head(10)[[
         'number', 'value', 'params_lr_init', 'params_nn_depth',
         'params_nn_width', 'params_reg_l2', 'params_smoothness_coeff', 'params_batch_size'
     ]]
     print(top10.to_string(index=False))
+    print(f'\nPaste these into FINAL_PARAMS and set run_mode = "train"')
 
     # ── Clean up checkpoints from non-best trials ────────────────────────────
     best_trial_number = study.best_trial.number
@@ -607,173 +621,6 @@ if run_mode == 'search1':
             if os.path.exists(trial_dir):
                 shutil.rmtree(trial_dir)
     print(f'\nCheckpoints from non-best trials removed. Best trial ({best_trial_number}) kept.')
-
-##################################
-#### run_mode: search2 ###########
-##################################
-elif run_mode == 'search2':
-
-    STAGE2_PARTITION_SEEDS = [4, 7, 13, 42, 99]  # 5 seeds for robustness evaluation
-    STAGE2_BATCH_SEED      = 5
-    STAGE2_NN_SEED         = 6
-    STAGE2_LR_PATIENCE     = 50
-    STAGE2_LR_FACTOR       = 0.7
-    STAGE2_LR_MIN          = 1e-7
-    STAGE2_N_EPOCHS        = 5000
-    STAGE2_ES_PATIENCE     = 200   # relaxed vs Stage 1 for fairer comparison
-    #Stage 1 used a tighter patience to speed up the search. 
-    #Stage 2 uses your intended final patience so the comparison is fair and reflects how the model
-    #will actually behave in train mode.
-    STAGE2_TOP_N           = 10
-
-    # ── Load Stage 1 results and extract top N configs ────────────────────────
-    stage1_csv = model_save_path + 'optuna_results_stage1.csv'
-    assert os.path.exists(stage1_csv), f'Stage 1 results not found at {stage1_csv}'
-
-    results_df = pd.read_csv(stage1_csv)
-
-    # Keep only completed (non-pruned) trials
-    completed = results_df[results_df['value'].notna()].copy()
-    top_configs = completed.sort_values('value').head(STAGE2_TOP_N).reset_index(drop=True)
-
-    print(f'\n=== Stage 2: Robustness evaluation of top {STAGE2_TOP_N} configs ===')
-    print(f'Partition seeds: {STAGE2_PARTITION_SEEDS}')
-    print(top_configs[['number', 'value', 'params_lr_init', 'params_nn_depth',
-                        'params_nn_width', 'params_reg_l2', 'params_smoothness_coeff', 'params_batch_size']].to_string(index=False))
-
-    stage2_results = []
-
-    #Optuna logging
-    stage2_study = optuna.create_study(
-        direction='minimize',
-        storage=f'sqlite:///{model_save_path}optuna_study_stage2.db',
-        study_name='tp_profile_nn_stage2',
-        load_if_exists=True,
-    )
-
-    for rank, row in top_configs.iterrows():
-        trial_num        = int(row['number'])
-        lr_init          = float(row['params_lr_init'])
-        nn_depth         = int(row['params_nn_depth'])
-        nn_width         = int(row['params_nn_width'])
-        reg_l2           = float(row['params_reg_l2'])
-        smoothness_coeff = float(row['params_smoothness_coeff'])
-        batch_size       = int(row['params_batch_size'])
-
-        print(f'\n--- Stage 2 | Rank {rank+1} | Stage-1 trial {trial_num} ---')
-        print(f'  lr={lr_init:.2e}, depth={nn_depth}, width={nn_width}, '
-              f'l2={reg_l2:.2e}, smooth={smoothness_coeff:.2e}, bs={batch_size}')
-
-        seed_val_losses = []
-
-        for p_seed in STAGE2_PARTITION_SEEDS:
-
-            data_module, _ = build_data_module(p_seed, batch_size, STAGE2_BATCH_SEED)
-
-            pl.seed_everything(STAGE2_NN_SEED, workers=True)
-            _model = NeuralNetwork(D + 4*O, nn_width, 2*O, nn_depth)
-
-            _lightning_module = RegressionModule(
-                model=_model,
-                optimizer=Adam,
-                learning_rate=lr_init,
-                reg_coeff_l1=0.0,
-                reg_coeff_l2=reg_l2,
-                weight_decay=0.0,
-                smoothness_coeff=smoothness_coeff,
-                lr_patience=STAGE2_LR_PATIENCE,
-                lr_factor=STAGE2_LR_FACTOR,
-                lr_min=STAGE2_LR_MIN,
-            )
-
-            ckpt_dir = model_save_path + f'stage2_trial{trial_num}_seed{p_seed}/'
-            checkpoint_cb = ModelCheckpoint(
-                dirpath=ckpt_dir,
-                monitor='valid_loss', mode='min', save_top_k=1,
-            )
-            early_stopping = EarlyStopping(
-                monitor='valid_loss', patience=STAGE2_ES_PATIENCE, mode='min',
-            )
-
-            trainer = Trainer(
-                max_epochs=STAGE2_N_EPOCHS,
-                callbacks=[checkpoint_cb, early_stopping],
-                enable_progress_bar=False,
-                logger=False,
-                deterministic=True,
-                enable_checkpointing=True,
-            )
-
-            trainer.fit(_lightning_module, datamodule=data_module)
-
-            best_val = checkpoint_cb.best_model_score
-            val_loss = best_val.item() if best_val is not None else float('nan')
-            seed_val_losses.append(val_loss)
-            print(f'  seed={p_seed}  ->  val_loss={val_loss:.6f}')
-
-        mean_loss   = float(np.nanmean(seed_val_losses))
-        std_loss    = float(np.nanstd(seed_val_losses))
-        worst_loss  = float(np.nanmax(seed_val_losses))
-
-        # After the per-seed loop for each config:
-        trial = stage2_study.ask()
-        trial.suggest_float('lr_init',  lr_init,    lr_init)
-        trial.suggest_int(  'nn_depth', nn_depth,   nn_depth)
-        trial.suggest_int(  'nn_width', nn_width,   nn_width)
-        trial.suggest_float('reg_l2',   reg_l2,     reg_l2)
-        trial.suggest_float('smoothness_coeff',   smoothness_coeff,     smoothness_coeff)
-        trial.suggest_int(  'batch_size', batch_size, batch_size)
-        stage2_study.tell(trial, mean_loss)
-
-        print(f'  => mean={mean_loss:.6f}  std={std_loss:.6f}  worst={worst_loss:.6f}')
-
-        stage2_results.append({
-            'stage1_trial'    : trial_num,
-            'stage1_val_loss' : float(row['value']),
-            'mean_val_loss'   : mean_loss,
-            'std_val_loss'    : std_loss,
-            'worst_val_loss'  : worst_loss,
-            'lr_init'         : lr_init,
-            'nn_depth'        : nn_depth,
-            'nn_width'        : nn_width,
-            'reg_l2'          : reg_l2,
-            'smoothness_coeff': smoothness_coeff,
-            'batch_size'      : batch_size,
-            'per_seed_losses' : seed_val_losses,
-        })
-
-    # ── Rank by mean val loss ─────────────────────────────────────────────────
-    stage2_df = pd.DataFrame(stage2_results).sort_values('mean_val_loss').reset_index(drop=True)
-    stage2_df.to_csv(model_save_path + 'stage2_results.csv', index=False)
-
-    print('\n=== Stage 2 Complete ===')
-    print('Rankings by mean val loss across seeds:')
-    print(stage2_df[['stage1_trial', 'stage1_val_loss', 'mean_val_loss',
-                      'std_val_loss', 'worst_val_loss', 'lr_init', 'nn_depth',
-                      'nn_width', 'reg_l2', 'smoothness_coeff', 'batch_size']].to_string(index=False))
-
-    best = stage2_df.iloc[0]
-    print(f'\nBest Stage-2 config (Stage-1 trial {int(best["stage1_trial"])}) :')
-    print(f'  mean_val_loss = {best["mean_val_loss"]:.6f}  (std={best["std_val_loss"]:.6f})')
-    print(f'  lr_init          : {best["lr_init"]}')
-    print(f'  nn_depth         : {int(best["nn_depth"])}')
-    print(f'  nn_width         : {int(best["nn_width"])}')
-    print(f'  reg_l2           : {best["reg_l2"]}')
-    print(f'  smoothness_coeff : {best["smoothness_coeff"]}')
-    print(f'  batch_size       : {int(best["batch_size"])}')
-    print(f'\nPaste these into FINAL_PARAMS and set run_mode = "train"')
-    print(f'Full results saved to {model_save_path}stage2_results.csv')
-
-    # ── Clean up checkpoints from non-best configs ────────────────────────────
-    best_trial_num = int(best['stage1_trial'])
-    for row in stage2_results:
-        if row['stage1_trial'] == best_trial_num:
-            continue
-        for p_seed in STAGE2_PARTITION_SEEDS:
-            ckpt_dir = model_save_path + f'stage2_trial{int(row["stage1_trial"])}_seed{p_seed}/'
-            if os.path.exists(ckpt_dir):
-                shutil.rmtree(ckpt_dir)
-    print(f'Checkpoints from non-best Stage-2 configs removed.')
 
 ##################################
 #### run_mode: train #############
