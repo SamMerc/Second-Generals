@@ -6,6 +6,7 @@ os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
+import gc
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -554,14 +555,22 @@ if run_mode == 'search':
 
             try:
                 _trainer.fit(_lightning_module, datamodule=_data_module)
-            except optuna.exceptions.TrialPruned:
-                raise
 
-            best_val = checkpoint.best_model_score
-            if best_val is None:
-                raise optuna.exceptions.TrialPruned()
+                best_val = checkpoint.best_model_score
+                if best_val is None:
+                    raise optuna.exceptions.TrialPruned()
 
-            val_losses.append(best_val.item())
+                val_losses.append(best_val.item())
+            finally:
+                # Explicit teardown between seeds: five fresh Trainers/
+                # DataModules/models get built per trial (one per seed), and
+                # relying on Python's GC timing to reclaim them let memory
+                # creep up across a multi-day run until a large-enough model
+                # finally triggered a host-OOM SIGBUS ("Bus error").
+                del _trainer, _lightning_module, _model, _data_module
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         return float(np.mean(val_losses))
 
