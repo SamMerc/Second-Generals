@@ -114,6 +114,10 @@ regularization_coeff_l2 = 5e-5
 #Smoothness constraint coefficient
 smoothness_coeff = 1e-3
 
+#Wasserstein distance coefficient (batch-level W1 distance between predicted
+#and true |grad S| ECDFs)
+wasserstein_coeff = 1e-3
+
 #Weight decay
 weight_decay = 0.0
 
@@ -313,25 +317,27 @@ data_module = CustomDataModule(
 class RegressionModule(pl.LightningModule):
     def __init__(self, model, optimizer, learning_rate, weight_decay=0.0,
                  reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0,
+                 wasserstein_coeff=0.0,
                  out_scaler=None, img_height=None, img_width=None,
                  lr_patience=10, lr_factor=0.5, lr_min=1e-7):
         super().__init__()
-        self.model            = model
-        self.learning_rate    = learning_rate
-        self.reg_coeff_l1     = reg_coeff_l1
-        self.reg_coeff_l2     = reg_coeff_l2
-        self.smoothness_coeff = smoothness_coeff
-        self.weight_decay     = weight_decay
-        self.loss_fn          = nn.MSELoss()
-        self.optimizer_class  = optimizer
-        self.lr_patience      = lr_patience
-        self.lr_factor        = lr_factor
-        self.lr_min           = lr_min
+        self.model             = model
+        self.learning_rate     = learning_rate
+        self.reg_coeff_l1      = reg_coeff_l1
+        self.reg_coeff_l2      = reg_coeff_l2
+        self.smoothness_coeff  = smoothness_coeff
+        self.wasserstein_coeff = wasserstein_coeff
+        self.weight_decay      = weight_decay
+        self.loss_fn           = nn.MSELoss()
+        self.optimizer_class   = optimizer
+        self.lr_patience       = lr_patience
+        self.lr_factor         = lr_factor
+        self.lr_min            = lr_min
 
-        # Buffer to un-scale the predicted map back to physical units (K), so
-        # the smoothness penalty is computed on the reconstructed temperature
-        # map S = pred (no GP baseline to add) rather than on the
-        # standardized network output.
+        # Buffer to un-scale the predicted (and true) map back to physical
+        # units (K), so the smoothness/Wasserstein penalties are computed on
+        # the reconstructed temperature map S = pred (no GP baseline to add)
+        # rather than on the standardized network output.
         self.register_buffer('out_mean',  torch.tensor(out_scaler.mean_,  dtype=torch.float32).view(1, 1, img_height, img_width))
         self.register_buffer('out_scale', torch.tensor(out_scaler.scale_, dtype=torch.float32).view(1, 1, img_height, img_width))
 
@@ -367,26 +373,60 @@ class RegressionModule(pl.LightningModule):
         l1_penalty, l2_penalty = self.compute_weight_regularization()
         loss = mse + l1_penalty + l2_penalty
 
-        # Smoothness penalty: L2 norm of the predicted map's spatial gradient.
+        # Reconstruct S = pred, in physical units (K) (no GP baseline to add).
         # Longitude is genuinely periodic (edge cells wrap to their neighbor
         # on the opposite side of the map), but latitude is not — the two
         # poles are distinct physical points, not neighbors — so dS/dy uses a
         # plain forward difference with no wrap.
-        if self.smoothness_coeff > 0:
+        if self.smoothness_coeff > 0 or self.wasserstein_coeff > 0:
             S_pred = pred * self.out_scale + self.out_mean
 
             dSdx_pred = torch.roll(S_pred, shifts=-1, dims=3) - S_pred   # periodic in longitude
             dSdy_pred = S_pred[:, :, 1:, :] - S_pred[:, :, :-1, :]        # no pole wrap-around → (batch, 1, H-1, W)
 
-            # dSdx and dSdy live on different-sized grids (dSdy has no row at
-            # the last pole boundary), so sum their squares separately
-            # before adding.
-            sum_sq = dSdx_pred.pow(2).sum(dim=(1, 2, 3)) + dSdy_pred.pow(2).sum(dim=(1, 2, 3))
-            field_norm = torch.sqrt(sum_sq)   # (batch,)
-            smoothness_penalty = self.smoothness_coeff * field_norm.mean()
-            loss += smoothness_penalty
+            # Smoothness penalty: L2 norm of the predicted gradient field per
+            # sample. dSdx and dSdy live on different-sized grids (dSdy has
+            # no row at the last pole boundary), so sum their squares
+            # separately before adding.
+            if self.smoothness_coeff > 0:
+                sum_sq = dSdx_pred.pow(2).sum(dim=(1, 2, 3)) + dSdy_pred.pow(2).sum(dim=(1, 2, 3))
+                field_norm = torch.sqrt(sum_sq)   # (batch,)
+                smoothness_penalty = self.smoothness_coeff * field_norm.mean()
+                loss += smoothness_penalty
 
-            self.log('train_smoothness', smoothness_penalty, on_step=True, on_epoch=True, prog_bar=True)
+                self.log('train_smoothness', smoothness_penalty, on_step=True, on_epoch=True, prog_bar=True)
+
+            # Wasserstein penalty: pushes the batch-pooled ECDF of the
+            # predicted gradient magnitude |grad S| toward the true one,
+            # rather than just penalizing roughness in general (mirrors
+            # ST2D_GP_CNN.py / ST2D_GP_CNN_Tuning.py).
+            if self.wasserstein_coeff > 0:
+                S_true = y * self.out_scale + self.out_mean
+
+                dSdx_true = torch.roll(S_true, shifts=-1, dims=3) - S_true
+                dSdy_true = S_true[:, :, 1:, :] - S_true[:, :, :-1, :]
+
+                # Gradient magnitude, only where both components are defined
+                # (crop dSdx's last, pole-adjacent row to match dSdy's extent).
+                # +1e-10 inside the sqrt guards the sqrt backward pass against
+                # the exact-0 pole-row gradients without biasing genuine
+                # nonzero values (see ST2D_GP_CNN.py for the full analysis).
+                mag_pred = torch.sqrt(dSdx_pred[:, :, :-1, :] ** 2 + dSdy_pred ** 2 + 1e-10)
+                mag_true = torch.sqrt(dSdx_true[:, :, :-1, :] ** 2 + dSdy_true ** 2 + 1e-10)
+
+                # 1-Wasserstein distance between the batch's pooled |grad S|
+                # distributions: for two empirical distributions with equal
+                # sample count, W1 is the mean absolute gap between sorted
+                # order statistics. torch.sort is differentiable, so
+                # gradients flow straight through.
+                mag_pred_sorted = torch.sort(mag_pred.reshape(-1)).values
+                mag_true_sorted = torch.sort(mag_true.reshape(-1)).values
+                wasserstein_dist = torch.mean(torch.abs(mag_pred_sorted - mag_true_sorted))
+
+                wasserstein_penalty = self.wasserstein_coeff * wasserstein_dist
+                loss += wasserstein_penalty
+
+                self.log('train_wasserstein', wasserstein_penalty, on_step=True, on_epoch=True, prog_bar=True)
 
         # Log metrics
         self.log('train_mse', mse, on_step=True, on_epoch=True, prog_bar=True)
@@ -449,6 +489,7 @@ lightning_module = RegressionModule(
     reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay,
     smoothness_coeff=smoothness_coeff,
+    wasserstein_coeff=wasserstein_coeff,
     out_scaler=data_module.out_scaler,
     img_height=IMG_H,
     img_width=IMG_W,
@@ -529,6 +570,7 @@ else:
         reg_coeff_l2=regularization_coeff_l2,
         weight_decay=weight_decay,
         smoothness_coeff=smoothness_coeff,
+        wasserstein_coeff=wasserstein_coeff,
         out_scaler=data_module.out_scaler,
         img_height=IMG_H,
         img_width=IMG_W,
@@ -559,10 +601,14 @@ metrics_df = pd.read_csv(csv_path)
 train_losses = metrics_df[metrics_df['train_mse_epoch'].notna()]['train_mse_epoch'].tolist()
 eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
 
-# Smoothness penalty is only logged when its coeff > 0 (see training_step)
+# Smoothness/Wasserstein penalties are only logged when their coeff > 0 (see training_step)
 plot_smoothness = smoothness_coeff > 0 and 'train_smoothness_epoch' in metrics_df.columns
 if plot_smoothness:
     smoothness_losses = metrics_df[metrics_df['train_smoothness_epoch'].notna()]['train_smoothness_epoch'].tolist()
+
+plot_wasserstein = wasserstein_coeff > 0 and 'train_wasserstein_epoch' in metrics_df.columns
+if plot_wasserstein:
+    wasserstein_losses = metrics_df[metrics_df['train_wasserstein_epoch'].notna()]['train_wasserstein_epoch'].tolist()
 
 
 
@@ -571,7 +617,7 @@ if plot_smoothness:
 #### Diagnostic plots ####
 ##########################
 # Loss curves
-n_extra_panels = int(plot_smoothness)
+n_extra_panels = int(plot_smoothness) + int(plot_wasserstein)
 n_rows        = 2 + n_extra_panels
 height_ratios = [3, 1] + [1] * n_extra_panels
 fig, axes = plt.subplots(
@@ -611,8 +657,9 @@ ax1.legend()
 ax1.grid()
 ax2.grid()
 
+next_ax_idx = 2
 if plot_smoothness:
-    ax3 = axes[2]
+    ax3 = axes[next_ax_idx]; next_ax_idx += 1
     smoothness_epoch = [smoothness_losses[0]] + smoothness_losses[n_batches-1::n_batches]
     ax3.plot(x_all, smoothness_losses, alpha=0.3, color='C3', linewidth=0.5)
     ax3.plot(x_epoch, smoothness_epoch, label="Smoothness Penalty", color='C3', linewidth=2, marker='o')
@@ -620,6 +667,16 @@ if plot_smoothness:
     ax3.set_ylabel("Smoothness\nPenalty")
     ax3.legend()
     ax3.grid()
+
+if plot_wasserstein:
+    ax4 = axes[next_ax_idx]; next_ax_idx += 1
+    wasserstein_epoch = [wasserstein_losses[0]] + wasserstein_losses[n_batches-1::n_batches]
+    ax4.plot(x_all, wasserstein_losses, alpha=0.3, color='C4', linewidth=0.5)
+    ax4.plot(x_epoch, wasserstein_epoch, label="Wasserstein Penalty", color='C4', linewidth=2, marker='o')
+    ax4.set_yscale('log')
+    ax4.set_ylabel("Wasserstein\nPenalty")
+    ax4.legend()
+    ax4.grid()
 
 axes[-1].set_xlabel("Epoch")
 plt.subplots_adjust(hspace=0)
