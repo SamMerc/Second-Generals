@@ -1,24 +1,28 @@
 #############################
 #### Importing libraries ####
 #############################
+import os
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
-from torch.optim import SGD, Adam
+from torch.optim import Adam
+import torch.optim.lr_scheduler as lr_scheduler
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning import Trainer
 import pytorch_lightning as pl
-import os
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from torchinfo import summary
+from sklearn.preprocessing import StandardScaler
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import seaborn as sns
-
-
-
+from time import time
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+torch.set_float32_matmul_precision('high')
 
 ##########################################################
 #### Importing raw data and defining hyper-parameters ####
@@ -26,33 +30,52 @@ import seaborn as sns
 #Defining function to check if directory exists, if not it generates it
 def check_and_make_dir(dir):
     if not os.path.isdir(dir):os.mkdir(dir)
-#Base directory 
+#Base directory
 base_dir = '/Users/samsonmercier/Desktop/Work/PhD/Research/Second_Generals/'
 #File containing surface temperature map
-raw_ST_data = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
+raw_data3000 = np.loadtxt(base_dir+'Data/bt-3000k/training_data_ST2D.csv', delimiter=',')
+raw_data4500 = np.loadtxt(base_dir+'Data/bt-4500k/training_data_ST2D.csv', delimiter=',')
 #Path to store model
-model_save_path = base_dir+'Model_Storage/NN_ST_fixedstand_nosmooth_noreg_nobatchnorm/'
+model_save_path = base_dir+'Model_Storage/nn_only_CNN/'
 check_and_make_dir(model_save_path)
 #Path to store plots
-plot_save_path = base_dir+'Plots/NN_ST_fixedstand_nosmooth_noreg_nobatchnorm/'
+plot_save_path = base_dir+'Plots/nn_only_CNN/'
 check_and_make_dir(plot_save_path)
 
-#Last 51 columns are the temperature/pressure values, 
+#Last 51 columns are the temperature/pressure values,
 #First 5 are the input values (H2 pressure in bar, CO2 pressure in bar, LoD in hours, Obliquity in deg, H2+Co2 pressure) but we remove the last one since it's not adding info.
-raw_inputs = raw_ST_data[:, :4] #has shape 46 x 72 = 3,312
-raw_outputs = raw_ST_data[:, 5:]
+# Extract the 4 physical inputs and append stellar temperature as 5th column
+inputs_3000 = np.hstack([raw_data3000[:, :4], np.full((len(raw_data3000), 1), 3000.0)])
+inputs_4500 = np.hstack([raw_data4500[:, :4], np.full((len(raw_data4500), 1), 4500.0)])
 
-#Storing useful quantitites
+# Concatenate along the sample axis
+raw_inputs  = np.vstack([inputs_3000,           inputs_4500          ])
+raw_outputs = np.vstack([raw_data3000[:, 5:],   raw_data4500[:, 5:] ])
+
+#Storing useful quantities
 N = raw_inputs.shape[0] #Number of data points
 D = raw_inputs.shape[1] #Number of features
+O = raw_outputs.shape[1] #Number of outputs
 
-## HYPER-PARAMETERS ##
-#Defining partition of data used for 1. training, 2. validation and 3. testing
-data_partitions = [0.7, 0.1, 0.2]
+# Map geometry
+IMG_H, IMG_W = 46, 72
+assert O == IMG_H * IMG_W, f"Output dim {O} != {IMG_H}x{IMG_W}"
+
+# Shuffle data
+shuffle_seed = 3
+np.random.seed(shuffle_seed)
+rp = np.random.permutation(N) #random permutation of the indices
+# Apply random permutation to shuffle the data
+raw_inputs  = raw_inputs[rp, :]
+raw_outputs = raw_outputs[rp, :]
+
+## HYPER-PARAMETERS for NN ##
+#Definine partitiion for splitting NN dataset
+data_partition = [0.7, 0.1, 0.2]
 
 #Defining the device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-num_threads = 1
+num_threads = 96
 torch.set_num_threads(num_threads)
 print(f"Using {device} device with {num_threads} threads")
 
@@ -71,27 +94,37 @@ NN_seed = 6
 NN_rng = torch.Generator()
 NN_rng.manual_seed(NN_seed)
 
-#Normalization layer to use in the CNN
-norm = 'batch' # can be 'batch', 'group', 'layer' or None
+# Variable to show plots or not
+show_plot = False
 
-#Optimizer learning rate
-learning_rate = 1e-3
+#CNN width (feature channels) and depth (number of residual conv blocks)
+cnn_hidden_channels = 64
+cnn_depth = 7
+
+# Optimizer learning rate schedule - ReduceLROnPlateau
+lr_init      = 1e-3   # initial LR — ReduceLROnPlateau will reduce from here
+lr_patience  = 15     # epochs to wait before reducing LR
+lr_factor    = 0.7    # multiply LR by this when plateauing
+lr_min       = 1e-7   # floor
 
 #Regularization coefficient
 regularization_coeff_l1 = 0.0
-regularization_coeff_l2 = 0.0
+regularization_coeff_l2 = 5e-5
 
 #Smoothness constraint coefficient
-smoothness_coeff = 0.0
+smoothness_coeff = 1e-3
 
-#Weight decay 
+#Weight decay
 weight_decay = 0.0
 
-#Batch size 
-batch_size = 64
+#Batch size
+batch_size = 128
 
-#Number of epochs 
-n_epochs = 10
+#Number of epochs
+n_epochs = 1000
+
+#Early stopping patience (in epochs)
+early_stopping_patience = 50
 
 #Mode for optimization
 run_mode = 'use'
@@ -99,203 +132,176 @@ run_mode = 'use'
 
 
 
-
-
-
-##############################################
-#### Partition data and generate datasets ####
-##############################################
-# PyTorch Lightning DataModule
-class CustomDataModule(pl.LightningDataModule):
-    def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs, 
-                 test_inputs, test_outputs, batch_size, rng, reshape_for_cnn=False, 
-                 img_channels=1, img_height=None, img_width=None):
-        super().__init__()
-
-        #Store original shapes for reshaping 
-        self.batch_size = batch_size
-        self.rng = rng
-        self.reshape_for_cnn = reshape_for_cnn
-        self.img_channels = img_channels
-        self.img_height = img_height
-        self.img_width = img_width
-        
-        # Standardizing the output
-        ## Create scaler
-        out_scaler = MinMaxScaler()
-        
-        ## Fit scaler on training dataset (convert to numpy)
-        out_scaler.fit(train_outputs.cpu().numpy())
-        
-        ## Transform all datasets and convert back to tensors
-        train_outputs = torch.tensor(out_scaler.transform(train_outputs.cpu().numpy()), dtype=torch.float32)
-        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.cpu().numpy()), dtype=torch.float32)
-        test_outputs = torch.tensor(out_scaler.transform(test_outputs.cpu().numpy()), dtype=torch.float32)
-        
-        # Store the scaler if you need to inverse transform later
-        self.out_scaler = out_scaler
-        
-        # Normalizing the input
-        ## Create scaler
-        in_scaler = StandardScaler()
-        
-        ## Fit scaler on training dataset (convert to numpy)
-        in_scaler.fit(train_inputs.cpu().numpy())
-        
-        ## Transform all datasets and convert back to tensors
-        train_inputs = torch.tensor(in_scaler.transform(train_inputs.cpu().numpy()), dtype=torch.float32)
-        valid_inputs = torch.tensor(in_scaler.transform(valid_inputs.cpu().numpy()), dtype=torch.float32)
-        test_inputs = torch.tensor(in_scaler.transform(test_inputs.cpu().numpy()), dtype=torch.float32)
-        
-        # Store the scaler if you need to inverse transform later
-        self.in_scaler = in_scaler
-        
-        #Store the inputs
-        self.train_inputs = train_inputs
-        self.valid_inputs = valid_inputs
-        self.test_inputs = test_inputs
-
-        # Reshape data if needed for CNN
-        if reshape_for_cnn:
-            # Reshape inputs
-            if img_height is None or img_width is None:
-                # Auto-calculate square dimensions if not provided
-                total_features = train_inputs.shape[1]
-                img_size = int(np.sqrt(total_features / img_channels))
-                if img_size * img_size * img_channels != total_features:
-                    raise ValueError(f"Cannot reshape {total_features} features into square image. "
-                                     f"Please provide img_height and img_width explicitly.")
-                self.img_height = img_size
-                self.img_width = img_size
-            
-            self.train_outputs = train_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
-            self.valid_outputs = valid_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
-            self.test_outputs = test_outputs.reshape(-1, img_channels, self.img_height, self.img_width)
-
-        else:
-            self.train_outputs = train_outputs
-            self.valid_outputs = valid_outputs
-            self.test_outputs = test_outputs
-    
-    def train_dataloader(self):
-        dataset = TensorDataset(self.train_inputs, self.train_outputs)
-        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, generator=self.rng)
-    
-    def val_dataloader(self):
-        dataset = TensorDataset(self.valid_inputs, self.valid_outputs)
-        return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
-    
-    def test_dataloader(self):
-        dataset = TensorDataset(self.test_inputs, self.test_outputs)
-        return DataLoader(dataset, batch_size=self.batch_size, generator=self.rng)
-
-#Splitting the data 
-
-## Retrieving indices of data partitions
-train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(N), data_partitions, generator=partition_rng)
-
-## Generate the data partitions
-### Training
-train_inputs = torch.tensor(raw_inputs[train_idx], dtype=torch.float32)
-train_outputs = torch.tensor(raw_outputs[train_idx], dtype=torch.float32)
-### Validation
-valid_inputs = torch.tensor(raw_inputs[valid_idx], dtype=torch.float32)
-valid_outputs = torch.tensor(raw_outputs[valid_idx], dtype=torch.float32)
-### Testing
-test_inputs = torch.tensor(raw_inputs[test_idx], dtype=torch.float32)
-test_outputs = torch.tensor(raw_outputs[test_idx], dtype=torch.float32)
-
-# Create DataModule
-data_module = CustomDataModule(
-    train_inputs, train_outputs,
-    valid_inputs, valid_outputs,
-    test_inputs, test_outputs,
-    batch_size, batch_rng, reshape_for_cnn=True,
-    img_channels=1, img_height=46, img_width=72
-)
-
-
 ###################
 #### Build CNN ####
 ###################
+class ResidualConvBlock(nn.Module):
+    """2-conv residual block with skip connection (mirrors TP_MLP.py's ResidualBlock)."""
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+        )
+        self.activation = nn.GELU()
+
+    def forward(self, x):
+        return self.activation(x + self.block(x))   # ← skip connection
+
 class CNN(nn.Module):
-    def __init__(self, input_dim, output_channels, generator=None):
-        super(CNN, self).__init__()
-        
-        # Set seed if generator provided
+    """
+    Mirrors the MLP architecture pattern from TP_MLP.py:
+      input_proj -> depth x ResidualBlock -> output_proj
+
+    Unlike ST2D_GP_CNN.py, there is no ens-CGP prediction/uncertainty map to
+    supply as spatial input channels, so the single input_proj layer takes
+    over that role: it projects the D raw physical inputs directly to a
+    full-resolution (hidden_channels, H, W) feature map, analogous to how
+    TP_MLP.py's input_proj (D -> hidden_dim) replaces the ens-CGP inputs of
+    TP_GP_MLP.py. From there the residual conv blocks and output_proj are
+    the direct 2-D counterparts of TP_MLP.py's residual blocks and
+    output_proj.
+    """
+    def __init__(self, input_dim, hidden_channels, depth, img_height, img_width, generator=None):
+        super().__init__()
         if generator is not None:
             torch.manual_seed(generator.initial_seed())
 
-        # Project input parameters to a higher dimension
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 128 * 6 * 9)  # 6x9 feature maps with 128 channels
-        )
+        self.hidden_channels = hidden_channels
+        self.img_height = img_height
+        self.img_width = img_width
 
-        # Helper function to get normalization layer
-        def get_norm(channels):
-            if norm == 'batch':
-                return nn.BatchNorm2d(channels)
-            elif norm == 'group':
-                return nn.GroupNorm(num_groups=32, num_channels=channels)  # 32 groups
-            elif norm == 'layer':
-                return nn.GroupNorm(num_groups=1, num_channels=channels)  # LayerNorm equivalent
-            else:  # None
-                return nn.Identity()
-            
-        # Decoder layers - progressively upsample
-        self.decoder = nn.Sequential(
-            # Input: 128 x 6 x 9
-            nn.ConvTranspose2d(128, 128, kernel_size=4, stride=2, padding=1),
-            get_norm(128),
-            nn.ReLU(inplace=True),
-            # Output: 128 x 12 x 18
-            
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            get_norm(64),
-            nn.ReLU(inplace=True),
-            # Output: 64 x 24 x 36
-            
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            get_norm(32),
-            nn.ReLU(inplace=True),
-            # Output: 32 x 48 x 72
-            
-            # Fine-tune to exact dimensions (48x72 -> 46x72)
-            nn.Conv2d(32, 16, kernel_size=(3,3), stride=1, padding=(0,1)),
-            nn.ReLU(inplace=True),
-            # Output: 16 x 46 x 72
-            
-            nn.Conv2d(16, output_channels, kernel_size=3, stride=1, padding=1),
-            nn.Sigmoid()  # Output values between 0 and 1
-            # Output: output_channels x 46 x 72
+        # Single projection layer: D physical inputs -> full-resolution feature map
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_channels * img_height * img_width),
+            nn.GELU(),
         )
+        # Stack of residual conv blocks, operating at full (H, W) resolution
+        self.blocks = nn.Sequential(*[ResidualConvBlock(hidden_channels) for _ in range(depth)])
+        # Project to a single output channel (temperature map)
+        self.output_proj = nn.Conv2d(hidden_channels, 1, kernel_size=1)
 
     def forward(self, x):
-        """
-        Forward pass through the decoder.
-        
-        Args:
-            x: Input tensor of shape (batch_size, input_dim)
-            
-        Returns:
-            Generated images of shape (batch_size, output_channels, 46, 72)
-        """
-        # Project to higher dimension and reshape
-        x = self.fc(x)
-        x = x.view(-1, 128, 6, 9)  # Reshape to (batch, channels, height, width)
-        
-        # Decode to image
-        x = self.decoder(x)
-        
-        return x
+        x = self.input_proj(x)
+        x = x.view(-1, self.hidden_channels, self.img_height, self.img_width)
+        x = self.blocks(x)
+        return self.output_proj(x)
 
-model = CNN(D,1,generator=NN_rng)
-summary(model)
+# PyTorch Lightning DataModule
+class CustomDataModule(pl.LightningDataModule):
+    def __init__(self, train_inputs, train_outputs, valid_inputs, valid_outputs,
+                 test_inputs, test_outputs, batch_size, rng, img_height, img_width):
+        super().__init__()
 
+        self.batch_size = batch_size
+        self.rng = rng
+        self.img_height = img_height
+        self.img_width = img_width
+
+        # Standardizing the output
+        ## Create scaler
+        out_scaler = StandardScaler()
+
+        ## Fit scaler on training dataset (convert to numpy)
+        out_scaler.fit(train_outputs.cpu().numpy())
+
+        ## Transform all datasets and convert back to tensors
+        train_outputs = torch.tensor(out_scaler.transform(train_outputs.cpu().numpy()), dtype=torch.float32)
+        valid_outputs = torch.tensor(out_scaler.transform(valid_outputs.cpu().numpy()), dtype=torch.float32)
+        test_outputs  = torch.tensor(out_scaler.transform(test_outputs.cpu().numpy()),  dtype=torch.float32)
+
+        # Store the scaler if you need to inverse transform later
+        self.out_scaler = out_scaler
+
+        # --- Input scaling ---
+        # This is the "scaling layer at the start of the network": the CNN has
+        # no ens-CGP step to standardize its inputs, so a StandardScaler here
+        # feeds directly into the model's input_proj (D -> hidden_channels x
+        # H x W) layer, which is the learned projection-to-image-space step
+        # analogous to what ens-CGP did.
+        in_scaler = StandardScaler()
+        in_scaler.fit(train_inputs.cpu().numpy())
+
+        def scale_inputs(X):
+            return torch.tensor(in_scaler.transform(X.cpu().numpy()), dtype=torch.float32)
+
+        self.train_inputs = scale_inputs(train_inputs)
+        self.valid_inputs = scale_inputs(valid_inputs)
+        self.test_inputs  = scale_inputs(test_inputs)
+
+        # Store scaler for inference
+        self.in_scaler = in_scaler
+
+        # Reshape outputs to (N, 1, H, W) for the CNN
+        self.train_outputs = train_outputs.reshape(-1, 1, img_height, img_width)
+        self.valid_outputs = valid_outputs.reshape(-1, 1, img_height, img_width)
+        self.test_outputs  = test_outputs.reshape(-1, 1, img_height, img_width)
+
+    def train_dataloader(self):
+        dataset = TensorDataset(self.train_inputs, self.train_outputs)
+        return DataLoader(
+         dataset,
+         batch_size=self.batch_size,
+         shuffle=True,
+         generator=self.rng,
+         pin_memory=True,
+         )
+
+    def val_dataloader(self):
+        dataset = TensorDataset(self.valid_inputs, self.valid_outputs)
+        return DataLoader(
+         dataset,
+         batch_size=self.batch_size,
+         generator=self.rng,
+         pin_memory=True,
+         )
+
+    def test_dataloader(self):
+        dataset = TensorDataset(self.test_inputs, self.test_outputs)
+        return DataLoader(
+         dataset,
+         batch_size=self.batch_size,
+         generator=self.rng,
+         pin_memory=True,
+         )
+
+model = CNN(D, cnn_hidden_channels, cnn_depth, IMG_H, IMG_W, generator=NN_rng)
+summary(model, input_size=(1, D))
+
+
+
+
+################################
+### Build/Load training set ####
+################################
+
+# Split dataset into training, validation, and testing
+train_idx, valid_idx, test_idx = torch.utils.data.random_split(range(N), data_partition, generator=partition_rng)
+
+# --- Inputs: physical parameters only. Unlike ST2D_GP_CNN.py, there are no ---
+# --- ens-CGP prediction/error maps to append since the CNN is doing the   ---
+# --- full D -> (H, W) mapping by itself.                                 ---
+NN_train_inputs = torch.tensor(raw_inputs[train_idx], dtype=torch.float32)
+NN_valid_inputs = torch.tensor(raw_inputs[valid_idx], dtype=torch.float32)
+NN_test_inputs  = torch.tensor(raw_inputs[test_idx],  dtype=torch.float32)
+
+# --- Outputs: with no ens-CGP baseline to correct, the CNN targets the raw ---
+# --- temperature map directly instead of a residual.                      ---
+NN_train_outputs = torch.tensor(raw_outputs[train_idx], dtype=torch.float32)
+NN_valid_outputs = torch.tensor(raw_outputs[valid_idx], dtype=torch.float32)
+NN_test_outputs  = torch.tensor(raw_outputs[test_idx],  dtype=torch.float32)
+
+# Create DataModule
+data_module = CustomDataModule(
+    NN_train_inputs, NN_train_outputs,
+    NN_valid_inputs, NN_valid_outputs,
+    NN_test_inputs, NN_test_outputs,
+    batch_size, batch_rng,
+    img_height=IMG_H, img_width=IMG_W,
+)
 
 
 
@@ -305,91 +311,88 @@ summary(model)
 ###################################
 # PyTorch Lightning Module
 class RegressionModule(pl.LightningModule):
-    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0, reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0):
+    def __init__(self, model, optimizer, learning_rate, weight_decay=0.0,
+                 reg_coeff_l1=0.0, reg_coeff_l2=0.0, smoothness_coeff=0.0,
+                 out_scaler=None, img_height=None, img_width=None,
+                 lr_patience=10, lr_factor=0.5, lr_min=1e-7):
         super().__init__()
-        self.model = model
-        self.learning_rate = learning_rate
-        self.reg_coeff_l1 = reg_coeff_l1
-        self.reg_coeff_l2 = reg_coeff_l2
+        self.model            = model
+        self.learning_rate    = learning_rate
+        self.reg_coeff_l1     = reg_coeff_l1
+        self.reg_coeff_l2     = reg_coeff_l2
         self.smoothness_coeff = smoothness_coeff
-        self.weight_decay = weight_decay
-        self.loss_fn = nn.MSELoss()
-        self.optimizer_class = optimizer
-    
+        self.weight_decay     = weight_decay
+        self.loss_fn          = nn.MSELoss()
+        self.optimizer_class  = optimizer
+        self.lr_patience      = lr_patience
+        self.lr_factor        = lr_factor
+        self.lr_min           = lr_min
+
+        # Buffer to un-scale the predicted map back to physical units (K), so
+        # the smoothness penalty is computed on the reconstructed temperature
+        # map S = pred (no GP baseline to add) rather than on the
+        # standardized network output.
+        self.register_buffer('out_mean',  torch.tensor(out_scaler.mean_,  dtype=torch.float32).view(1, 1, img_height, img_width))
+        self.register_buffer('out_scale', torch.tensor(out_scaler.scale_, dtype=torch.float32).view(1, 1, img_height, img_width))
+
     def compute_weight_regularization(self):
         """
         Compute L1 and L2 regularization on model weights (parameters).
         """
         if self.reg_coeff_l1 == 0 and self.reg_coeff_l2 == 0:
             return torch.tensor(0., device=self.device), torch.tensor(0., device=self.device)
-        
+
         l1_penalty = torch.tensor(0., device=self.device)
         l2_penalty = torch.tensor(0., device=self.device)
-        
+
         for param in self.model.parameters():
             if self.reg_coeff_l1 > 0:
                 l1_penalty += torch.sum(torch.abs(param))
             if self.reg_coeff_l2 > 0:
                 l2_penalty += torch.sum(param ** 2)
-        
-        return self.reg_coeff_l1 * l1_penalty, self.reg_coeff_l2 * l2_penalty
-    
-    def compute_smoothness_constraint(self, X, output):
-        """
-        Compute smoothness constraint: ||∇s|| where s is the model output.
-        This penalizes rapid changes in output with respect to input.
-        """
-        if self.smoothness_coeff == 0:
-            return torch.tensor(0., device=self.device)
-        
-        # Clone and enable gradient computation for inputs
-        X_grad = X.clone().detach().requires_grad_(True)
 
-        # Temporarily enable gradients
-        with torch.enable_grad():
-            # Recompute output with gradient tracking
-            output_grad = self.model(X_grad)
-            
-            # Compute gradients of output with respect to input: ∂s/∂x
-            grad_outputs = torch.ones_like(output_grad)
-            gradients = torch.autograd.grad(
-                outputs=output_grad,
-                inputs=X_grad,
-                grad_outputs=grad_outputs,
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True
-            )[0]
-            
-            # Smoothness: ||∇s|| = L2 norm of gradient vector for each sample
-            # Shape: gradients is (batch_size, input_dim)
-            # We want: mean over batch of ||∇s|| for each sample
-            smoothness_penalty = torch.mean(torch.norm(gradients, p=2, dim=1))
-        
-        return self.smoothness_coeff * smoothness_penalty
+        return self.reg_coeff_l1 * l1_penalty, self.reg_coeff_l2 * l2_penalty
 
     def forward(self, x):
         return self.model(x)
-    
+
     def training_step(self, batch):
         X, y = batch
         pred = self(X)
-        
+
         # Base loss: ||y - s||
-        loss = self.loss_fn(pred, y)
-        
+        mse = self.loss_fn(pred, y)
+
         # Add weight regularization (L1/L2 on network parameters)
         l1_penalty, l2_penalty = self.compute_weight_regularization()
-        loss += l1_penalty + l2_penalty
-        
-        # Add smoothness constraint (gradient of output w.r.t. input)
-        smoothness_penalty = self.compute_smoothness_constraint(X, pred)
-        loss += smoothness_penalty
+        loss = mse + l1_penalty + l2_penalty
+
+        # Smoothness penalty: L2 norm of the predicted map's spatial gradient.
+        # Longitude is genuinely periodic (edge cells wrap to their neighbor
+        # on the opposite side of the map), but latitude is not — the two
+        # poles are distinct physical points, not neighbors — so dS/dy uses a
+        # plain forward difference with no wrap.
+        if self.smoothness_coeff > 0:
+            S_pred = pred * self.out_scale + self.out_mean
+
+            dSdx_pred = torch.roll(S_pred, shifts=-1, dims=3) - S_pred   # periodic in longitude
+            dSdy_pred = S_pred[:, :, 1:, :] - S_pred[:, :, :-1, :]        # no pole wrap-around → (batch, 1, H-1, W)
+
+            # dSdx and dSdy live on different-sized grids (dSdy has no row at
+            # the last pole boundary), so sum their squares separately
+            # before adding.
+            sum_sq = dSdx_pred.pow(2).sum(dim=(1, 2, 3)) + dSdy_pred.pow(2).sum(dim=(1, 2, 3))
+            field_norm = torch.sqrt(sum_sq)   # (batch,)
+            smoothness_penalty = self.smoothness_coeff * field_norm.mean()
+            loss += smoothness_penalty
+
+            self.log('train_smoothness', smoothness_penalty, on_step=True, on_epoch=True, prog_bar=True)
 
         # Log metrics
+        self.log('train_mse', mse, on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
         return loss
-    
+
     def validation_step(self, batch):
         X, y = batch
         pred = self(X)
@@ -407,13 +410,29 @@ class RegressionModule(pl.LightningModule):
         # Log metrics
         self.log('test_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
-    
+
     def configure_optimizers(self):
-        return self.optimizer_class(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-
-
-
-
+        optimizer = self.optimizer_class(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+        scheduler = lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=self.lr_factor,
+            patience=self.lr_patience,
+            min_lr=self.lr_min,
+        )
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'valid_loss',   # ReduceLROnPlateau needs a metric to watch
+                'interval': 'epoch',
+                'frequency': 1,
+            }
+        }
 
 
 
@@ -425,11 +444,17 @@ class RegressionModule(pl.LightningModule):
 lightning_module = RegressionModule(
     model=model,
     optimizer=Adam,
-    learning_rate=learning_rate,
+    learning_rate=lr_init,
     reg_coeff_l1=regularization_coeff_l1,
     reg_coeff_l2=regularization_coeff_l2,
     weight_decay=weight_decay,
     smoothness_coeff=smoothness_coeff,
+    out_scaler=data_module.out_scaler,
+    img_height=IMG_H,
+    img_width=IMG_W,
+    lr_patience=lr_patience,
+    lr_factor=lr_factor,
+    lr_min=lr_min,
 )
 
 # Setup logger
@@ -438,39 +463,87 @@ logger = CSVLogger(model_save_path+'logs', name='NeuralNetwork')
 # Set all seeds for complete reproducibility
 pl.seed_everything(NN_seed, workers=True)
 
+#Define early stopping callback
+early_stopping = EarlyStopping(
+    monitor='valid_loss',
+    patience=early_stopping_patience,
+    mode='min',
+    verbose=True,
+)
+
 # Create Trainer and train
 trainer = Trainer(
     max_epochs=n_epochs,
     logger=logger,
-    deterministic=True  # For reproducibility
+    deterministic=True,
+    enable_checkpointing=True,
+    callbacks=[
+        ModelCheckpoint(
+            dirpath=model_save_path,
+            save_top_k=1,
+            monitor='valid_loss',
+            mode='min',
+        ),
+        early_stopping,
+    ],
+    enable_progress_bar=True,
 )
 
+#Start time
+t0 = time()
+
 if run_mode == 'use':
-    
-    trainer.fit(lightning_module, datamodule=data_module)
-    
-    # Save model (PyTorch Lightning style)
-    trainer.save_checkpoint(model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt')
-    
-    print("Done!")
-    
+
+    # Try to resume from last checkpoint if it exists
+    last_ckpt = None
+    if os.path.exists(model_save_path + 'last.ckpt'):
+        last_ckpt = model_save_path + 'last.ckpt'
+
+    trainer.fit(lightning_module, datamodule=data_module, ckpt_path=last_ckpt)
+
+    # Get the best checkpoint path from ModelCheckpoint callback
+    best_model_path = trainer.checkpoint_callback.best_model_path
+    print(f"Best model path: {best_model_path}")
+
+    # Save best path for later loading
+    with open(model_save_path + 'best_ckpt_path.txt', 'w') as f:
+        f.write(best_model_path)
+
+    finish_time_s = time() - t0
+    finish_time_min = finish_time_s/60
+    finish_time_hrs = finish_time_s/3600
+    finish_time_days = finish_time_s/(3600*24)
+    print(f"Done! In {finish_time_s:.3f} s/{finish_time_min:.3f} min/{finish_time_hrs:.3f} hrs/{finish_time_days:.3f} days")
+
 else:
+    with open(model_save_path + 'best_ckpt_path.txt', 'r') as f:
+        best_ckpt_path = f.read().strip()
+
     # Load model
     lightning_module = RegressionModule.load_from_checkpoint(
-        model_save_path + f'{n_epochs}epochs_{weight_decay}WD_{regularization_coeff_l1+regularization_coeff_l2}RC_{smoothness_coeff}SC_{learning_rate}LR_{batch_size}BS.ckpt',
+        best_ckpt_path,
         model=model,
         optimizer=Adam,
-    learning_rate=learning_rate,
-    reg_coeff_l1=regularization_coeff_l1,
-    reg_coeff_l2=regularization_coeff_l2,
-    weight_decay=weight_decay,
-    smoothness_coeff=smoothness_coeff,
+        learning_rate=lr_init,
+        reg_coeff_l1=regularization_coeff_l1,
+        reg_coeff_l2=regularization_coeff_l2,
+        weight_decay=weight_decay,
+        smoothness_coeff=smoothness_coeff,
+        out_scaler=data_module.out_scaler,
+        img_height=IMG_H,
+        img_width=IMG_W,
+        lr_patience=lr_patience,
+        lr_factor=lr_factor,
+        lr_min=lr_min,
     )
     print("Model loaded!")
 
+model = lightning_module.model
+model.cpu()
+model.eval()
 
 #Testing model on test dataset
-trainer.test(lightning_module, datamodule=data_module)
+if run_mode == 'use':trainer.test(lightning_module, datamodule=data_module)
 
 # --- Accessing Training History After Training ---
 # Find the version directory (e.g., version_0, version_1, etc.)
@@ -483,10 +556,13 @@ csv_path = os.path.join(log_dir, latest_version, 'metrics.csv')
 metrics_df = pd.read_csv(csv_path)
 
 # Extract losses per epoch
-train_losses = metrics_df[metrics_df['train_loss_epoch'].notna()]['train_loss_epoch'].tolist()
+train_losses = metrics_df[metrics_df['train_mse_epoch'].notna()]['train_mse_epoch'].tolist()
 eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist()
 
-
+# Smoothness penalty is only logged when its coeff > 0 (see training_step)
+plot_smoothness = smoothness_coeff > 0 and 'train_smoothness_epoch' in metrics_df.columns
+if plot_smoothness:
+    smoothness_losses = metrics_df[metrics_df['train_smoothness_epoch'].notna()]['train_smoothness_epoch'].tolist()
 
 
 
@@ -495,108 +571,149 @@ eval_losses = metrics_df[metrics_df['valid_loss'].notna()]['valid_loss'].tolist(
 #### Diagnostic plots ####
 ##########################
 # Loss curves
-fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, gridspec_kw={'height_ratios':[3, 1]}, figsize=(10, 6))
+n_extra_panels = int(plot_smoothness)
+n_rows        = 2 + n_extra_panels
+height_ratios = [3, 1] + [1] * n_extra_panels
+fig, axes = plt.subplots(
+    n_rows, 1, sharex=True, gridspec_kw={'height_ratios': height_ratios},
+    figsize=(10, 6 + 2 * n_extra_panels)
+)
+ax1, ax2 = axes[0], axes[1]
 
 # Calculate number of batches per epoch
-n_batches = len(train_losses) // n_epochs
+actual_epochs = len(eval_losses)  # one entry per epoch
+n_batches = len(train_losses) // actual_epochs  # batches per epoch
+n_batches = max(1, n_batches)     # safety guard
 
 # Create x-axis in terms of epochs (0 to n_epochs)
-x_all = np.linspace(0, n_epochs, len(train_losses))
-x_epoch = np.arange(n_epochs+1)
+x_all = np.linspace(0, actual_epochs, len(train_losses))
+x_epoch = np.arange(actual_epochs + 1)
 
 # Plot transparent background showing all batch losses
 ax1.plot(x_all, train_losses, alpha=0.3, color='C0', linewidth=0.5)
 ax1.plot(x_all, eval_losses, alpha=0.3, color='C1', linewidth=0.5)
 
 # Plot solid lines showing epoch-level losses (every n_batches steps)
-train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]  # Last batch of each epoch
-eval_epoch = [eval_losses[0]] + eval_losses[n_batches-1::n_batches]
+train_epoch = [train_losses[0]] + train_losses[n_batches-1::n_batches]
+eval_epoch  = [eval_losses[0]]  + eval_losses[n_batches-1::n_batches]
 ax1.plot(x_epoch, train_epoch, label="Train", color='C0', linewidth=2, marker='o')
 ax1.plot(x_epoch, eval_epoch, label="Validation", color='C1', linewidth=2, marker='o')
 
 # Same for difference plot
-diff_all = np.array(train_losses) - np.array(eval_losses)
-diff_epoch = np.array(train_epoch) - np.array(eval_epoch)
-
-ax2.plot(x_all, diff_all, alpha=0.3, color='C2', linewidth=0.5)
+diff_epoch  = np.abs(np.array(train_epoch) - np.array(eval_epoch))
 ax2.plot(x_epoch, diff_epoch, color='C2', linewidth=2, marker='o')
 
 ax1.set_yscale('log')
 ax2.set_yscale('log')
-ax2.set_xlabel("Epoch")
 ax1.set_ylabel("MSE Loss")
 ax2.set_ylabel("Loss Diff.")
 ax1.legend()
 ax1.grid()
 ax2.grid()
+
+if plot_smoothness:
+    ax3 = axes[2]
+    smoothness_epoch = [smoothness_losses[0]] + smoothness_losses[n_batches-1::n_batches]
+    ax3.plot(x_all, smoothness_losses, alpha=0.3, color='C3', linewidth=0.5)
+    ax3.plot(x_epoch, smoothness_epoch, label="Smoothness Penalty", color='C3', linewidth=2, marker='o')
+    ax3.set_yscale('log')
+    ax3.set_ylabel("Smoothness\nPenalty")
+    ax3.legend()
+    ax3.grid()
+
+axes[-1].set_xlabel("Epoch")
 plt.subplots_adjust(hspace=0)
 plt.savefig(plot_save_path+'/loss.pdf')
+plt.close()
 
-#Comparing predicted T-P profiles vs true T-P profiles with residuals
-substep = 1000
+#Comparing NN predicted ST maps vs true ST maps with residuals
+substep = 100
 
 # Get the scalers from data module
 out_scaler = data_module.out_scaler
 in_scaler = data_module.in_scaler
 
 #Converting tensors to numpy arrays if this isn't already done
-if (type(test_outputs) != np.ndarray):
-    test_outputs = test_outputs.cpu().numpy()
+if (type(NN_test_outputs) != np.ndarray):
+    NN_test_outputs = NN_test_outputs.cpu().numpy()
 
-res = np.zeros(test_outputs.shape, dtype=float)
+NN_res = np.zeros(NN_test_outputs.shape, dtype=float)
 
-for test_idx, (test_input, test_output) in enumerate(zip(test_inputs, test_outputs)):
+for NN_test_idx, (NN_test_input, true_output) in enumerate(zip(
+    NN_test_inputs, NN_test_outputs
+)):
+
+    scaled_input = torch.tensor(
+        in_scaler.transform(NN_test_input.numpy().reshape(1, -1)),
+        dtype=torch.float32,
+    )
+
+    with torch.no_grad():
+        NN_pred_output_scaled = model(scaled_input).numpy().reshape(1, -1)
+
+    #Inverse scaling - CNN predicts the map directly (no GP baseline to add)
+    NN_pred_output = out_scaler.inverse_transform(NN_pred_output_scaled).flatten()
 
     #Convert to numpy
-    test_input = test_input.cpu().numpy()
+    true_np = true_output
+    NN_test_input_np = NN_test_input.cpu().numpy()
 
-    #Retrieve prediction
-    pred_output_scaled = model(torch.tensor(in_scaler.transform(test_input.reshape(1, -1)))).detach().numpy().reshape(3312)
-    
-    # Inverse transform to get original scale
-    pred_output = out_scaler.inverse_transform(pred_output_scaled.reshape(1, -1)).flatten()
-
-    #Storing residuals 
-    res[test_idx, :] = pred_output - test_output
+    #Storing residuals
+    NN_res[NN_test_idx, :] = NN_pred_output - true_np
 
     #Plotting
-    if (test_idx % substep == 0):
+    if (NN_test_idx % substep == 0):
+        plot_true = true_np.reshape((IMG_H, IMG_W))
+        plot_pred = NN_pred_output.reshape((IMG_H, IMG_W))
+        plot_res  = NN_res[NN_test_idx, :].reshape((IMG_H, IMG_W))
 
-        #Convert shape
-        plot_test_output = test_output.reshape((46, 72))
-        plot_pred_output = pred_output.reshape((46, 72))
-        plot_res = res[test_idx, :].reshape((46, 72))
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 8), sharex=True, layout='constrained')
 
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 8), sharex=True, layout='constrained')        
-        
-        # Compute global vmin/vmax across all datasets
-        vmin = np.min(test_output)
-        vmax = np.max(test_output)
-        
-        # Plot heatmaps
         ax1.set_title('Data')
-        hm1 = sns.heatmap(plot_test_output, ax=ax1)#, cbar=False, vmin=vmin, vmax=vmax)
-        cbar = hm1.collections[0].colorbar
-        cbar.set_label('Temperature (K)')
+        hm1 = sns.heatmap(plot_true, ax=ax1)
+        hm1.collections[0].colorbar.set_label('Temperature (K)')
 
-        ax2.set_title('NN Model')
-        hm3 = sns.heatmap(plot_pred_output, ax=ax2)#, cbar=False, vmin=vmin, vmax=vmax)
-        cbar = hm3.collections[0].colorbar
-        cbar.set_label('Temperature (K)')
+        ax2.set_title('CNN Model')
+        hm2 = sns.heatmap(plot_pred, ax=ax2)
+        hm2.collections[0].colorbar.set_label('Temperature (K)')
 
-        ax3.set_title('NN Residuals')
-        hm5 = sns.heatmap(plot_res, ax=ax3)#, cbar=False, vmin=vmin, vmax=vmax)
-        cbar = hm5.collections[0].colorbar
-        cbar.set_label('Temperature (K)')
+        ax3.set_title('CNN Residuals')
+        hm3 = sns.heatmap(plot_res, ax=ax3)
+        hm3.collections[0].colorbar.set_label('Temperature (K)')
 
-        ax3.set_xticks(np.linspace(0, 72, 5))
+        ax3.set_xticks(np.linspace(0, IMG_W, 5))
         ax3.set_xticklabels(np.linspace(-180, 180, 5).astype(int))
         ax3.set_xlabel('Longitude (degrees)')
-        # Fix latitude ticks
         for ax in [ax1, ax2, ax3]:
-            ax.set_yticks(np.linspace(0, 46, 5))
+            ax.set_yticks(np.linspace(0, IMG_H, 5))
             ax.set_yticklabels(np.linspace(-90, 90, 5).astype(int))
             ax.set_ylabel('Latitude (degrees)')
-        plt.suptitle(rf'H$_2$O : {test_input[0]} bar, CO$_2$ : {test_input[1]} bar, LoD : {test_input[2]:.0f} days, Obliquity : {test_input[3]} deg')
-        plt.savefig(plot_save_path+f'/pred_vs_actual_n.{test_idx}.pdf')
-    
+
+        plt.suptitle(rf'H$_2$ : {NN_test_input_np[0]} bar, CO$_2$ : {NN_test_input_np[1]} bar, LoD : {NN_test_input_np[2]:.0f} days, Obliquity : {NN_test_input_np[3]} deg, Teff : {NN_test_input_np[4]} K')
+        plt.savefig(plot_save_path+f'/pred_vs_actual_n.{NN_test_idx}.pdf')
+        plt.close()
+
+
+#Plot residuals
+fig, ax = plt.subplots(figsize=[10, 6])
+for qid in range(len(NN_test_outputs)):
+    ax.plot(NN_res[qid, :], alpha=0.1, color='blue')
+ax.axhline(0, color='black', linestyle='dashed')
+ax.grid()
+ax.set_xlabel('Pixel Index')
+ax.set_ylabel('Temperature Residual (K)')
+plt.subplots_adjust(bottom=0.25)
+
+# Add statistics text at the bottom
+stats_text = (
+    f"--- CNN Residuals ---\n"
+    f"Temperature Residuals : Median = {np.median(NN_res):.2f} K, "
+    f"Std = {np.std(NN_res):.2f} K, "
+    f"RMSE = {np.sqrt(np.mean(NN_res**2)):.2f} K"
+)
+
+fig.text(0.1, 0.05, stats_text, fontsize=10, family='monospace',
+         verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+plt.savefig(plot_save_path+f'/res_NN.pdf', bbox_inches='tight')
+plt.close()
