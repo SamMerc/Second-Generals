@@ -8,6 +8,10 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.colors as mcolors
+from matplotlib import ticker
+from scipy.interpolate import RectBivariateSpline
+from scipy.ndimage import gaussian_filter
 import seaborn as sns
 import torch
 from torch import nn
@@ -436,6 +440,277 @@ for row, label in enumerate(row_labels):
 
 plt.savefig(plot_save_path + '/combined_figures_ablation.png', bbox_inches='tight', dpi=300)
 plt.close()
+
+##########################################################
+#### Corner plots of median RMSE across parameter space ##
+##########################################################
+# Same corner plot as ST2D_GP_CNN_Tuning.py (compact_rmse_corner.pdf), made
+# once per model, each with its own colour normalisation.
+
+# Convert LoD to days (same mapping as ST2D_GP_CNN_Tuning.py)
+test_inputs_np = raw_inputs[test_idx].copy()   # shape (n_test, D)
+current_lod = np.unique(test_inputs_np[:, 2])
+new_lod = np.array([0.17, 0.26, 0.42, 0.66, 1.04, 1.64, 2.71, 4.17, 6.67, 10.42])
+
+for lod_idx, lod in enumerate(current_lod):
+    idx = np.where(test_inputs_np[:, 2] == lod)[0]
+    test_inputs_np[idx, 2] = new_lod[lod_idx]
+
+param_names = [
+    r'H$_2$ (bar)',
+    r'CO$_2$ (bar)',
+    r'LoD (days)',
+    r'Obliquity ($\circ$)',
+    r'$T_{\rm eff}$ (K)',
+]
+
+log_params  = {0, 1, 2}
+N_PARAMS    = 5
+
+param_nbins = {
+    0: 10,   # H2
+    1: 10,   # CO2
+    2: 10,   # LoD
+    3: 10,   # Obliquity
+    4: 2,    # Teff
+}
+
+show_x_tick_labels: set = {
+    (4, 0), (4, 1), (4, 2), (4, 3),
+}
+show_y_tick_labels: set = {
+    (1, 0), (2, 0), (3, 0), (4, 0),
+}
+
+
+# ── Helper: bin edges ─────────────────────────────────────────────────────────
+def make_edges(vals, n_bins, log=False):
+    unique_vals = np.unique(vals)
+    if len(unique_vals) <= n_bins:
+        edges = np.concatenate([
+            [unique_vals[0] * 0.99],
+            0.5 * (unique_vals[:-1] + unique_vals[1:]),
+            [unique_vals[-1] * 1.01],
+        ])
+        return edges
+    if log:
+        v_min = vals.min() if vals.min() > 0 else 1e-10
+        return np.geomspace(v_min, vals.max(), n_bins + 1)
+    return np.linspace(vals.min(), vals.max(), n_bins + 1)
+
+
+def compute_corner_grids(rmse):
+    """Lower-triangle 2-D median-RMSE grids and diagonal marginal histograms."""
+    grids = {}
+    for i in range(N_PARAMS):
+        for j in range(i):
+            x = test_inputs_np[:, j]
+            y = test_inputs_np[:, i]
+
+            x_edges = make_edges(x, param_nbins[j], log=(j in log_params))
+            y_edges = make_edges(y, param_nbins[i], log=(i in log_params))
+            n_x, n_y = len(x_edges) - 1, len(y_edges) - 1
+
+            x_bin = np.clip(np.digitize(x, x_edges) - 1, 0, n_x - 1)
+            y_bin = np.clip(np.digitize(y, y_edges) - 1, 0, n_y - 1)
+
+            gt     = np.full((n_y, n_x), np.nan)
+            counts = np.zeros((n_y, n_x), dtype=int)
+
+            for xi in range(n_x):
+                for yi in range(n_y):
+                    mask = (x_bin == xi) & (y_bin == yi)
+                    if mask.any():
+                        gt[yi, xi]     = np.median(rmse[mask])
+                        counts[yi, xi] = mask.sum()
+
+            grids[(i, j)] = (gt, x_edges, y_edges, counts)
+
+    # For each parameter p, bin along that axis and compute median RMSE
+    # marginalised over all other parameters.
+    diag_hists = {}   # p -> (bin_centers, median_rmse_per_bin, edges)
+    for p in range(N_PARAMS):
+        vals    = test_inputs_np[:, p]
+        edges   = make_edges(vals, param_nbins[p], log=(p in log_params))
+        n_bins  = len(edges) - 1
+        centers = 0.5 * (edges[:-1] + edges[1:])
+
+        bin_idx  = np.clip(np.digitize(vals, edges) - 1, 0, n_bins - 1)
+        med_rmse = np.array([
+            np.median(rmse[bin_idx == b]) if (bin_idx == b).any() else np.nan
+            for b in range(n_bins)
+        ])
+        diag_hists[p] = (centers, med_rmse, edges)
+
+    return grids, diag_hists
+
+
+def get_norm_range(grid_dict, log=False):
+    # Robust limits (median +/- 5*IQR) so a few outlier bins don't drive the
+    # colour scale; clamped to the data range since RMSE can't go negative.
+    all_vals = np.concatenate([v[0][~np.isnan(v[0])] for v in grid_dict.values()])
+    med      = np.median(all_vals)
+    q25, q75 = np.percentile(all_vals, [25, 75])
+    iqr      = q75 - q25
+    vmin = max(med - 5 * iqr, all_vals.min())
+    vmax = min(med + 5 * iqr, all_vals.max())
+    if log:
+        return mcolors.LogNorm(vmin=max(vmin, 1e-6), vmax=vmax)
+    return mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+
+def plot_rmse_corner(grids, diag_hists, norm, cmap_name, cbar_label, save_file, FS=12):
+    cmap = plt.get_cmap(cmap_name)
+    fig, axes = plt.subplots(N_PARAMS, N_PARAMS,
+                             figsize=(2.5 * N_PARAMS, 2 * N_PARAMS))
+
+    for i in range(N_PARAMS):
+        for j in range(N_PARAMS):
+            ax = axes[i, j]
+
+            # ── Upper triangle: hide ───────────────────────────────────────────
+            if j > i:
+                ax.set_visible(False)
+                continue
+
+            # ── Diagonal: marginal RMSE histogram ─────────────────────────────
+            if i == j:
+                centers, med_rmse, edges = diag_hists[p := i]
+                widths = np.diff(edges)
+
+                # Colour each bar by its RMSE value using the same norm/cmap
+                bar_colors = cmap(norm(med_rmse))
+
+                ax.bar(centers, med_rmse,
+                       width=widths * 0.85,          # slight gap between bars
+                       color=bar_colors,
+                       edgecolor='black', linewidth=0.5,
+                       align='center')
+
+                if p in log_params:
+                    ax.set_xscale('log')
+                    ax.xaxis.set_major_locator(ticker.LogLocator(numticks=3))
+                    ax.xaxis.set_major_formatter(ticker.LogFormatterSciNotation(labelOnlyBase=True))
+                else:
+                    ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=3, prune=None))
+
+                # Teff: force exact tick positions
+                if p == 4:
+                    ax.set_xticks(centers)
+                    ax.set_xticklabels(['3000', '4500'])
+
+                ax.tick_params(axis='both', labelsize=0, length=2)
+                ax.yaxis.set_visible(False)
+                ax.set_title(param_names[p], fontsize=FS, fontstyle='italic', pad=3)
+
+                for spine in ax.spines.values():
+                    spine.set_linewidth(0.8)
+
+                continue
+
+            # ── Lower triangle: 2-D RMSE heatmap + contours ───────────────────
+            grid, x_edges, y_edges, counts = grids[(i, j)]
+
+            ax.pcolormesh(x_edges, y_edges, grid,
+                          cmap=cmap_name, norm=norm,
+                          shading='flat', edgecolors='black', linewidth=0.2)
+
+            x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+            y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+
+            x_eval    = np.log10(x_centers) if j in log_params else x_centers
+            y_eval    = np.log10(y_centers) if i in log_params else y_centers
+            x_edge_lo = np.log10(x_edges[0])  if j in log_params else x_edges[0]
+            x_edge_hi = np.log10(x_edges[-1]) if j in log_params else x_edges[-1]
+            y_edge_lo = np.log10(y_edges[0])  if i in log_params else y_edges[0]
+            y_edge_hi = np.log10(y_edges[-1]) if i in log_params else y_edges[-1]
+
+            grid_filled = grid.copy()
+            nan_mask = np.isnan(grid_filled)
+            if nan_mask.any():
+                grid_filled[nan_mask] = np.nanmean(grid_filled)
+
+            spline    = RectBivariateSpline(y_eval, x_eval, grid_filled,
+                                            kx=min(3, len(y_eval) - 1),
+                                            ky=min(3, len(x_eval) - 1))
+            N_FINE    = 100
+            x_fine    = np.linspace(x_edge_lo, x_edge_hi, N_FINE)
+            y_fine    = np.linspace(y_edge_lo, y_edge_hi, N_FINE)
+            grid_fine = gaussian_filter(spline(y_fine, x_fine), sigma=1.5)
+
+            x_plot = 10**x_fine if j in log_params else x_fine
+            y_plot = 10**y_fine if i in log_params else y_fine
+
+            finite_vals = grid_filled[~np.isnan(grid)]
+            levels = np.linspace(np.nanpercentile(finite_vals, 5),
+                                 np.nanpercentile(finite_vals, 95), 5)
+            ax.contour(x_plot, y_plot, grid_fine,
+                       levels=levels, colors='black', linewidths=0.8, alpha=0.5)
+            ax.contourf(x_plot, y_plot, grid_fine,
+                        levels=levels, cmap=cmap_name, norm=norm, alpha=0.4)
+
+            # ── Axis scales ───────────────────────────────────────────────────
+            if j in log_params:
+                ax.set_xscale('log')
+                ax.xaxis.set_major_locator(ticker.LogLocator(numticks=3))
+                ax.xaxis.set_major_formatter(ticker.LogFormatterSciNotation(labelOnlyBase=True))
+            else:
+                ax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=3, prune=None))
+                ax.xaxis.set_major_formatter(ticker.ScalarFormatter())
+
+            if i in log_params:
+                ax.set_yscale('log')
+                ax.yaxis.set_major_locator(ticker.LogLocator(numticks=3))
+                ax.yaxis.set_major_formatter(ticker.LogFormatterSciNotation(labelOnlyBase=True))
+            else:
+                ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=3, prune=None))
+                ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
+
+            if j == 4:
+                ax.set_xticks(x_centers)
+                ax.set_xticklabels(['3000', '4500'])
+            if i == 4:
+                ax.set_yticks(y_centers)
+                ax.set_yticklabels(['3000', '4500'])
+
+            # ── Tick label visibility ─────────────────────────────────────────
+            if (i, j) in show_x_tick_labels:
+                ax.tick_params(axis='x', labelsize=FS - 2, rotation=45)
+            else:
+                ax.set_xticklabels([])
+                ax.tick_params(axis='x', length=2)
+
+            if (i, j) in show_y_tick_labels:
+                ax.tick_params(axis='y', labelsize=FS - 2)
+            else:
+                ax.set_yticklabels([])
+                ax.tick_params(axis='y', length=2)
+
+    # ── Single colorbar ───────────────────────────────────────────────────────
+    cbar_ax = fig.add_axes([0.92, 0.11, 0.02, 0.77])
+    fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap_name),
+                 cax=cbar_ax, orientation='vertical')
+    cbar_ax.set_ylabel(cbar_label, fontsize=FS)
+    cbar_ax.tick_params(labelsize=FS - 2)
+
+    plt.subplots_adjust(right=0.91, hspace=0.15, wspace=0.10)
+    plt.savefig(save_file, bbox_inches='tight')
+    plt.close()
+
+
+GP_rmse = np.sqrt(np.mean(GP_res**2, axis=1))
+
+corner_models = [
+    ('Ens-CGP',       'ensCGP',     GP_rmse),
+    ('Ens-CGP + CNN', 'ensCGP_CNN', GPCNN_rmse),
+    ('CNN only',      'CNNonly',    CNNonly_rmse),
+]
+for label, tag, rmse in corner_models:
+    grids, diag_hists = compute_corner_grids(rmse)
+    norm_corner = get_norm_range(grids, log=False)
+    plot_rmse_corner(grids, diag_hists, norm_corner, 'summer_r',
+                     'Temp. RMSE (K)',
+                     plot_save_path + f'/compact_rmse_corner_{tag}.pdf')
 
 print('Ablation comparison complete. Plot saved to:', plot_save_path)
 print(f'Ens-CGP      : R2={r2_gp:.4f}  RMSE={rmse_gp:.3f} K  ME={me_gp:.3f} K')
