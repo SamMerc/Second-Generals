@@ -344,8 +344,8 @@ NNonly_pred_T = nnonly_out_scaler_T.inverse_transform(nnonly_out[:, :O])
 NNonly_pred_P = nnonly_out_scaler_P.inverse_transform(nnonly_out[:, O:])
 
 # ── Residuals ─────────────────────────────────────────────────────────────
-GP_res_T     = GP_pred_T     - test_true_T
-GP_res_P     = GP_pred_P     - test_true_P
+GPonly_res_T = GP_pred_T     - test_true_T
+GPonly_res_P = GP_pred_P     - test_true_P
 GPNN_res_T   = GPNN_pred_T   - test_true_T
 GPNN_res_P   = GPNN_pred_P   - test_true_P
 NNonly_res_T = NNonly_pred_T - test_true_T
@@ -353,8 +353,17 @@ NNonly_res_P = NNonly_pred_P - test_true_P
 
 GPNN_rmse_T   = np.sqrt(np.mean(GPNN_res_T**2,   axis=1))
 GPNN_rmse_P   = np.sqrt(np.mean(GPNN_res_P**2,   axis=1))
+GPonly_rmse_T = np.sqrt(np.mean(GPonly_res_T**2, axis=1))
+GPonly_rmse_P = np.sqrt(np.mean(GPonly_res_P**2, axis=1))
 NNonly_rmse_T = np.sqrt(np.mean(NNonly_res_T**2, axis=1))
 NNonly_rmse_P = np.sqrt(np.mean(NNonly_res_P**2, axis=1))
+
+iqr_T     = np.percentile(test_true_T, 75, axis=0) - np.percentile(test_true_T, 25, axis=0)
+iqr_P     = np.percentile(test_true_P, 75, axis=0) - np.percentile(test_true_P, 25, axis=0)
+
+GPNN_nrmse   = np.sqrt(np.sum( (GPNN_res_T/iqr_T)**2 + (GPNN_res_P/iqr_P)**2 , axis=1) / (2 * O))
+GPonly_nrmse = np.sqrt(np.sum( (GPonly_res_T/iqr_T)**2 + (GPonly_res_P/iqr_P)**2 , axis=1) / (2 * O))
+NNonly_nrmse = np.sqrt(np.sum( (NNonly_res_T/iqr_T)**2 + (NNonly_res_P/iqr_P)**2 , axis=1) / (2 * O))
 
 ##########################################################
 #### Combined ablation figure ############################
@@ -371,16 +380,15 @@ def compute_stats(y_true, y_pred):
     y_true_flat = y_true.flatten()
     y_pred_flat = y_pred.flatten()
     r2   = r2_score(y_true_flat, y_pred_flat)
-    rmse = np.sqrt(np.mean((y_true_flat - y_pred_flat)**2))
     me   = np.mean(y_pred_flat - y_true_flat)
-    return r2, rmse, me
+    return r2, me
 
 
 # ── Pick representative cases (median and median-1sigma) using ens-CGP+NN RMSE ──
-sorted_indices           = np.argsort(GPNN_rmse_T)
+sorted_indices           = np.argsort(GPNN_nrmse)
 median_idx               = sorted_indices[len(sorted_indices) // 2]
-median_minus_1sigma      = np.median(GPNN_rmse_T) - np.std(GPNN_rmse_T)
-median_minus_1sigma_idx  = np.argmin(np.abs(GPNN_rmse_T - median_minus_1sigma))
+median_minus_1sigma      = np.median(GPNN_nrmse) - np.std(GPNN_nrmse)
+median_minus_1sigma_idx  = np.argmin(np.abs(GPNN_nrmse - median_minus_1sigma))
 
 # ── Master figure ────────────────────────────────────────────────────────────
 fig = plt.figure(figsize=(14, 16))
@@ -409,7 +417,6 @@ for g, col in enumerate(['median', 'sigma']):
     group_axes[f'{col}_res_pressure']    = fig.add_subplot(inner_gs[1, 0])
 
 axs = group_axes
-
 for col in ['median', 'sigma']:
     idx = {'median': median_idx, 'sigma': median_minus_1sigma_idx}[col]
 
@@ -441,9 +448,9 @@ for col in ['median', 'sigma']:
                       '.', linestyle='-', color=GPNN_plot_color, linewidth=2)
     res_temp_ax.plot(NNonly_res_T[idx, :], test_true_P[idx, :],
                       '.', linestyle='-', color=NNonly_plot_color, linewidth=2)
-    res_temp_ax.errorbar(GP_res_T[idx, :], test_true_P[idx, :], xerr=GP_err_T[idx, :],
+    res_temp_ax.errorbar(GPonly_res_T[idx, :], test_true_P[idx, :], xerr=GP_err_T[idx, :],
                           alpha=0.4, fmt='-', color=GP_plot_color, linewidth=2)
-    res_temp_ax.plot(GP_res_T[idx, :], test_true_P[idx, :], '-', color=GP_plot_color, linewidth=2)
+    res_temp_ax.plot(GPonly_res_T[idx, :], test_true_P[idx, :], '-', color=GP_plot_color, linewidth=2)
     res_temp_ax.xaxis.set_label_position('top')
     res_temp_ax.xaxis.tick_top()
     res_temp_ax.tick_params(axis='x', bottom=False, labelbottom=False, top=True, labeltop=True, labelsize=FS)
@@ -460,11 +467,11 @@ for col in ['median', 'sigma']:
                       '.', linestyle='-', color=GPNN_plot_color, linewidth=2)
     res_pres_ax.plot(test_true_T[idx, :], NNonly_res_P[idx, :] * multiplier,
                       '.', linestyle='-', color=NNonly_plot_color, linewidth=2)
-    res_pres_ax.errorbar(test_true_T[idx, :], GP_res_P[idx, :] * multiplier,
+    res_pres_ax.errorbar(test_true_T[idx, :], GPonly_res_P[idx, :] * multiplier,
                           yerr=GP_err_P[idx, :] * multiplier,
                           alpha=0.4, fmt='-', color=GP_plot_color, linewidth=2)
-    res_pres_ax.plot(test_true_T[idx, :], GP_res_P[idx, :] * multiplier, '-', color=GP_plot_color, linewidth=2)
-    res_pres_ax.set_ylabel(f'Residuals \nx{multiplier_str} (bar)', fontsize=FS)
+    res_pres_ax.plot(test_true_T[idx, :], GPonly_res_P[idx, :] * multiplier, '-', color=GP_plot_color, linewidth=2)
+    res_pres_ax.set_ylabel(f'Residuals \nx{multiplier_str} (dex)', fontsize=FS)
     res_pres_ax.sharex(results_ax)
     res_pres_ax.tick_params(axis='x', bottom=False, labelbottom=False, top=False, labeltop=False, labelsize=FS)
     res_pres_ax.grid()
@@ -486,8 +493,9 @@ for col, col_str, idx in [('median', 'median', median_idx),
 
     title_str = (
         f'{col_str.capitalize()}\n'
-        f'Ens-CGP+NN: RMSE = {GPNN_rmse_T[idx]:.2f} K, {GPNN_rmse_P[idx]*multiplier:.2f}{multiplier_str} bar\n'
-        f'NN only: RMSE = {NNonly_rmse_T[idx]:.2f} K, {NNonly_rmse_P[idx]*multiplier:.2f}{multiplier_str} bar'
+        f'Ens-CGP+NN: RMSE = {GPNN_rmse_T[idx]:.2f} K, {GPNN_rmse_P[idx]*multiplier:.2f}{multiplier_str} dex\n'
+        f'NN only: RMSE = {NNonly_rmse_T[idx]:.2f} K, {NNonly_rmse_P[idx]*multiplier:.2f}{multiplier_str} dex\n'
+        f'GP only: RMSE = {GPonly_rmse_T[idx]:.2f} K, {GPonly_rmse_P[idx]*multiplier:.2f}{multiplier_str} dex'
     )
     fig.text(x_center, y_top + 0.035, title_str,
               ha='center', va='bottom', fontsize=FS - 1, fontweight='bold',
@@ -505,35 +513,35 @@ ax_P.plot(np.linspace(-10, 10, 100), np.linspace(-10, 10, 100), 'k--', zorder=4)
 ax_T.plot(np.linspace(-3000, 3000, 100), np.linspace(-3000, 3000, 100),
           'k--', zorder=4, label='Perfect prediction - 1:1 line')
 
-r2_gp_T,     rmse_gp_T,     me_gp_T     = compute_stats(test_true_T, GP_pred_T)
-r2_gpnn_T,   rmse_gpnn_T,   me_gpnn_T   = compute_stats(test_true_T, GPNN_pred_T)
-r2_nnonly_T, rmse_nnonly_T, me_nnonly_T = compute_stats(test_true_T, NNonly_pred_T)
+r2_gp_T,     me_gp_T     = compute_stats(test_true_T, GP_pred_T)
+r2_gpnn_T,   me_gpnn_T   = compute_stats(test_true_T, GPNN_pred_T)
+r2_nnonly_T, me_nnonly_T = compute_stats(test_true_T, NNonly_pred_T)
 
-r2_gp_P,     rmse_gp_P,     me_gp_P     = compute_stats(test_true_P, GP_pred_P)
-r2_gpnn_P,   rmse_gpnn_P,   me_gpnn_P   = compute_stats(test_true_P, GPNN_pred_P)
-r2_nnonly_P, rmse_nnonly_P, me_nnonly_P = compute_stats(test_true_P, NNonly_pred_P)
+r2_gp_P,     me_gp_P     = compute_stats(test_true_P, GP_pred_P)
+r2_gpnn_P,   me_gpnn_P   = compute_stats(test_true_P, GPNN_pred_P)
+r2_nnonly_P, me_nnonly_P = compute_stats(test_true_P, NNonly_pred_P)
 
 # Temperature — plot ens-CGP first (zorder=1), NN-only next (zorder=2), ens-CGP+NN last (zorder=3)
-ax_T.errorbar(GP_pred_T.flatten(), test_true_T.flatten(), yerr=GP_err_T.flatten(),
-              fmt='o', alpha=plot_alpha, color='orange', zorder=1,
-              label=f"Ens-CGP      R$^2$={r2_gp_T:.4f}  RMSE={rmse_gp_T:.4f}  ME={me_gp_T:.4f}")
-ax_T.plot(NNonly_pred_T.flatten(), test_true_T.flatten(),
-          'o', alpha=plot_alpha, color=NNonly_plot_color, zorder=2,
-          label=f"NN only      R$^2$={r2_nnonly_T:.4f}  RMSE={rmse_nnonly_T:.4f}  ME={me_nnonly_T:.4f}")
 ax_T.plot(GPNN_pred_T.flatten(), test_true_T.flatten(),
           'o', alpha=plot_alpha, color='skyblue', zorder=3,
-          label=f"Ens-CGP+NN  R$^2$={r2_gpnn_T:.4f}  RMSE={rmse_gpnn_T:.4f}  ME={me_gpnn_T:.4f}")
+          label=f"Ens-CGP+NN  R$^2$={r2_gpnn_T:.3f}  ME={me_gpnn_T:.3f}")
+ax_T.errorbar(GP_pred_T.flatten(), test_true_T.flatten(), yerr=GP_err_T.flatten(),
+              fmt='o', alpha=plot_alpha, color='orange', zorder=1,
+              label=f"Ens-CGP      R$^2$={r2_gp_T:.3f}  ME={me_gp_T:.3f}")
+ax_T.plot(NNonly_pred_T.flatten(), test_true_T.flatten(),
+          'o', alpha=plot_alpha, color=NNonly_plot_color, zorder=2,
+          label=f"NN only      R$^2$={r2_nnonly_T:.3f}  ME={me_nnonly_T:.3f}")
 
 # Pressure — same ordering
-ax_P.errorbar(GP_pred_P.flatten(), test_true_P.flatten(), yerr=GP_err_P.flatten(),
-              fmt='o', alpha=plot_alpha, color='darkorange', zorder=1,
-              label=f"Ens-CGP      R$^2$={r2_gp_P:.4f}  RMSE={rmse_gp_P:.4f}  ME={me_gp_P:.4f}")
-ax_P.plot(NNonly_pred_P.flatten(), test_true_P.flatten(),
-          'o', alpha=plot_alpha, color=NNonly_plot_color, zorder=2,
-          label=f"NN only      R$^2$={r2_nnonly_P:.4f}  RMSE={rmse_nnonly_P:.4f}  ME={me_nnonly_P:.4f}")
 ax_P.plot(GPNN_pred_P.flatten(), test_true_P.flatten(),
           'o', alpha=plot_alpha, color='deepskyblue', zorder=3,
-          label=f"Ens-CGP+NN  R$^2$={r2_gpnn_P:.4f}  RMSE={rmse_gpnn_P:.4f}  ME={me_gpnn_P:.4f}")
+          label=f"Ens-CGP+NN  R$^2$={r2_gpnn_P:.3f}  ME={me_gpnn_P:.5f}")
+ax_P.errorbar(GP_pred_P.flatten(), test_true_P.flatten(), yerr=GP_err_P.flatten(),
+              fmt='o', alpha=plot_alpha, color='darkorange', zorder=1,
+              label=f"Ens-CGP      R$^2$={r2_gp_P:.3f}  ME={me_gp_P:.5f}")
+ax_P.plot(NNonly_pred_P.flatten(), test_true_P.flatten(),
+          'o', alpha=plot_alpha, color=NNonly_plot_color, zorder=2,
+          label=f"NN only      R$^2$={r2_nnonly_P:.3f}  ME={me_nnonly_P:.5f}")
 
 # Temperature axis formatting
 ax_T.set_xlim(min(GP_pred_T.min(), GPNN_pred_T.min(), NNonly_pred_T.min()),
@@ -553,7 +561,7 @@ ax_P.set_xlabel(r'Predicted Pressure ($\log_{10}$ bar)', fontsize=FS)
 ax_P.tick_params(axis='both', labelsize=FS)
 ax_P.legend(fontsize=10, loc='lower right')
 
-plt.savefig(plot_save_path + '/combined_figures_ablation.png', bbox_inches='tight', dpi=1000)
+plt.savefig(plot_save_path + '/combined_figures_ablation.png', bbox_inches='tight', dpi=2000)
 plt.close()
 
 ##########################################################
@@ -813,8 +821,8 @@ def plot_rmse_corner(grids, diag_hists, norm, cmap_name, cbar_label, save_file, 
     plt.close()
 
 
-GP_rmse_T = np.sqrt(np.mean(GP_res_T**2, axis=1))
-GP_rmse_P = np.sqrt(np.mean(GP_res_P**2, axis=1))
+GP_rmse_T = np.sqrt(np.mean(GPonly_res_T**2, axis=1))
+GP_rmse_P = np.sqrt(np.mean(GPonly_res_P**2, axis=1))
 
 corner_quantities = [
     # (suffix, cmap, colorbar label, models [(label, tag, rmse)])
@@ -823,7 +831,7 @@ corner_quantities = [
         ('Ens-CGP + NN', 'ensCGP_NN', GPNN_rmse_T),
         ('NN only',      'NNonly',    NNonly_rmse_T),
     ]),
-    ('P', 'winter_r', r'Pressure RMSE ($\log_{10}$ bar)', [
+    ('P', 'winter_r', r'Pressure RMSE (dex)', [
         ('Ens-CGP',      'ensCGP',    GP_rmse_P),
         ('Ens-CGP + NN', 'ensCGP_NN', GPNN_rmse_P),
         ('NN only',      'NNonly',    NNonly_rmse_P),
@@ -853,8 +861,8 @@ for ax, gp_err, nn_corr, color, xlabel, ylabel in [
      'Ens-CGP Temperature Uncertainty (K)',
      'Ens-CGP+NN $-$ Ens-CGP Temperature (K)'),
     (ax_P, GP_err_P, GPNN_pred_P - GP_pred_P, 'deepskyblue',
-     r'Ens-CGP Pressure Uncertainty ($\log_{10}$ bar)',
-     r'Ens-CGP+NN $-$ Ens-CGP Pressure ($\log_{10}$ bar)'),
+     r'Ens-CGP Pressure Uncertainty (dex)',
+     r'Ens-CGP+NN $-$ Ens-CGP Pressure (dex)'),
 ]:
     x = gp_err.flatten()
     y = nn_corr.flatten()
@@ -1089,79 +1097,81 @@ cases = [
 case_specs = {case_name: case_spectra(case_idx) for _, case_name, case_idx in cases}
 
 
-def plot_ablation_figure(spectrum_key, ylabel, spectrum_label, save_path):
-    fig, axes = plt.subplots(2, 2, sharex=True, figsize=(18, 8),
-                             gridspec_kw={'height_ratios': [2, 1], 'hspace': 0.05, 'wspace': 0.35})
+def plot_ablation_figure(save_path):
+    # Rows: transmission spectrum, transmission residual, emission spectrum,
+    # emission residual. Columns: one per representative case.
+    fig, axes = plt.subplots(4, 2, sharex=True, figsize=(16, 16),
+                             gridspec_kw={'height_ratios': [2, 1, 2, 1], 'hspace': 0.08, 'wspace': 0.2})
+
+    spectrum_blocks = [
+        ('transmission', 'Transit depth (ppm)', 'Transmission', 0, False),
+        ('emission',     'Eclipse depth (ppm)', 'Emission',     2, True),
+    ]
 
     for col, (case_str, case_name, case_idx) in enumerate(cases):
-        spec = case_specs[case_name][spectrum_key]
-        ax1, ax2 = axes[0, col], axes[1, col]
-
-        ax1.fill_between(prism_wavelengths_um, spec['gp_minus'], spec['gp_plus'],
-                         color=GP_plot_color, alpha=0.25, label=r'Ens-CGP ($\pm 1\sigma$)')
-        ax1.plot(prism_wavelengths_um, spec['gp'],     color=GP_plot_color,     linewidth=1.5, label='Ens-CGP')
-        ax1.plot(prism_wavelengths_um, spec['nnonly'], color=NNonly_plot_color, linewidth=1.5, label='NN only')
-        ax1.plot(prism_wavelengths_um, spec['gpnn'],   color=GPNN_plot_color,   linewidth=1.5, label='Ens-CGP+NN')
-        ax1.plot(prism_wavelengths_um, spec['truth'],  color='black', linewidth=1.5, linestyle='--',
-                 zorder=5, label='Truth (ExoCAM)')
-        ax1.set_ylabel(ylabel, fontsize=FS)
-        ax1.tick_params(axis='both', labelsize=FS)
-        ax1.grid(alpha=0.3)
-        if col == 0:
-            ax1.legend(fontsize=FS - 2)
-
         H2_bar, CO2_bar, _, _, Teff = test_inputs_phys[case_idx]
-        ax1.set_title(
-            f'{case_str}\n'
-            rf'H$_2$: {H2_bar:.4g} bar, CO$_2$: {CO2_bar:.4g} bar, $+$1 bar N$_2$, '
-            rf'$T_{{\rm eff}}$: {Teff:.0f} K',
-            fontsize=FS, fontweight='bold'
-        )
 
-        # Residuals (true - pred) in ppm on the left spine, relative residuals
-        # (true - pred)/true (%) on the right spine. The two aren't a fixed linear
-        # rescaling of one another (true depth varies with wavelength), so the
-        # right spine is independently scaled, with y-limits set explicitly so both
-        # zero lines align.
-        diffs = {
-            'Ens-CGP':    (spec['truth'] - spec['gp'],     GP_plot_color),
-            'NN only':    (spec['truth'] - spec['nnonly'], NNonly_plot_color),
-            'Ens-CGP+NN': (spec['truth'] - spec['gpnn'],   GPNN_plot_color),
-        }
-        diff_gp_upper = spec['truth'] - spec['gp_minus']
-        diff_gp_lower = spec['truth'] - spec['gp_plus']
+        for spectrum_key, ylabel, spectrum_label, row0, is_bottom in spectrum_blocks:
+            spec = case_specs[case_name][spectrum_key]
+            ax1, ax2 = axes[row0, col], axes[row0 + 1, col]
 
-        ax2.fill_between(prism_wavelengths_um, diff_gp_lower, diff_gp_upper, color=GP_plot_color, alpha=0.25)
-        for diff, color in diffs.values():
-            ax2.plot(prism_wavelengths_um, diff, color=color, linewidth=1.5)
-        ax2.axhline(0, color='black', linestyle='dashed', linewidth=1)
-        ax2.set_xlabel(r'Wavelength ($\mu$m)', fontsize=FS)
-        ax2.set_ylabel('Residuals (ppm)', fontsize=FS)
-        ax2.tick_params(axis='both', labelsize=FS)
-        ax2.grid(alpha=0.3)
+            ax1.fill_between(prism_wavelengths_um, spec['gp_minus'], spec['gp_plus'],
+                             color=GP_plot_color, alpha=0.25, label=r'Ens-CGP ($\pm 1\sigma$)')
+            ax1.plot(prism_wavelengths_um, spec['gp'],     color=GP_plot_color,     linewidth=1.5, label='Ens-CGP')
+            ax1.plot(prism_wavelengths_um, spec['nnonly'], color=NNonly_plot_color, linewidth=1.5, label='NN only')
+            ax1.plot(prism_wavelengths_um, spec['gpnn'],   color=GPNN_plot_color,   linewidth=1.5, label='Ens-CGP+NN')
+            ax1.plot(prism_wavelengths_um, spec['truth'],  color='black', linewidth=1.5, linestyle='--',
+                     zorder=5, label='Truth (ExoCAM)')
+            ax1.set_ylabel(ylabel, fontsize=FS)
+            ax1.tick_params(axis='both', labelsize=FS)
+            ax1.grid(alpha=0.3)
+            if col == 0 and row0 == 0:
+                ax1.legend(fontsize=FS - 2)
 
-        ax2b = ax2.twinx()
-        ax2b.set_ylabel('Relative residuals (%)', color='darkorange', fontsize=FS)
-        ax2b.tick_params(axis='y', labelcolor='darkorange', labelsize=FS)
-        ax2b.spines['right'].set_color('darkorange')
+            if row0 == 0:
+                ax1.set_title(
+                    f'{case_str}\n'
+                    rf'H$_2$: {H2_bar:.4g} bar, CO$_2$: {CO2_bar:.4g} bar, $+$1 bar N$_2$, '
+                    rf'$T_{{\rm eff}}$: {Teff:.0f} K',
+                    fontsize=FS, fontweight='bold'
+                )
 
-        all_diffs = [d for d, _ in diffs.values()] + [diff_gp_lower, diff_gp_upper]
-        max_abs_ppm = np.nanmax(np.abs(np.concatenate(all_diffs)))
-        max_abs_pct = np.nanmax(np.abs(np.concatenate([d / spec['truth'] * 100 for d in all_diffs])))
-        ax2.set_ylim(-max_abs_ppm*1.1, max_abs_ppm*1.1)
-        ax2b.set_ylim(-max_abs_pct*1.1, max_abs_pct*1.1)
+            # Residuals (true - pred) in ppm on the left spine, relative residuals
+            # (true - pred)/true (%) on the right spine. The two aren't a fixed linear
+            # rescaling of one another (true depth varies with wavelength), so the
+            # right spine is independently scaled, with y-limits set explicitly so both
+            # zero lines align.
+            diffs = {
+                'Ens-CGP':    (spec['gp'] - spec['truth'],     GP_plot_color),
+                'NN only':    (spec['nnonly'] - spec['truth'], NNonly_plot_color),
+                'Ens-CGP+NN': (spec['gpnn'] - spec['truth'],   GPNN_plot_color),
+            }
+            diff_gp_lower = spec['gp_minus'] - spec['truth']
+            diff_gp_upper = spec['gp_plus'] - spec['truth']
 
-        print(f'{spectrum_label} spectrum, {case_name} (test case {case_idx}):')
-        for label, (diff, _) in diffs.items():
-            print(f'  {label:<11s}: RMS spectrum residual = {np.sqrt(np.nanmean(diff**2)):.4f} ppm')
+            ax2.fill_between(prism_wavelengths_um, diff_gp_lower, diff_gp_upper, color=GP_plot_color, alpha=0.25)
+            for diff, color in diffs.values():
+                ax2.plot(prism_wavelengths_um, diff, color=color, linewidth=1.5)
+            ax2.axhline(0, color='black', linestyle='dashed', linewidth=1)
+            if is_bottom:
+                ax2.set_xlabel(r'Wavelength ($\mu$m)', fontsize=FS)
+            ax2.set_ylabel('Residuals (ppm)', fontsize=FS)
+            ax2.tick_params(axis='both', labelsize=FS)
+            ax2.grid(alpha=0.3)
+
+            all_diffs = [d for d, _ in diffs.values()] + [diff_gp_lower, diff_gp_upper]
+            max_abs_ppm = np.nanmax(np.abs(np.concatenate(all_diffs)))
+            max_abs_pct = np.nanmax(np.abs(np.concatenate([d / spec['truth'] * 100 for d in all_diffs])))
+            ax2.set_ylim(-max_abs_ppm*1.1, max_abs_ppm*1.1)
+
+            print(f'{spectrum_label} spectrum, {case_name} (test case {case_idx}):')
+            for label, (diff, _) in diffs.items():
+                print(f'  {label:<11s}: RMS spectrum residual = {np.sqrt(np.nanmean(diff**2)):.4f} ppm')
 
     plt.savefig(save_path, bbox_inches='tight')
     plt.close()
 
 
-plot_ablation_figure('transmission', 'Transit depth (ppm)', 'Transmission',
-                      plot_save_path + '/transmission_spectrum_comparison_ablation.pdf')
-plot_ablation_figure('emission', 'Eclipse depth (ppm)', 'Emission',
-                      plot_save_path + '/emission_spectrum_comparison_ablation.pdf')
+plot_ablation_figure(plot_save_path + '/spectrum_comparison_ablation.pdf')
 
 print('Ablation comparison complete. Plots saved to:', plot_save_path)
